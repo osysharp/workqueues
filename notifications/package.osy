@@ -1,0 +1,29 @@
+// Osysharp.WorkQueues.Notifications — the inbox's people told in their bell: the one an item is offered to, the cover it is
+// handed to while its holder is away, whoever holds it when its policy says to tell them a promise is at risk or
+// missed, and a queue's leads when nobody picks an item up or its policy says to tell them. Each reads it in their own language, in the second person ("Offered to you — it is yours if you take it
+// within 15 minutes.", "Handed to you — Ines is away until Mon 8 Jun 06:00 UTC.", "First reply is at risk.").
+//
+// ⚑ A BRIDGE, SO NEITHER KIT DEPENDS ON THE OTHER: the Inbox names who should know on its own events (`ItemOffered.To`,
+//   `HolderChanged.Told`, `PromiseToldToHolder.Holder`) and Notifications tells anybody about anything. This package hears
+//   the first and calls the second. An app using both writes nothing: the bridge arrives by itself (`completes`
+//   below — `osy lock` includes it and says so).
+//
+// ⚑ WHO LEADS IS STILL THE APP'S TO SAY — ONCE, AS A POLICY. Two of the inbox's events are for a queue's leads
+//   (`PickupOverdue`, `PromiseToldToLeads`). This package tells the queue's active members who satisfy the app's
+//   `LeadsInbox` (`InboxLeads`, which asks it of each person with `Security.Authorize`) — or, when none of them does,
+//   everybody who leads in any queue. The app writes nothing for them: `policy LeadsInbox => IsLead;` is all it says,
+//   and it already says it for the inbox.
+//
+// ⚑ NEVER ABOUT AN ITEM THEY MAY NOT READ. Each notification is about the item, and Notifications asks, as it delivers, reads
+//   and mails it, whether the recipient may read that item under their own rules.
+package Osysharp.WorkQueues.Notifications {
+  version     "0.3.1";
+  minPlatform "0.9.0";
+  summary     "the inbox's people told in their bell — an item offered to them, work handed to them while its holder is away, a promise at risk or missed on what they hold, and a queue's leads when nobody picks an item up — in their own words and language, and never about an item they may not read; the leads are whoever the app's LeadsInbox policy says.";
+  completes   Osysharp.WorkQueues@0, Osysharp.Notifications@1;
+  model "model/*.osy";
+  use Osysharp.Identity@0;
+  use Osysharp.WorkQueues@0;
+  use Osysharp.Notifications@1;
+  tests "tests";
+}

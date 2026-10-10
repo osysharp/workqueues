@@ -1,0 +1,47 @@
+// Everything the repair desk says: who works the inbox and who leads it, who has a bell, what a repair is and who reads
+// it. Nothing about telling anybody — the bridge does all of it, the leads included (`LeadsInbox`).
+namespace InboxNotificationsKitTests;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.ServiceHours;
+using Osysharp.Notifications;
+using Osysharp.WorkQueues.Notifications;
+
+[Role] enum CrewRole { Authenticator, Crew, Lead }
+
+policy IsCrew => RoleGrant.Any(g => g.Member == user && (g.Role == CrewRole.Crew || g.Role == CrewRole.Lead));
+policy IsLead => RoleGrant.Any(g => g.Member == user && g.Role == CrewRole.Lead);
+policy WorksInbox => IsCrew;
+policy LeadsInbox => IsLead;
+policy AdministersInbox => IsLead;
+policy ManagesOrganizations => IsLead;
+policy CollaboratesOnRecords => IsCrew;
+policy ReceivesNotifications => IsCrew;
+policy ManagesClock => IsLead;
+
+/// The crew.
+entity Person : Principal {
+  [MaxLength(200)] string CodeHash = "";
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+    deny read CodeHash when !IsAuthenticator;
+  }
+}
+
+/// A repair somebody reported. A repair marked `Sensitive` (a break-in at a school) is for the leads alone.
+[Title(Title)]
+entity Repair : WorkItem {
+  bool Sensitive;
+  security {
+    allow read, create, update when IsCrew;
+    deny read when !IsLead where Sensitive;
+  }
+}
+
+partial entity ServiceHours { security { allow read, create, update, delete when IsLead; } }
+partial entity Notification { security { allow create when IsCrew; } }
+
+app.Notifications = new NotificationsSetup { AppName = "Repairs" };
+app.Inbox = new InboxSetup { DefaultQueue = "Repairs" };

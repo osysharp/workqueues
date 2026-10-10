@@ -1,0 +1,21 @@
+// The producer's test project for Osysharp.WorkQueues.Notifications — the smallest correct consumer: a council's repair desk.
+// Residents report a broken streetlight or a blocked drain, the crew work the queue, and whoever the inbox says should
+// know finds it in their bell. NOT a helpdesk on purpose: the bridge tells people about any item kind.
+app InboxNotificationsKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Identity@0;
+  use Osysharp.Organizations@0;
+  use Osysharp.Organizations.ServicePlans@0;
+  use Osysharp.Presence@0;
+  use Osysharp.Observability;
+  use Osysharp.Workflow;
+  use Osysharp.ServiceHours;
+  use Osysharp.Ui;
+  use Osysharp.WorkQueues@0;
+  use Osysharp.Mail@0;
+  use Osysharp.EmailTemplates@0;
+  use Osysharp.Notifications@1;
+  // Osysharp.WorkQueues.Notifications, the package under test, is not written: it arrives by itself because this app uses
+  // Inbox and Notifications, which it completes (`osy lock` includes it and says so).
+}

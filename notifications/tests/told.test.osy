@@ -1,0 +1,122 @@
+// Whoever the inbox says should know finds it in their bell, in their own words — and nobody else does.
+//
+//   Mia, Leo  crew        Ana  lead        — all three work Repairs; Mia also works Parks, which nobody leads
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.Notifications;
+using Osysharp.WorkQueues.Notifications;
+using InboxNotificationsKitTests;
+
+[TestFixture]
+void Crew() {
+  var mia = new Person { Email = "mia@repairs.test", DisplayName = "Mia" };
+  new RoleGrant { Member = mia, Role = CrewRole.Crew };
+  var leo = new Person { Email = "leo@repairs.test", DisplayName = "Leo" };
+  new RoleGrant { Member = leo, Role = CrewRole.Crew };
+  var ana = new Person { Email = "ana@repairs.test", DisplayName = "Ana" };
+  new RoleGrant { Member = ana, Role = CrewRole.Lead };
+  var repairs = new Queue { Name = "Repairs" };
+  new QueueMember { Queue = repairs, Member = mia };
+  new QueueMember { Queue = repairs, Member = leo };
+  new QueueMember { Queue = repairs, Member = ana };
+  var parks = new Queue { Name = "Parks" };
+  new QueueMember { Queue = parks, Member = mia };
+}
+
+principal Mia => Person.Single(p => p.Email == "mia@repairs.test");
+principal Leo => Person.Single(p => p.Email == "leo@repairs.test");
+principal Ana => Person.Single(p => p.Email == "ana@repairs.test");
+
+/// A repair, reported to `queue` — `sensitive`: for the leads alone.
+Repair Reported(string title, bool sensitive = false, string queue = "Repairs") {
+  var id = Guid.Empty;
+  runas (Ana) { id = new Repair { Title = title, Sensitive = sensitive, Queue = QueueNamed(queue) }.Id; UnitOfWork.Commit(); }
+  Repair? r = null;
+  runas (Ana) { r = Repair.Single(x => x.Id == id); }
+  return r!;
+}
+
+/// What the signed-in person's bell says, newest first — asked inside their `runas`: a person row handed to a helper
+/// from a test body nobody is signed in to is a row that caller cannot read, and such a call is refused before it runs.
+List<string> MyBell() {
+  Background.Settle();
+  return MyNotificationLines().Select(l => l.Sentence).ToList();
+}
+
+Person Named(string name) { return Person.Single(p => p.DisplayName == name); }
+
+[Test(Crew)]
+void the_one_an_item_is_offered_to_reads_it_in_their_bell_in_the_second_person() {
+  var r = Reported("Streetlight out on Elm Road");
+  runas (Ana) {
+    Raise(new ItemOffered { Item = r, To = Named("Mia"), Step = new InboxStep { Reason = AssignReason.AccountOwner, About = "Mia", Minutes = 15 } });
+    UnitOfWork.Commit();
+  }
+  runas (Mia) { Assert.Contains("Offered to you — it is yours if you take it within 15 minutes.", MyBell()); }
+  runas (Leo) { Assert.Equal(0, MyBell().Count); }
+}
+
+[Test(Crew)]
+void work_handed_to_a_cover_is_in_the_covers_bell_and_a_plain_change_of_holder_tells_nobody() {
+  var r = Reported("Blocked drain on Mill Lane");
+  runas (Ana) {
+    Raise(new HolderChanged { Item = r, Told = Named("Leo"),
+                              Step = new InboxStep { Reason = AssignReason.Cover, From = "Mia", To = "Leo",
+                                                     Until = new DateTime(2026, 6, 8, 6, 0, 0) } });
+    Raise(new HolderChanged { Item = r, Step = new InboxStep { Reason = AssignReason.Claimed, To = "Mia" } });
+    UnitOfWork.Commit();
+  }
+  runas (Leo) { Assert.Equal(["Handed to you — Mia is away until Mon 8 Jun 06:00 UTC."], MyBell()); }
+  runas (Mia) { Assert.Equal(0, MyBell().Count); }
+}
+
+[Test(Crew)]
+void whoever_holds_it_is_told_of_a_promise_when_its_policy_says_so() {
+  var r = Reported("Pothole outside the school");
+  runas (Ana) {
+    Raise(new PromiseToldToHolder { Item = r, Holder = Named("Mia"), About = "Mia", Metric = SlaMetric.FirstResponse,
+                                    Moment = SlaMoment.AtRisk });
+    UnitOfWork.Commit();
+  }
+  runas (Mia) { Assert.Equal(["First response is at risk."], MyBell()); }
+}
+
+/// The queue's leads are told nobody picked it up — whoever the app's `LeadsInbox` says leads, asked of each member.
+/// The app wrote nothing for it; the crew in the same queue are not told.
+[Test(Crew)]
+void the_queues_leads_are_told_nobody_picked_it_up() {
+  var r = Reported("Graffiti on the bridge");
+  runas (Ana) {
+    Raise(new PickupOverdue { Item = r, Queue = "Repairs", Minutes = 30 });
+    UnitOfWork.Commit();
+  }
+  runas (Ana) { Assert.Equal(["Nobody has picked it up in Repairs — it has waited more than 30 minutes."], MyBell()); }
+  runas (Mia) { Assert.Equal(0, MyBell().Count); }
+  runas (Leo) { Assert.Equal(0, MyBell().Count); }
+}
+
+/// A queue nobody leads still reaches somebody: its item's leads are everybody who leads in any queue. A promise its
+/// policy says to tell the leads of reaches them the same way.
+[Test(Crew)]
+void a_queue_nobody_leads_tells_the_leads_of_the_others() {
+  var r = Reported("Fallen tree in the park", queue: "Parks");
+  runas (Ana) {
+    Raise(new PromiseToldToLeads { Item = r, Metric = SlaMetric.FirstResponse, Moment = SlaMoment.Breached });
+    UnitOfWork.Commit();
+  }
+  runas (Ana) { Assert.Equal(1, MyBell().Count); }
+  runas (Mia) { Assert.Equal(0, MyBell().Count); }
+}
+
+/// The inbox may name somebody who may not read the item — the bell never shows it to them.
+[Test(Crew)]
+void nobody_is_told_about_an_item_they_may_not_read() {
+  var r = Reported("Break-in at the primary school", sensitive: true);
+  runas (Ana) {
+    Raise(new ItemOffered { Item = r, To = Named("Mia"), Step = new InboxStep { Reason = AssignReason.AccountOwner, About = "Mia", Minutes = 15 } });
+    Raise(new ItemOffered { Item = r, To = Named("Ana"), Step = new InboxStep { Reason = AssignReason.AccountOwner, About = "Ana", Minutes = 15 } });
+    UnitOfWork.Commit();
+  }
+  runas (Mia) { Assert.Equal(0, MyBell().Count); }
+  runas (Ana) { Assert.Equal(["Offered to you — it is yours if you take it within 15 minutes."], MyBell()); }
+}

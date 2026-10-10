@@ -1,0 +1,63 @@
+namespace Osysharp.WorkQueues.Notifications;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.Notifications;
+
+// WHO THE INBOX SAYS SHOULD KNOW, TOLD — each one named on the inbox's own event, in their bell, in their words.
+
+/// The one an item is offered to — it is theirs if they take it in time.
+[On]
+internal void TellTheOffered(ItemOffered e) { InboxNotify(e.To, e); }
+
+/// The cover an item was handed to while its holder is away. A change of holder that names nobody tells nobody.
+[On]
+internal void TellTheCover(HolderChanged e) {
+  if (e.Told != null) { InboxNotify(e.Told!, e); }
+}
+
+/// Whoever holds it, when its policy says to tell them a promise is at risk or missed.
+[On]
+internal void TellTheHolder(PromiseToldToHolder e) { InboxNotify(e.Holder, e); }
+
+/// The queue's leads, when nobody has picked an item up in time — whoever the app's `LeadsInbox` says leads
+/// (`InboxLeads`, which asks it of each member).
+[On]
+internal void TellTheLeadsNobodyPickedItUp(PickupOverdue e) { InboxNotifyAll(InboxLeads(e.Item), e); }
+
+/// The queue's leads, when an item's policy says to tell them a promise is at risk or missed.
+[On]
+internal void TellTheLeadsOfAPromise(PromiseToldToLeads e) { InboxNotifyAll(InboxLeads(e.Item), e); }
+
+/// Tell `person` what the inbox said should reach them — in the second person, in their language, when they read it:
+/// "Offered to you.", "Handed to you — Ines is away until …". One unread notification per item and kind of event: a
+/// second "at risk" on one item moves the unread one to the top rather than adding another.
+public void InboxNotify(Principal person, Event e) {
+  var about = Events.About(e);
+  if (about is WorkItem item) {
+    Notify(person, new InboxToldYou { Item = item, Said = Events.Write(e) },
+           key: "inbox:" + item.Id.ToString() + ":" + Events.Name(e));
+  }
+}
+
+/// Tell each of `people`, once each — what the leads' two events go through: `InboxNotifyAll(InboxLeads(e.Item), e)`.
+public void InboxNotifyAll(Principal[] people, Event e) {
+  List<Guid> told = [];
+  foreach (var p in people) {
+    if (told.Contains(p.Id)) { continue; }
+    told.Add(p.Id);
+    InboxNotify(p, e);
+  }
+}
+
+/// What the inbox told somebody — its own event, kept as it was (`Events.Write`) and said TO them when they read it
+/// (`InboxNotice`). Nobody is offered it as a trigger or a webhook: it is how a notification says an inbox event.
+[Event("The inbox told you")]
+internal sealed class InboxToldYou {
+  public WorkItem Item;
+  public string Said = "";
+  public override string Sentence() {
+    var e = Events.Read(Said);
+    return e == null ? "Something happened." : InboxNotice(e!);
+  }
+}

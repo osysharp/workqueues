@@ -1,0 +1,30 @@
+// A REPORT IS ITS READER'S, through the item too. A job in a restricted queue is invisible to a technician outside it —
+// in a list, in a count, and so in every figure: its promises are counted only by those who may see the job they are
+// on, because a promise is read through its item as the item's own type allows (Explore reads a base type as its rows'
+// own types; the statement applies each row's rule).
+using Osysharp.WorkQueues;
+using Osysharp.WorkQueues.Reports;
+using Osysharp.Reports;
+using Osysharp.Explore;
+using InboxReportsKitTests;
+
+[Test(Desk)]
+[runas(Lena)]
+void a_job_in_a_restricted_queue_counts_only_for_those_who_may_see_it() {
+  TestClock.Set(new DateTime(2026, 6, 3, 9, 0, 0));
+  Report("Master key missing", "Locks");
+  TestClock.Set(new DateTime(2026, 6, 3, 10, 0, 0));
+  var promises = new ExploreQuery { Root = Explore.Root<SlaClock>(), Measures = [new ExploreMeasure { Name = "n" }],
+                                    GroupBy = [new ExploreGroup { Field = "Item.Queue" }] };
+  var jobs = new ExploreQuery { Root = Explore.Root<Job>(), Measures = [new ExploreMeasure { Name = "n" }] };
+  // Lena works Locks: the job, and its two running promises (first reply, fix).
+  Assert.Equal(1m, Explore.Run(jobs).Rows[0].Cells[0].Number);
+  var mine = Explore.Run(promises);
+  Assert.Equal("Locks", mine.Rows[0].Cells[0].Text);
+  Assert.Equal(2m, mine.Rows[0].Cells[1].Number);
+  // Rahul does not: none of it, anywhere.
+  runas (Rahul) {
+    Assert.Equal(0m, Explore.Run(jobs).Rows[0].Cells[0].Number);
+    Assert.Equal(0, Explore.Run(promises).Rows.Count);
+  }
+}

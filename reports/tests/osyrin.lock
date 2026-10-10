@@ -1,0 +1,29 @@
+{
+  "platform": {
+    "version": "0.9.0"
+  },
+  "entries": [
+    {
+      "name": "Osysharp.WorkQueues.Reports",
+      "kind": "package",
+      "shadow": "app-forkable",
+      "source": "workspace:kits/work-queues-reports",
+      "included": "completes Osysharp.WorkQueues \u002B Osysharp.Reports"
+    }
+  ],
+  "bridges": {
+    "searched": [
+      "workspace",
+      "platform"
+    ],
+    "skipped": [
+      "github: offline \u2014 the public catalog was not searched for bridges. Run \u0060osy lock\u0060 with a network to look."
+    ],
+    "notIncluded": [
+      {
+        "name": "Osysharp.WorkQueues.Notifications",
+        "reason": "completes Osysharp.WorkQueues \u002B Osysharp.Notifications, and this app does not use \u0060Osysharp.Notifications\u0060."
+      }
+    ]
+  }
+}

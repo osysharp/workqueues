@@ -1,0 +1,78 @@
+// The maintenance desk: technicians, a facilities lead, tenants; jobs in two queues. Everything it says to the inbox (who
+// works it) and to Reports (who reads them, and which two sources it reports on, in its own words).
+namespace InboxReportsKitTests;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.WorkQueues.Reports;
+using Osysharp.Reports;
+using Osysharp.Explore;
+using Osysharp.ServiceHours;
+
+[Role] enum AppRole { Authenticator, Technician, Lead, Tenant }
+
+policy WorksInbox => RoleGrant.Any(g => g.Member == user && (g.Role == AppRole.Technician || g.Role == AppRole.Lead));
+policy LeadsInbox => RoleGrant.Any(g => g.Member == user && g.Role == AppRole.Lead);
+policy AdministersInbox => LeadsInbox;
+policy ManagesOrganizations => LeadsInbox;
+policy CollaboratesOnRecords => WorksInbox;
+// Everybody who works the desk reads its reports; the lead shares them.
+policy ReadsReports => WorksInbox;
+policy SharesReports => LeadsInbox;
+policy ManagesClock => LeadsInbox;
+
+entity Person : Principal {
+  [MaxLength(200)] string CodeHash = "";
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+    deny read CodeHash when !IsAuthenticator;
+  }
+}
+
+/// A tenant company in the building.
+entity Tenant : CustomerAccount {
+  security { allow read when WorksInbox; allow create, update when ManagesOrganizations; }
+}
+
+partial entity ServiceHours { security { allow read when WorksInbox; allow create, update, delete when AdministersInbox; } }
+partial entity ServiceWindow { security { allow read when WorksInbox; allow create, update, delete when AdministersInbox; } }
+partial entity ServiceException { security { allow read when WorksInbox; allow create, update, delete when AdministersInbox; } }
+
+/// A maintenance job — a leak, a dead light, a door that sticks.
+entity Job : WorkItem {
+  [MaxLength(80)] string Room = "";
+  security {
+    allow read, create, update when WorksInbox;
+    allow read, create when IsAuthenticated where Requester == user;
+  }
+}
+
+/// The desk's words — what a job is, what done is called, and its groupings.
+public InboxReportWords DeskWords() {
+  return new InboxReportWords { Title = "Jobs", Noun = "job", Nouns = "jobs", Done = "Fixed", Finish = "fix", Agent = "Technician",
+                                Queue = "Trade", Organization = "Tenant" };
+}
+
+public class JobReports : IReportSource {
+  public ReportSource Describe() { return InboxWorkSource("jobs", Explore.Root<Job>(), DeskWords()); }
+}
+
+public class PromiseReports : IReportSource {
+  public ReportSource Describe() { return InboxPromiseSource("promises", DeskWords()); }
+}
+
+app.Inbox = new InboxSetup { DefaultQueue = "Plumbing", AgentsHandOn = false };
+
+[AuthMethod]
+string SignInWithCode(string email, string code) {
+  var p = Person.FirstOrDefault(x => x.Email == NormalisedEmail(email));
+  if (p == null || !p.IsActive) { Security.VerifyPassword(code); return ""; }
+  if (!Security.VerifyPassword(code, p.CodeHash)) { return ""; }
+  return Security.IssueJwt(p.Id, p.Email);
+}
+
+app.AuthBootstrap = new AuthBootstrap { Role = AppRole.Authenticator, Login = SignInWithCode };
+app.Auth = new PasswordAuth { LoginField = Email, PasswordField = CodeHash };

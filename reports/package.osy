@@ -1,0 +1,37 @@
+// Osysharp.WorkQueues.Reports — what a team's inbox did, as Osysharp.Reports sources: how much arrived, how much was done,
+// how soon the first reply came and how long it took to finish (medians and the slowest tenth), what stands open now,
+// and the share of promises kept — by agent, queue, channel, organization, tier and priority.
+//
+// ⚑ AN ADAPTER, SO NEITHER KIT DEPENDS ON THE OTHER: the Inbox does not force reports on an app that only works a queue,
+//   and Reports knows nothing of inboxes. An app using both gets it by itself (`completes` below), and says, in one class
+//   per source, which of its item kinds it reports on and in which words:
+//
+//       public class TicketReports : IReportSource {
+//         public ReportSource Describe() { return InboxWorkSource("tickets", Explore.Root<Ticket>(), HelpdeskWords()); }
+//       }
+//       public class PromiseReports : IReportSource {
+//         public ReportSource Describe() { return InboxPromiseSource("promises", HelpdeskWords()); }
+//       }
+//
+// ⚑ DEFINITIONS, said once and in the figures' own hints:
+//   · the WORK source counts items by when they ARRIVED (`ArrivedAt`) — "of what arrived in March, how much is done, how
+//     soon was it answered" — so a figure never changes its denominator under a reader's feet;
+//   · first reply and time to done are CALENDAR time from arrival (`FirstRespondedAt`/`DoneAt` − `ArrivedAt`), the time
+//     the requester actually waited; the PROMISE source has the same in the item's BUSINESS hours, as the clocks
+//     counted it (`SlaClock.BusinessTime`);
+//   · a promise is counted by when it STARTED, once it has ended — met in time, or met late; a promise still running is
+//     neither kept nor missed yet, and a cancelled one measured nothing.
+package Osysharp.WorkQueues.Reports {
+  version "0.2.2";
+  minPlatform "0.9.0";
+  summary     "Osysharp.Reports sources for Osysharp.WorkQueues — arrived, done, first reply and time to done (median and slowest tenth), open now, and promises kept, by agent, queue, channel, organization, tier and priority.";
+  completes   Osysharp.WorkQueues@0, Osysharp.Reports@0;
+  model "model/*.osy";
+  use Osysharp.Identity@0;
+  use Osysharp.Organizations@0;
+  use Osysharp.Organizations.ServicePlans@0;
+  use Osysharp.WorkQueues@0;
+  use Osysharp.Reports@0;
+  use Osysharp.Explore;
+  tests "tests";
+}

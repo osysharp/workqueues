@@ -1,0 +1,106 @@
+// THE WEEK EVERY TEST READS — four jobs at the maintenance desk, worked through the inbox's real run (its clocks, its
+// business hours), and read on Friday 5 June 2026 at 12:00 UTC.
+//
+// Business hours: Mon–Fri 09:00–17:00 UTC. The promise: first reply within 4 business hours, fixed within 16.
+//
+//   job  trade       arrived          who    first reply       fixed            first reply      fix
+//                                                                                (calendar · business)
+//   j1   Plumbing    Mon 1 Jun 09:00  Ines   Mon 10:00         Mon 13:00        1h · 1h  kept    4h · 4h  kept
+//   j2   Plumbing    Mon 1 Jun 15:00  Rahul  Tue 10:00         Tue 15:00        19h · 3h kept    24h · 8h kept
+//   j3   Plumbing    Tue 2 Jun 09:00  Ines   Tue 18:00         —                9h · 8h  LATE    running, run out Wed 17:00
+//   j4   Electrical  Wed 3 Jun 09:00  —      —                 —                running, run out Wed 13:00 · running, run out Thu 17:00
+//
+// So: 4 arrived, 2 fixed (50%); first reply median 9h, slowest tenth 17h (9h + 0.8 × 10h); time to fix median 14h;
+// open 2. Promises ended 5 (j1 ×2, j2 ×2, j3's first reply), kept 4 (80%), missed 4 (j3 ×2, j4 ×2); first reply in
+// business hours median 3h; time to fix in business hours median 6h.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.WorkQueues.Reports;
+using Osysharp.Reports;
+using Osysharp.Explore;
+using Osysharp.ServiceHours;
+using InboxReportsKitTests;
+
+[TestFixture]
+void Desk() {
+  TestClock.Set(new DateTime(2026, 6, 1, 8, 0, 0));
+  var ines = new Person { Email = "ines@desk.test", DisplayName = "Ines", CodeHash = Security.HashPassword("1111") };
+  new RoleGrant { Member = ines, Role = AppRole.Technician };
+  var rahul = new Person { Email = "rahul@desk.test", DisplayName = "Rahul", CodeHash = Security.HashPassword("2222") };
+  new RoleGrant { Member = rahul, Role = AppRole.Technician };
+  var lena = new Person { Email = "lena@desk.test", DisplayName = "Lena", CodeHash = Security.HashPassword("3333") };
+  new RoleGrant { Member = lena, Role = AppRole.Lead };
+  var olivia = new Person { Email = "olivia@tenant.test", DisplayName = "Olivia", CodeHash = Security.HashPassword("4444") };
+  new RoleGrant { Member = olivia, Role = AppRole.Tenant };
+
+  var standard = new OrganizationTier { Name = "Standard", Rank = 1, IsDefault = true };
+  new Tenant { Name = "Larkspur", Tier = standard };
+
+  var hours = new ServiceHours { Name = "Office hours", Zone = Zone.Of("UTC") };
+  foreach (var d in new List<DayOfWeek> { DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday, DayOfWeek.Friday }) {
+    new ServiceWindow { ServiceHours = hours, Day = d, Start = TimeSpan.FromHours(9), End = TimeSpan.FromHours(17) };
+  }
+  // Plumbing hands its jobs out in turn (Ines, then Rahul); Electrical is a pool nobody has taken from yet.
+  var plumbing = new Queue { Name = "Plumbing", Position = 1, Distribution = Distribution.RoundRobin };
+  var electrical = new Queue { Name = "Electrical", Position = 2 };
+  new QueueMember { Queue = plumbing, Member = ines };
+  new QueueMember { Queue = plumbing, Member = rahul };
+  foreach (var p in new List<Person> { ines, rahul, lena }) { new QueueMember { Queue = electrical, Member = p }; }
+  // Locks and keys: restricted — only Lena works it, and nobody else on the desk may see what is in it.
+  var locks = new Queue { Name = "Locks", Position = 3, Restricted = true };
+  new QueueMember { Queue = locks, Member = lena };
+  var promise = new SlaPolicy { Name = "Standard", Hours = hours, Position = 1 };
+  new SlaTarget { Policy = promise, Metric = SlaMetric.FirstResponse, Within = TimeSpan.FromHours(4) };
+  new SlaTarget { Policy = promise, Metric = SlaMetric.Resolution, Within = TimeSpan.FromHours(16) };
+}
+
+principal Ines => Person.Single(p => p.Email == "ines@desk.test");
+principal Rahul => Person.Single(p => p.Email == "rahul@desk.test");
+principal Lena => Person.Single(p => p.Email == "lena@desk.test");
+principal Olivia => Person.Single(p => p.Email == "olivia@tenant.test");
+
+/// A job reported now, in `trade`.
+Job Report(string title, string trade) {
+  var j = new Job { Title = title, Organization = Tenant.Single(t => t.Name == "Larkspur"), Requester = Person.Single(p => p.Email == "olivia@tenant.test"),
+                    Queue = Queue.Single(q => q.Name == trade) };
+  Workflow.Settle(j);
+  return j;
+}
+
+/// Lets every run catch up with the clock.
+void Settle(List<Job> jobs) { foreach (var j in jobs) { Workflow.Settle(j); } }
+
+/// One figure of `source`'s, over the last 7 days, as the screen writes it.
+string Figure(string source, string measure) {
+  var s = ReportSourceOrNull(source)!;
+  var m = s.Measures.Single(x => x.Measure.Name == measure);
+  var parts = WithParts([m.Measure], s);
+  var a = RunSourceReport(source, new ExploreQuery { Root = s.Root, Measures = parts }, PeriodPreset.Last7Days);
+  if (a.Result.Problem != "") { return "PROBLEM: " + a.Result.Problem; }
+  var at = a.Result.Columns.FindIndex(c => c.Name == measure);
+  return CellText(a.Result.Rows[0].Cells[at], a.Result.Columns[at].Kind, m.Format);
+}
+
+/// A breakdown of `source`'s `measures` by its grouping labelled `by`, one "key | value…" line per group.
+string By(string source, string by, List<string> measures) {
+  var s = ReportSourceOrNull(source)!;
+  var dim = s.Dimensions.Single(d => d.Label == by);
+  List<ExploreMeasure> chosen = [];
+  foreach (var n in measures) { chosen.Add(s.Measures.Single(x => x.Measure.Name == n).Measure); }
+  var a = RunSourceReport(source, new ExploreQuery { Root = s.Root, Measures = WithParts(chosen, s),
+                                                     GroupBy = [new ExploreGroup { Field = dim.Field }] }, PeriodPreset.Last7Days);
+  if (a.Result.Problem != "") { return "PROBLEM: " + a.Result.Problem; }
+  List<string> lines = [];
+  foreach (var r in a.Result.Rows) {
+    List<string> cells = [];
+    for (var i = 0; i < a.Result.Columns.Count; i = i + 1) {
+      var c = a.Result.Columns[i];
+      if (c.IsMeasure && !measures.Contains(c.Name)) { continue; }
+      cells.Add(CellText(r.Cells[i], c.Kind, FormatOf(c, s)));
+    }
+    lines.Add(String.Join(" | ", cells));
+  }
+  return String.Join("\n", lines);
+}

@@ -1,0 +1,174 @@
+namespace Osysharp.WorkQueues.Reports;
+
+using Osysharp.WorkQueues;
+using Osysharp.Reports;
+using Osysharp.Explore;
+
+/// The app's words for its inbox — what an item is called, what "done" is, and what its groupings are called. Both
+/// sources take the SAME words, which is what lets an overview put a figure from each in one breakdown: it joins them on
+/// the grouping of the same name ("Agent" in both).
+public class InboxReportWords {
+  /// The source's title, and an item in the singular and the plural — "Tickets", "ticket", "tickets".
+  public string Title = "Items";
+  public string Noun = "item";
+  public string Nouns = "items";
+  /// The app's word for done — "Solved", "Approved", "Closed" — and the verb for getting there: "Time to solve".
+  public string Done = "Done";
+  public string Finish = "finish";
+  public string Agent = "Agent";
+  public string Queue = "Queue";
+  public string Channel = "Channel";
+  public string Organization = "Organization";
+  public string Tier = "Tier";
+  public string Priority = "Priority";
+}
+
+// The paths both sources read, written once — each is checked against the model when the kit compiles.
+string ArrivedAt() { return Explore.Path<WorkItem>(w => w.ArrivedAt); }
+string FirstRespondedAt() { return Explore.Path<WorkItem>(w => w.FirstRespondedAt); }
+string DoneAt() { return Explore.Path<WorkItem>(w => w.DoneAt); }
+string HandlingPath() { return Explore.Path<WorkItem>(w => w.Handling); }
+
+/// Done or closed — the work finished. A cancelled item was not done; it is neither done nor open.
+ExploreFilter IsDone() {
+  return new ExploreFilter { Field = HandlingPath(), Op = FilterOp.IsAnyOf, Values = ["Done", "Closed"] };
+}
+
+/// THE WORK SOURCE over the app's own item kind — `root` is `Explore.Root<Ticket>()`. Counted by when items ARRIVED.
+/// Measures: `arrived`, `done`, `doneShare`, `firstReply` + `firstReplySlowest`, `toDone` + `toDoneSlowest`, `open`
+/// (as things stand — show it with an overview's `now`), `reopened`.
+public ReportSource InboxWorkSource(string key, string root, InboxReportWords words) {
+  return InboxWork(key, root, words).Source;
+}
+
+/// THE WORK SOURCE with its measures as members — `work.Done`, `work.FirstReply` — so an overview names them by
+/// reference and a misspelt one is a compile error.
+public class InboxWorkReport {
+  public ReportSource Source = new ReportSource();
+  public ReportMeasure Arrived = new ReportMeasure();
+  public ReportMeasure Done = new ReportMeasure();
+  public ReportMeasure DoneShare = new ReportMeasure();
+  public ReportMeasure FirstReply = new ReportMeasure();
+  public ReportMeasure FirstReplySlowest = new ReportMeasure();
+  public ReportMeasure ToDone = new ReportMeasure();
+  public ReportMeasure ToDoneSlowest = new ReportMeasure();
+  public ReportMeasure Open = new ReportMeasure();
+}
+
+public InboxWorkReport InboxWork(string key, string root, InboxReportWords words) {
+  var source = Keyed(WorkSourceOf(key, root, words));
+  var m = source.Measures;
+  return new InboxWorkReport { Source = source, Arrived = m[0], Done = m[1], DoneShare = m[2], FirstReply = m[3],
+                               FirstReplySlowest = m[4], ToDone = m[5], ToDoneSlowest = m[6], Open = m[7] };
+}
+
+ReportSource WorkSourceOf(string key, string root, InboxReportWords words) {
+  var done = words.Done.ToLower();
+  return new ReportSource {
+    Key = key, Title = words.Title, Root = root, Noun = words.Noun, Nouns = words.Nouns, Date = ArrivedAt(),
+    Measures = [
+      new ReportMeasure { Label = words.Title, Hint = $"{Cap(words.Nouns)} that arrived in the period.", Format = FigureFormat.Count,
+                          Measure = new ExploreMeasure { Name = "arrived" } },
+      new ReportMeasure { Label = words.Done, Hint = $"Of those, {done} by now.", Format = FigureFormat.Count,
+                          Measure = new ExploreMeasure { Name = "done", Where = [IsDone()] } },
+      new ReportMeasure { Label = $"{words.Done} share", Hint = $"{words.Done}, of everything that arrived.", Format = FigureFormat.Percent,
+                          Measure = new ExploreMeasure { Name = "doneShare", Kind = MeasureKind.Ratio, Numerator = "done", Denominator = "arrived" } },
+      new ReportMeasure { Label = "First reply", HigherIsBetter = false, Format = FigureFormat.Duration,
+                          Hint = $"Half of the answered {words.Nouns} had a first reply sooner than this, in calendar time.",
+                          Measure = new ExploreMeasure { Name = "firstReply", Kind = MeasureKind.Median, Field = FirstRespondedAt(), Since = ArrivedAt() } },
+      new ReportMeasure { Label = "First reply, slowest tenth", HigherIsBetter = false, Format = FigureFormat.Duration,
+                          Hint = $"Nine in ten answered {words.Nouns} had a first reply sooner than this.",
+                          Measure = new ExploreMeasure { Name = "firstReplySlowest", Kind = MeasureKind.Percentile, Fraction = 0.9m,
+                                                         Field = FirstRespondedAt(), Since = ArrivedAt() } },
+      new ReportMeasure { Label = $"Time to {words.Finish}", HigherIsBetter = false, Format = FigureFormat.Duration,
+                          Hint = $"Half of the {done} {words.Nouns} were {done} sooner than this, in calendar time.",
+                          Measure = new ExploreMeasure { Name = "toDone", Kind = MeasureKind.Median, Field = DoneAt(), Since = ArrivedAt(),
+                                                         Where = [IsDone()] } },
+      new ReportMeasure { Label = $"Time to {words.Finish}, slowest tenth", HigherIsBetter = false, Format = FigureFormat.Duration,
+                          Hint = $"Nine in ten {done} {words.Nouns} were {done} sooner than this.",
+                          Measure = new ExploreMeasure { Name = "toDoneSlowest", Kind = MeasureKind.Percentile, Fraction = 0.9m,
+                                                         Field = DoneAt(), Since = ArrivedAt(), Where = [IsDone()] } },
+      new ReportMeasure { Label = "Open", HigherIsBetter = false, Format = FigureFormat.Count,
+                          Hint = $"{Cap(words.Nouns)} not {done} or cancelled, whenever they arrived.",
+                          Measure = new ExploreMeasure { Name = "open", Where = [
+                            new ExploreFilter { Field = HandlingPath(), Op = FilterOp.IsNot, Values = ["Done"] },
+                            new ExploreFilter { Field = HandlingPath(), Op = FilterOp.IsNot, Values = ["Closed"] },
+                            new ExploreFilter { Field = HandlingPath(), Op = FilterOp.IsNot, Values = ["Cancelled"] }] } },
+    ],
+    Dimensions = WorkDimensions("", words),
+    RowFields = [Explore.Path<WorkItem>(w => w.Reference), Explore.Path<WorkItem>(w => w.Title), ArrivedAt()],
+  };
+}
+
+/// THE PROMISE SOURCE — every service-level promise on every item (`SlaClock`), counted by when it STARTED, once it has
+/// ended. Measures: `ended`, `kept`, `keptShare`, `missed`, `firstReplyHours` + `toDoneHours` (business time, as the
+/// clocks counted it). Groupings: the promise, and the item's — under the same words as the work source.
+public ReportSource InboxPromiseSource(string key, InboxReportWords words) {
+  return InboxPromises(key, words).Source;
+}
+
+/// THE PROMISE SOURCE with its measures as members — `promises.KeptShare`.
+public class InboxPromiseReport {
+  public ReportSource Source = new ReportSource();
+  public ReportMeasure Ended = new ReportMeasure();
+  public ReportMeasure Kept = new ReportMeasure();
+  public ReportMeasure KeptShare = new ReportMeasure();
+  public ReportMeasure Missed = new ReportMeasure();
+  public ReportMeasure FirstReplyHours = new ReportMeasure();
+  public ReportMeasure ToDoneHours = new ReportMeasure();
+}
+
+public InboxPromiseReport InboxPromises(string key, InboxReportWords words) {
+  var source = Keyed(PromiseSourceOf(key, words));
+  var m = source.Measures;
+  return new InboxPromiseReport { Source = source, Ended = m[0], Kept = m[1], KeptShare = m[2], Missed = m[3],
+                                  FirstReplyHours = m[4], ToDoneHours = m[5] };
+}
+
+ReportSource PromiseSourceOf(string key, InboxReportWords words) {
+  var outcome = Explore.Path<SlaClock>(c => c.Outcome);
+  var metric = Explore.Path<SlaClock>(c => c.Metric);
+  var ended = new ExploreFilter { Field = outcome, Op = FilterOp.IsAnyOf, Values = ["Met", "Breached"] };
+  var business = Explore.Path<SlaClock>(c => c.BusinessTime);
+  return new ReportSource {
+    Key = key, Title = "Promises", Root = Explore.Root<SlaClock>(), Noun = "promise", Nouns = "promises",
+    Date = Explore.Path<SlaClock>(c => c.StartedAt),
+    Measures = [
+      new ReportMeasure { Label = "Promises ended", Hint = "Promises that ran their course — met in time or late.", Format = FigureFormat.Count,
+                          Measure = new ExploreMeasure { Name = "ended", Where = [ended] } },
+      new ReportMeasure { Label = "Kept", Hint = "Promises met in time.", Format = FigureFormat.Count,
+                          Measure = new ExploreMeasure { Name = "kept", Where = [new ExploreFilter { Field = outcome, Op = FilterOp.Is, Values = ["Met"] }] } },
+      new ReportMeasure { Label = "Promises kept", Hint = "Of the promises that ended, the share met in time.", Format = FigureFormat.Percent,
+                          Measure = new ExploreMeasure { Name = "keptShare", Kind = MeasureKind.Ratio, Numerator = "kept", Denominator = "ended" } },
+      new ReportMeasure { Label = "Missed", Hint = "Promises that ran out — answered late, or still owed.", Format = FigureFormat.Count,
+                          HigherIsBetter = false,
+                          Measure = new ExploreMeasure { Name = "missed", Where = [new ExploreFilter { Field = Explore.Path<SlaClock>(c => c.BreachedAt), Op = FilterOp.HasValue }] } },
+      new ReportMeasure { Label = "First reply, business hours", HigherIsBetter = false, Format = FigureFormat.Duration,
+                          Hint = "Half of the first replies came sooner than this, counted in the item's business hours.",
+                          Measure = new ExploreMeasure { Name = "firstReplyHours", Kind = MeasureKind.Median, Field = business, Where = [ended,
+                            new ExploreFilter { Field = metric, Op = FilterOp.Is, Values = ["FirstResponse"] }] } },
+      new ReportMeasure { Label = $"Time to {words.Finish}, business hours", HigherIsBetter = false, Format = FigureFormat.Duration,
+                          Hint = "Half were finished sooner than this, counted in the item's business hours.",
+                          Measure = new ExploreMeasure { Name = "toDoneHours", Kind = MeasureKind.Median, Field = business, Where = [ended,
+                            new ExploreFilter { Field = metric, Op = FilterOp.Is, Values = ["Resolution"] }] } },
+    ],
+    Dimensions = WorkDimensions(Explore.Path<SlaClock>(c => c.Item) + ".", words)
+      .Concat([new ReportDimension { Field = metric, Label = "Promise" }]).ToList(),
+  };
+}
+
+/// The item's groupings, under the app's words — from the item itself (`prefix` ""), or from a row that points at one
+/// (`"Item."`).
+List<ReportDimension> WorkDimensions(string prefix, InboxReportWords words) {
+  return [
+    new ReportDimension { Field = prefix + Explore.Path<WorkItem>(w => w.Assignee), Label = words.Agent },
+    new ReportDimension { Field = prefix + Explore.Path<WorkItem>(w => w.Queue), Label = words.Queue },
+    new ReportDimension { Field = prefix + Explore.Path<WorkItem>(w => w.Channel), Label = words.Channel },
+    new ReportDimension { Field = prefix + Explore.Path<WorkItem>(w => w.Organization), Label = words.Organization },
+    new ReportDimension { Field = prefix + Explore.Path<WorkItem>(w => w.Organization.Tier), Label = words.Tier },
+    new ReportDimension { Field = prefix + Explore.Path<WorkItem>(w => w.Priority), Label = words.Priority },
+  ];
+}
+
+/// "tickets" → "Tickets".
+string Cap(string s) { return s == "" ? s : s.Substring(0, 1).ToUpper() + s.Substring(1); }

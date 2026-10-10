@@ -1,0 +1,23 @@
+// The producer's test project for Osysharp.WorkQueues.Reports — a building's maintenance desk: tenants report a leak or a dead
+// light, technicians take the job, and the facilities lead wants to know how much came in, how soon somebody answered,
+// how long a fix took, and how many promises were kept. NOT a helpdesk on purpose: the kit reports on any item kind.
+app InboxReportsKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Identity@0;
+  use Osysharp.Organizations@0;
+  use Osysharp.Organizations.ServicePlans@0;
+  use Osysharp.Presence@0;
+  use Osysharp.Observability;
+  use Osysharp.WorkQueues@0;
+  // Osysharp.WorkQueues.Reports, the package under test, is not written: it arrives by itself because this app uses
+  // Inbox and Reports, which it completes (`osy lock` includes it and says so).
+  use Osysharp.Reports@0;
+  use Osysharp.Explore;
+  use Osysharp.Charts@1;
+  use Osysharp.Csv@0;
+  use Osysharp.Storage;
+  use Osysharp.Workflow;
+  use Osysharp.ServiceHours;
+  use Osysharp.Ui;
+}

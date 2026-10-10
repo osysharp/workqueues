@@ -49,7 +49,7 @@ void at_risk_fires_once_at_the_policys_fraction() {
     Assert.Contains("Orbit export broken", Titles(Rows(BuiltInView.AtRisk)));
     TestClock.Advance(TimeSpan.FromHours(1));
     Workflow.Settle(r);
-    Assert.Equal(1, ToldCount(r, "inbox.promise-at-risk"));          // once
+    Assert.Equal(1, ToldCount(r, "work-queues.promise-at-risk"));          // once
   }
   runas (Ines) {                                                      // …and waiting pauses it, as it pauses the deadline
     TestClock.Set(new DateTime(2026, 6, 9, 0, 0, 0));

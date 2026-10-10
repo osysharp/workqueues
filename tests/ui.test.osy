@@ -230,7 +230,7 @@ void an_item_with_only_a_due_date_shows_its_clock_and_never_says_no_promise_appl
     Assert.Null(Request.Single(x => x.Id == id).Policy);
     Assert.True(HasPromise(r));
     // …and its arrival says what it is promised, not that nothing is.
-    Assert.Equal("Arrived — due by 2 July 2026 07:00 UTC.", Told.Single(t => t.Item == id && t.Kind == "inbox.item-arrived").Text);
+    Assert.Equal("Arrived — due by 2 July 2026 07:00 UTC.", Told.Single(t => t.Item == id && t.Kind == "work-queues.item-arrived").Text);
   }
   Ui.Viewport(1440, 900);
   Ui.SignInAs(Lena);

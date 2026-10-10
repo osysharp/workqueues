@@ -53,7 +53,7 @@ void after_the_language_wait_anyone_may_take_it() {
   runas (Lena) {
     var r = Ask("La factura está mal", queue: "Rota", language: "es");
     Assert.Equal("Nobody", HolderOf(r));                              // for the queue's 10 minutes, only a speaker
-    Assert.True(WasTold(r, "inbox.item-pooled"));
+    Assert.True(WasTold(r, "work-queues.item-pooled"));
     TestClock.Advance(TimeSpan.FromMinutes(9));
     Workflow.Settle(r);
     Assert.Equal("Nobody", HolderOf(r));

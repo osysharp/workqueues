@@ -37,7 +37,7 @@ void what_the_app_is_told_is_facts_it_can_say_in_any_language() {
   var r = Ask("Printer offline");
   TakeWork(r);
   Workflow.Settle(r);
-  var told = StepHeard(r, "inbox.holder-changed");
+  var told = StepHeard(r, "work-queues.holder-changed");
   Assert.Equal("Ines", told.To);
   Assert.Equal(AssignReason.Claimed, told.Reason);
   Assert.Equal("Ines took it.", InboxStepWords(told));

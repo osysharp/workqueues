@@ -18,7 +18,7 @@ void taking_an_item_puts_your_name_on_it_and_records_why() {
   Assert.Equal("Ines", last.To!.DisplayName);
   Assert.Equal("Ines", last.By!.DisplayName);
   Assert.Equal("Ines took it.", Said(last));
-  Assert.True(WasTold(r, "inbox.holder-changed"));
+  Assert.True(WasTold(r, "work-queues.holder-changed"));
 }
 
 [Test(Desk)]
@@ -192,7 +192,7 @@ void nobody_is_given_more_than_their_capacity() {
     }
     Assert.Equal("Ines, Rahul, Rahul, Nobody", string.Join(", ", holders));
     var pooled = Request.Single(x => x.Title == "Tiny four");
-    Assert.True(WasTold(pooled, "inbox.item-pooled"));
+    Assert.True(WasTold(pooled, "work-queues.item-pooled"));
     Assert.Contains("Tiny four", Titles(Rows(BuiltInView.Unassigned)));
     HandWorkTo(pooled, PersonNamed("Ines"));                        // capacity limits what the inbox GIVES — a lead may still
     Workflow.Settle(pooled);
@@ -258,7 +258,7 @@ void an_unclaimed_item_past_pickup_tells_the_leads() {
     TestClock.Advance(TimeSpan.FromMinutes(2));
     Workflow.Settle(left); Workflow.Settle(taken);
     Assert.True(WasTold(left, "notify:leads"));
-    Assert.True(WasTold(left, "inbox.pickup-overdue"));
+    Assert.True(WasTold(left, "work-queues.pickup-overdue"));
     Assert.False(WasTold(taken, "notify:leads"));                    // held in time: nobody is told
     TestClock.Advance(TimeSpan.FromHours(2));
     Workflow.Settle(left);

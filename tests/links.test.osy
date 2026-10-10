@@ -32,10 +32,10 @@ void a_link_shows_on_both_items_from_each_side_and_both_histories_say_it() {
   Assert.True(theirs[0].Removable);
 
   // Both items' history is told — facts, said from each one's side.
-  var told = Told.Where(t => t.Kind == "inbox.item-linked").OrderBy(t => t.At).ToList();
+  var told = Told.Where(t => t.Kind == "work-queues.item-linked").OrderBy(t => t.At).ToList();
   Assert.Equal(2, told.Count);
-  Assert.Equal("Linked: Duplicate of R-1.", Told.Single(t => t.Kind == "inbox.item-linked" && t.Item == again.Id).Text);
-  Assert.Equal("Linked: Duplicated by R-2.", Told.Single(t => t.Kind == "inbox.item-linked" && t.Item == first.Id).Text);
+  Assert.Equal("Linked: Duplicate of R-1.", Told.Single(t => t.Kind == "work-queues.item-linked" && t.Item == again.Id).Text);
+  Assert.Equal("Linked: Duplicated by R-2.", Told.Single(t => t.Kind == "work-queues.item-linked" && t.Item == first.Id).Text);
   // …and a link moves nothing: who holds them and where they wait are as they were.
   Assert.Equal(LinkedTo(again, "duplicate")!.Id, first.Id);
   Assert.Equal(1, LinkedFrom(first, "duplicate").Count);
@@ -87,8 +87,8 @@ void removing_a_link_takes_it_off_both_and_both_histories_say_so() {
   UnlinkWork(ItemLinksOf(a.Id)[0].Link);
   Assert.Equal(0, ItemLinksOf(a.Id).Count);
   Assert.Equal(0, ItemLinksOf(b.Id).Count);
-  Assert.Equal("Link removed: Related to R-31.", Told.Single(t => t.Kind == "inbox.item-unlinked" && t.Item == a.Id).Text);
-  Assert.Equal("Link removed: Related to R-30.", Told.Single(t => t.Kind == "inbox.item-unlinked" && t.Item == b.Id).Text);
+  Assert.Equal("Link removed: Related to R-31.", Told.Single(t => t.Kind == "work-queues.item-unlinked" && t.Item == a.Id).Text);
+  Assert.Equal("Link removed: Related to R-30.", Told.Single(t => t.Kind == "work-queues.item-unlinked" && t.Item == b.Id).Text);
   Assert.Equal("That link was already removed.", Assert.Throws<ValidationException>(() => UnlinkWork(Guid.NewGuid())).Message);
 }
 

@@ -47,10 +47,10 @@ void the_first_response_clock_breaches_when_nobody_responds_in_time() {
   var r = Ask("Export stuck");
   TestClock.Advance(TimeSpan.FromHours(7)); Workflow.Settle(r);
   Assert.Null(ClockOf(r, SlaMetric.FirstResponse).BreachedAt);       // 7 of 8 gone
-  Assert.False(WasTold(r, "inbox.promise-breached"));
+  Assert.False(WasTold(r, "work-queues.promise-breached"));
   TestClock.Advance(TimeSpan.FromHours(2)); Workflow.Settle(r);
   Assert.NotNull(ClockOf(r, SlaMetric.FirstResponse).BreachedAt);
-  Assert.True(WasTold(r, "inbox.promise-breached"));
+  Assert.True(WasTold(r, "work-queues.promise-breached"));
 }
 
 [Test(Desk)]
@@ -186,7 +186,7 @@ void raising_the_priority_retargets_every_clock() {
   Assert.Null(ClockOf(r, SlaMetric.FirstResponse).BreachedAt);
   TestClock.Advance(TimeSpan.FromMinutes(15)); Workflow.Settle(r);                                 // 65 minutes in all
   Assert.NotNull(ClockOf(r, SlaMetric.FirstResponse).BreachedAt);
-  Assert.True(WasTold(r, "inbox.priority-changed"));
+  Assert.True(WasTold(r, "work-queues.priority-changed"));
 }
 
 [Test(Desk)]
@@ -224,7 +224,7 @@ void an_item_with_no_policy_has_no_promise_and_says_so() {
     Assert.False(HasPromise(r));
     Assert.Equal(0, Clocks(r).Count);
     Assert.False(SlaClock.Any(c => c.Item.Id == r.Id));
-    Assert.True(Told.Any(t => t.Item == r.Id && t.Kind == "inbox.item-arrived" && t.Text.Contains("no promise")));
+    Assert.True(Told.Any(t => t.Item == r.Id && t.Kind == "work-queues.item-arrived" && t.Text.Contains("no promise")));
     TestClock.Advance(TimeSpan.FromDays(30)); Workflow.Settle(r);
     Assert.Equal(Handling.New, r.Handling);                          // nothing to breach; the work still stands
   }
@@ -262,8 +262,8 @@ void a_breach_found_late_is_recorded_when_it_happened() {
   Assert.Equal(new DateTime(2026, 6, 2, 11, 0, 0), first.AtRiskAt);
   Assert.Equal(SlaState.Breached, r.Sla);
   // …and the app is TOLD them at those minutes, so its timeline reads as it happened (InboxEvents.Recorded's `at`).
-  Assert.True(Told.Any(t => t.Item == r.Id && t.Kind == "inbox.promise-breached" && t.At == new DateTime(2026, 6, 2, 11, 30, 0)));
-  Assert.True(Told.Any(t => t.Item == r.Id && t.Kind == "inbox.promise-at-risk" && t.At == new DateTime(2026, 6, 2, 11, 0, 0)));
+  Assert.True(Told.Any(t => t.Item == r.Id && t.Kind == "work-queues.promise-breached" && t.At == new DateTime(2026, 6, 2, 11, 30, 0)));
+  Assert.True(Told.Any(t => t.Item == r.Id && t.Kind == "work-queues.promise-at-risk" && t.At == new DateTime(2026, 6, 2, 11, 0, 0)));
 }
 
 [Test(Desk)]
@@ -351,11 +351,11 @@ void an_absolute_due_date_runs_in_real_time_through_a_wait_and_breaches_at_the_i
   TestClock.Advance(TimeSpan.FromDays(7) + TimeSpan.FromHours(13)); Workflow.Settle(r);   // past 75% of ten days
   Assert.NotNull(ClockOf(r, SlaMetric.Resolution).AtRiskAt);
   Assert.Null(ClockOf(r, SlaMetric.Resolution).BreachedAt);
-  Assert.True(WasTold(r, "inbox.promise-at-risk"));
+  Assert.True(WasTold(r, "work-queues.promise-at-risk"));
 
   TestClock.Advance(TimeSpan.FromDays(3)); Workflow.Settle(r);
   Assert.Equal(due, ClockOf(r, SlaMetric.Resolution).BreachedAt);     // recorded at the instant it ran out
-  Assert.True(WasTold(r, "inbox.promise-breached"));
+  Assert.True(WasTold(r, "work-queues.promise-breached"));
   Assert.Equal(SlaState.Breached, Request.Single(x => x.Id == r.Id).Sla);
 }
 
@@ -372,5 +372,5 @@ void an_absolute_due_date_moves_only_through_the_kit_saying_why() {
   MoveDue(r, later, "Extended by two months: the request is complex.");
   Assert.Equal(later, Request.Single(x => x.Id == r.Id).DueAt);
   Assert.Equal(later, ClockOf(r, SlaMetric.Resolution).DueAt);
-  Assert.True(WasTold(r, "inbox.due-moved"));
+  Assert.True(WasTold(r, "work-queues.due-moved"));
 }

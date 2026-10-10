@@ -58,7 +58,7 @@ void an_item_is_never_assigned_offered_or_covered_to_someone_who_may_not_hold_it
   runas (Lena) {
     var ruled = Ask("Card refused", kind: "bill");
     Assert.Equal("Nobody", HolderOf(ruled));                         // Ines is not in Billing
-    Assert.True(WasTold(ruled, "inbox.routing-skipped"));
+    Assert.True(WasTold(ruled, "work-queues.routing-skipped"));
     foreach (var title in new List<string> { "Slow query", "Lock wait", "Vacuum" }) {
       Assert.Equal("Rahul", HolderOf(Ask(title, kind: "db", queue: "Rota")));   // only Rahul holds Databases
     }

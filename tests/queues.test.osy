@@ -13,8 +13,8 @@ void an_item_no_rule_names_lands_in_the_default_queue() {
   var r = Ask("Password reset loops");
   Assert.Equal("Support", r.Queue!.Name);                            // the app's DefaultQueue
   Assert.Equal("Arrived", Trail(r));
-  Assert.True(WasTold(r, "inbox.item-queued"));
-  Assert.False(WasTold(r, "inbox.item-routed"));                      // no rule placed it
+  Assert.True(WasTold(r, "work-queues.item-queued"));
+  Assert.False(WasTold(r, "work-queues.item-routed"));                      // no rule placed it
 }
 
 /// A routing rule's placement is its OWN event, `ItemRouted`, beside the `ItemQueued` every arrival raises — so a
@@ -27,10 +27,10 @@ void a_rules_placement_raises_item_routed_as_well_as_item_queued() {
   }
   runas (Lena) {
     var invoice = Ask("Invoice 42 is wrong");
-    Assert.True(WasTold(invoice, "inbox.item-queued"));
-    Assert.True(WasTold(invoice, "inbox.item-routed"));
+    Assert.True(WasTold(invoice, "work-queues.item-queued"));
+    Assert.True(WasTold(invoice, "work-queues.item-routed"));
     Assert.Equal("Arrived in Billing — rule “Money words”.",
-      Told.Single(t => t.Item == invoice.Id && t.Kind == "inbox.item-routed").Text);
+      Told.Single(t => t.Item == invoice.Id && t.Kind == "work-queues.item-routed").Text);
   }
 }
 

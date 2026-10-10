@@ -1,0 +1,14 @@
+// sv (Svenska): a few of the inbox's trail words, for the tests that prove a trail is said in its reader's language.
+// Every other text falls back to the source.
+
+translations sv {
+  /// Osysharp.WorkQueues.InboxSentence · a step of an item's trail
+  /// placeholders: {to} = to (string)
+  text "{to} took it." => "{to} tog ärendet.";
+  /// Osysharp.WorkQueues.InboxSentence · a step of an item's trail
+  /// placeholders: {queue} = queue (string), {by} = by (string)
+  text "Moved to {queue} by {by}." => "Flyttat till {queue} av {by}.";
+  /// Osysharp.WorkQueues.InboxSentence · a step of an item's trail
+  /// placeholders: {moved} = what the move said, {from} = from (string), {queue} = queue (string)
+  text "{moved} {from} is not in {queue}, so it is unheld." => "{moved} {from} är inte med i {queue}, så ingen har det nu.";
+}

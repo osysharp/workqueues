@@ -1,0 +1,130 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+
+// ── what the app says ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Works items: takes them, responds, moves them within their queues, sees the inbox. The app's to say:
+/// `policy WorksInbox => IsAgent;`
+policy WorksInbox;
+
+/// Also moves other people's work, manages queue members, availability and skills. `policy LeadsInbox => IsLead;`
+policy LeadsInbox;
+
+/// Also changes queues, SLA policies, hours, routing rules and shared views, and sees restricted queues.
+/// `policy AdministersInbox => IsAdmin;`
+policy AdministersInbox;
+
+// ── the kit's own words ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// How urgent an item is. The kit's, not the app's: policies, views and reports all name it. The app keeps its own
+/// `Priority` (or none) for its own meanings.
+// ⚠ Appended, never inserted: an enum is stored by position.
+public enum WorkPriority {
+  [Label("Low")] Low,
+  [Label("Normal")] Normal,
+  [Label("High")] High,
+  [Label("Urgent")] Urgent,
+}
+
+/// Where an item stands in the work, as the clocks read it — the `WorkHandling` run's, moved by the four facts the app
+/// tells the kit. The app's own states stay the app's; this is the phase the promise is kept by.
+public enum Handling {
+  /// Nobody has responded yet — the first-response clock runs.
+  [Label("New")] New,
+  /// The requester wrote; a response is owed — a next-response clock runs.
+  [Label("Owed a response")] Owed,
+  /// Responded, and nothing is owed until they write again.
+  [Label("Answered")] Answered,
+  /// Waiting on the requester — every clock is paused.
+  [Label("Waiting on the requester")] WaitingOnRequester,
+  /// Waiting on somebody else — a vendor, engineering. Resolution keeps running (the requester still waits on us),
+  /// unless the item's policy says waiting on others pauses it — then the item is `Paused` instead.
+  [Label("Waiting on others")] WaitingOnOthers,
+  /// Held by agreement — every clock is paused.
+  [Label("Paused")] Paused,
+  /// Done; it may reopen.
+  [Label("Done")] Done,
+  [Label("Closed")] Closed,
+  [Label("Cancelled")] Cancelled,
+}
+
+/// What the app says the item is waiting on — `WaitOn(item, WaitFor.Requester)`.
+public enum WaitFor {
+  /// The requester: more information, a confirmation. Every clock pauses.
+  [Label("The requester")] Requester,
+  /// Somebody else: a vendor, another team. Resolution runs unless the policy pauses it.
+  [Label("Somebody else")] Others,
+  /// Nobody — held by agreement, a legal hold. Every clock pauses.
+  [Label("On hold")] Pause,
+}
+
+/// The three promises. Fixed, so policies, clocks and reports can name them; the app supplies its own WORDS for them
+/// ("feedback due", "decide by", "acknowledge") through `InboxWords`.
+public enum SlaMetric {
+  [Label("First response")] FirstResponse,
+  [Label("Next response")] NextResponse,
+  [Label("Resolution")] Resolution,
+}
+
+// ── how the app's inbox works ─────────────────────────────────────────────────────────────────────────────────────────
+
+/// How the app's inbox works — `app.Inbox = new InboxSetup { … }`. Every field has a default, so an app that states
+/// nothing has a working inbox with one queue.
+[AppSetting("Inbox")]
+public class InboxSetup {
+  /// May an agent hand an item to a colleague, or take one a colleague holds? Leads always may. The target must be
+  /// able to hold it either way.
+  public bool AgentsHandOn = true;
+  /// The queue an item lands in when nothing names one — made on first use.
+  public string DefaultQueue = "General";
+  /// Offer an organisation's items to its account team first — owner, backup, pod — before the queue hands them out.
+  public bool AccountRouting = true;
+  /// An escalated item stays with its holder when they are a member at the new level; false: it is always routed again.
+  public bool KeepHolderOnEscalation = true;
+  /// Where an item goes and what it needs, in the app's own terms — override `QueueFor`, `SkillsFor`, `Routed`.
+  public InboxRouting Routing = new InboxRouting();
+  /// The app's own filter for a saved view ("tag:refund") — override `Narrow`.
+  public InboxViews Views = new InboxViews();
+  /// The app's words for the three promises.
+  public InboxWords Words = new InboxWords();
+  /// The kinds of link its items may have — "Duplicate of", "Caused by" (Links.osy). None: nothing is linked.
+  public InboxLinks Links = new InboxLinks();
+}
+
+/// Where an item goes and what it needs, said in the app's own terms. Asked when an item ARRIVES, after the app's own
+/// choice of queue and the inbox's routing rules — so admins' rules (data) win over code, and code over the default.
+public class InboxRouting {
+  /// The queue `item` waits in when neither the app nor a rule named one. Null: no opinion — the default queue.
+  public virtual Queue? QueueFor(WorkItem item) { return null; }
+  /// Skills `item` needs, beyond what the rules say: required ones limit who may hold it, preferred ones rank.
+  public virtual List<SkillNeed> SkillsFor(WorkItem item) { return new List<SkillNeed>(); }
+  /// A matching routing rule's own app action, by key ("tag:refund"), with the rule's name — the app does what the
+  /// key says (tag it, set a field of its own). Asked for each matching rule that has one, in order, as the item
+  /// arrives. Default: nothing — a key the app does not understand does nothing. The run's write.
+  public virtual void Act(WorkItem item, string appAction, string rule) { }
+  /// `item` has arrived and been routed — the app's own follow-ups, whatever matched. The run's write.
+  public virtual void Routed(WorkItem item) { }
+}
+
+/// A skill an item needs: required (only holders of it may hold the item) or preferred (they rank first).
+public class SkillNeed {
+  public RoutingSkill Skill;
+  public bool Required = true;
+}
+
+/// The app's own filters for saved views — a view whose `AppFilter` is "tag:refund" shows the items `Narrow` names.
+public class InboxViews {
+  /// The ids of the items the app's own filter `appFilter` keeps. Default: none — an app filter the app does not
+  /// understand shows nothing rather than everything.
+  public virtual List<Guid> Narrow(string appFilter) { return new List<Guid>(); }
+}
+
+/// The app's words for the three promises — "feedback due", "decide by", "acknowledge".
+public class InboxWords {
+  public virtual string Metric(SlaMetric metric) {
+    if (metric == SlaMetric.FirstResponse) { return "first response"; }
+    if (metric == SlaMetric.NextResponse) { return "next response"; }
+    return "resolution";
+  }
+}

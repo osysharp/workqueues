@@ -1,0 +1,171 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+
+/// THE ITEM'S LINKS — every link it has, from its side ("Duplicate of #1042", "Caused #1057"), each opening the other
+/// item, each removable by whoever works the inbox; and "Link…", which asks which way and finds the other item by its
+/// reference or the words of its title. Live: a link a colleague makes or removes appears or goes. `hrefOf` says where
+/// an item opens (its route is the app's — by id, by reference). `shortcut` opens the picker (the app's key). `empty` is
+/// what an unlinked item says. `titled`: false when the place it stands names it already (a sheet called "Links").
+/// `opened`: what the page already asked for the item (`OpenItem`) — then this asks nothing of its own as it opens.
+/// `onAct`: what the app does when somebody takes a kind's step (`LinkKind.Act`, "Merge into #1042") on one of its
+/// links; without it no step is offered.
+[Composable]
+public component ItemLinks(WorkItem item, Func<WorkItem, string> hrefOf, string shortcut = "",
+                           string empty = "Not linked to anything.", bool titled = true, ItemOpening? opened = null,
+                           Action<WorkLink>? onAct = null) {
+  live var itemId = item.Id;
+  // Its links, both ways — live, so one a colleague makes or removes appears or goes.
+  live var linked = WorkLink.Where(l => l.From.Id == itemId || l.To.Id == itemId).Include(l => l.From).Include(l => l.To)
+    .OrderByDescending(l => l.At).ToList();
+  // Every kind's words from both sides, in the reader's language — said once, on the server, as it opens.
+  List<LinkChoice> asked = [];
+  bool askedLoaded = false;
+  bool adding = false;
+  bool picking = false;
+  string kindKey = "";
+  bool kindBack = false;
+  string kindWords = "";
+  string words = "";
+  List<WorkPick> picks = [];
+  bool searched = false;
+  string problem = "";
+
+  on mount {
+    if (opened == null) {
+      asked = AllLinkWords();
+      askedLoaded = true;
+    }
+  }
+  live var said = opened != null ? opened.LinkWords : asked;
+  live var loaded = opened != null ? opened.Loaded : askedLoaded;
+  live var choices = said.Where(c => c.Offered && !c.Repeats).ToList();
+
+  // The kind a new link starts as is the first the app offers — chosen as the picker opens, once the words are here.
+  action Start() {
+    adding = true; problem = ""; picks = []; searched = false; words = "";
+    if (kindKey == "" && choices.Count > 0) { kindKey = choices[0].Key; kindBack = choices[0].Reversed; kindWords = choices[0].Words; }
+  }
+  action Stop() { adding = false; picking = false; problem = ""; }
+  action Pick() { picking = !picking; }
+  action Choose(LinkChoice c) { kindKey = c.Key; kindBack = c.Reversed; kindWords = c.Words; picking = false; }
+  action Find() {
+    problem = "";
+    picks = FindWork(words, itemId);
+    searched = true;
+  }
+  action LinkTo(Guid other) {
+    problem = "";
+    try {
+      LinkWork(itemId, other, kindKey, kindBack);
+      adding = false;
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action Remove(Guid link) {
+    problem = "";
+    try { UnlinkWork(link); } catch (Exception ex) { problem = ex.Message; }
+  }
+
+  render {
+    Stack(gap: 2, label: "Links") {
+      Row(gap: 2, align: Align.Center) {
+        if (titled) { SectionLabel("Linked"); }
+        Spacer();
+        if (choices.Count > 0) {
+          Button("Link…", onPress: Start, size: Size.Sm, tone: Tone.Ghost,
+                 shortcut: shortcut);
+        }
+      }
+      if (loaded && linked.Count == 0 && !adding) {
+        Text(empty, fontSize: FontSize.Caption, color: Colors.TextMuted);
+      }
+      if (loaded) {
+        foreach (var l in linked) {
+          LinkLine(l, l.To.Id == itemId, said, hrefOf, () => Remove(l.Id), onAct: onAct);
+        }
+      }
+      if (adding && choices.Count > 0) {
+        Stack(gap: 2, p: 3, rounded: Radius.Md, bg: Colors.Sunken, borderW: 1, border: Colors.Border, label: "Link to another") {
+          // Which way: this item says it ("Duplicate of"), or the other does ("Duplicated by").
+          Box(position: Position.Relative) {
+            Pressable(onClick: Pick, label: "Kind of link: " + kindWords, px: 2, py: 1, rounded: Radius.Md,
+                      bg: Colors.Surface, borderW: 1, border: Colors.Border) {
+              Row(gap: 2, align: Align.Center) {
+                Text("This one is", fontSize: FontSize.Caption, color: Colors.TextMuted);
+                Text(kindWords, fontSize: FontSize.Label, fontWeight: FontWeight.Medium);
+                Icon(Icons.ChevronDown, size: 12, color: Colors.TextMuted);
+              }
+            }
+            if (picking) {
+              Backdrop(Pick);
+              Menu(from: MenuFrom.BelowStart, label: "Kind of link") {
+                foreach (var c in choices) {
+                  MenuItem(c.Words, () => Choose(c), checked: c.Key == kindKey && c.Reversed == kindBack);
+                }
+              }
+            }
+          }
+          Field("Find the other one", value: words, placeholder: "Its number, or words from its title", onEnter: Find);
+          Row(gap: 2) {
+            Button("Find", onPress: Find, size: Size.Sm);
+            Button("Cancel", onPress: Stop, size: Size.Sm, tone: Tone.Ghost);
+          }
+          if (searched && picks.Count == 0) {
+            Text("Nothing matches “" + words + "”.", fontSize: FontSize.Caption, color: Colors.TextMuted);
+          }
+          foreach (var p in picks) {
+            Row(gap: 2, align: Align.Center, minW: "0", label: p.Reference + " " + p.Title) {
+              Text(p.Reference, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted,
+                   whiteSpace: WhiteSpace.Nowrap);
+              Text(p.Title, fontSize: FontSize.Label, whiteSpace: WhiteSpace.Nowrap, overflow: Overflow.Hidden,
+                   textOverflow: TextOverflow.Ellipsis, minW: "0", grow: 1);
+              Button("Link " + p.Reference, onPress: () => LinkTo(p.Item), size: Size.Sm, tone: Tone.Primary);
+            }
+          }
+        }
+      }
+      if (problem != "") { Alert(problem, tone: Tone.Warning); }
+    }
+  }
+}
+
+/// One link from an item's side — the words, the other item (its reference, title and where it stands), opening it;
+/// and, for a kind people choose, removing it.
+[Composable]
+public component LinkLine(WorkLink link, bool back, List<LinkChoice> said, Func<WorkItem, string> hrefOf, Action onRemove,
+                          Action<WorkLink>? onAct = null) {
+  live var other = back ? link.From : link.To;
+  live var words = WordsOf(said, link.Kind, back);
+  // The kind's step, offered while the item taking it is still being worked — a merged duplicate has nothing left to do.
+  live var act = onAct == null || back || IsFinished(link.From.Handling) ? "" : ActOf(said, link.Kind, back);
+  render {
+    Row(gap: 2, align: Align.Center, minW: "0", role: UiRole.ListItem, label: words + " " + other.Reference,
+        animation: KitArrive) {
+      Link(href: hrefOf(other), color: Colors.OnSurface, grow: 1, minW: "0") {
+        Stack(gap: 0, minW: "0") {
+          Text(words, fontSize: FontSize.Caption, color: Colors.TextMuted);
+          Row(gap: 2, align: Align.Center, minW: "0") {
+            Text(other.Reference, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted,
+                 whiteSpace: WhiteSpace.Nowrap);
+            Text(other.Title, fontSize: FontSize.Label, whiteSpace: WhiteSpace.Nowrap, overflow: Overflow.Hidden,
+                 textOverflow: TextOverflow.Ellipsis, minW: "0", grow: 1);
+            Text(other.Handling.Label, fontSize: FontSize.Caption, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap);
+          }
+        }
+      }
+      if (act != "") {
+        Button(act + " " + other.Reference, onPress: () => onAct!(link), size: Size.Sm, tone: Tone.Ghost);
+      }
+      if (ChosenByPeople(said, link.Kind)) {
+        IconButton("Remove the link to " + other.Reference, onRemove, size: Size.Sm, tone: Tone.Ghost) {
+          Icon(Icons.Close, size: 10);
+        }
+      }
+    }
+  }
+}
+
+/// Is an item in `h` finished — done, closed or cancelled — so that nothing is left to do on it?
+public bool IsFinished(Handling h) {
+  return h == Handling.Done || h == Handling.Closed || h == Handling.Cancelled;
+}

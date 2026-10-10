@@ -1,0 +1,199 @@
+// ACCOUNT-BASED ROUTING — an organisation's own people first: its owner, then its backup (or the owner's cover), then
+// its pod, then the segment queue that serves its tier, then the queue. Each offer waits the queue's `OfferFor` in the
+// queue's hours; anybody who cannot take it NOW is skipped at once, with the reason on the trail. Dedicated never means
+// stuck. The desk is in desk.test.osy: Acme is an Enterprise customer whose account team each test sets.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+using InboxKitTests;
+
+[Test(Desk)]
+void an_organisations_item_is_offered_to_its_account_owner_first() {
+  runas (Ada) { Team("Acme", "Mateo", "Lena", new List<string> { "Ines" }); }   // Mateo is not in Support — the account is his
+  var id = Guid.Empty;
+  runas (Lena) {
+    var r = Ask("Acme cannot export", org: "Acme");
+    id = r.Id;
+    Assert.Equal("Nobody", HolderOf(r));
+    Assert.Equal("Mateo", OfferedOf(r));
+    var offered = TrailOf(r)[1];
+    Assert.Equal(AssignReason.AccountOwner, offered.Reason);
+    Assert.Equal("Offered to Mateo (account owner); it falls through after 15 minutes.", Said(offered));
+    Assert.Equal(OfferState.Offered, OfferOf(r).State);
+  }
+  runas (Mateo) {
+    var r = Request.Single(x => x.Id == id);
+    Assert.Equal("Acme cannot export", Titles(Rows(BuiltInView.Offered)));
+    Assert.Equal(1, Counts().Offered);
+    AcceptOffer(r);
+    Workflow.Settle(r);
+    Assert.Equal("Mateo", HolderOf(r));
+    Assert.Equal("Nobody", OfferedOf(r));
+    Assert.Equal(AssignReason.AccountOwner, TrailOf(r)[2].Reason);    // why he has it: he owns the account
+    Assert.Equal(OfferState.Accepted, OfferOf(r).State);
+    Assert.Equal(0, Counts().Offered);
+  }
+}
+
+[Test(Desk)]
+void an_offer_falls_through_to_the_backup_then_the_pod_then_the_queue_on_time() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  runas (Ada) {
+    Team("Acme", "Mateo", "Lena", new List<string> { "Ines", "Rahul" });
+    var pod = new Queue { Name = "Enterprise pod", Distribution = Distribution.RoundRobin,
+                          ForTier = OrganizationTier.Single(t => t.Name == "Enterprise") };
+    new QueueMember { Queue = pod, Member = PersonNamed("Rahul") };
+    UnitOfWork.Commit();
+  }
+  runas (Lena) {
+    var r = Ask("Acme sync stalls", org: "Acme");
+    Assert.Equal("Mateo", OfferedOf(r));
+    TestClock.Advance(TimeSpan.FromMinutes(14));
+    Workflow.Settle(OfferOf(r));
+    Assert.Equal("Mateo", OfferedOf(r));                              // 14 minutes: still his
+    TestClock.Advance(TimeSpan.FromMinutes(2));
+    Workflow.Settle(OfferOf(r));
+    Assert.Equal("Lena", OfferedOf(r));                               // the backup
+    TestClock.Advance(TimeSpan.FromMinutes(16));
+    Workflow.Settle(OfferOf(r));
+    Assert.Equal("Ines", OfferedOf(r));                               // the pod, least loaded first
+    TestClock.Advance(TimeSpan.FromMinutes(16));
+    Workflow.Settle(OfferOf(r));
+    Assert.Equal("Nobody", OfferedOf(r));                             // past the team: the Enterprise pod queue gives it out
+    Assert.Equal("Rahul", HolderOf(r));
+    Assert.Equal("Enterprise pod", Request.Single(x => x.Id == r.Id).Queue!.Name);
+    Assert.Equal("Arrived → AccountOwner → FellThrough → AccountBackup → FellThrough → AccountPod → FellThrough → FellThrough → RoundRobin",
+                 Trail(r));
+    Assert.Equal("Mateo did not take it in 15 minutes — it falls through.", Said(TrailOf(r)[2]));
+    Assert.Equal(3, RoutingOffer.Count(o => o.Item.Id == r.Id && o.State == OfferState.FellThrough));
+  }
+}
+
+[Test(Desk)]
+void an_away_owner_is_skipped_at_once_and_the_note_says_why() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  runas (Ada) { Team("Acme", "Mateo", "Lena", new List<string>()); }
+  runas (Lena) { MarkAway(PersonNamed("Mateo"), until: new DateTime(2026, 6, 8, 6, 0, 0)); }
+  runas (Lena) {
+    var r = Ask("Acme invoices missing", org: "Acme");
+    Assert.Equal("Lena", OfferedOf(r));                               // at once — not after Mateo's fifteen minutes
+    var skipped = TrailOf(r)[1];
+    Assert.Equal(AssignReason.OwnerAway, skipped.Reason);
+    Assert.Equal("Mateo is away until Mon 8 Jun 06:00 UTC — skipped.", Said(skipped));
+    // The skip is its own step, with who, why and until when; the offer that follows says only the offer.
+    Assert.Equal("Offered to Lena (backup); it falls through after 15 minutes.", Said(TrailOf(r)[2]));
+  }
+}
+
+[Test(Desk)]
+void an_offer_waits_for_the_owners_hours_on_a_business_hours_queue() {
+  runas (Ada) {
+    Team("Acme", "Mateo", "Lena", new List<string>());
+    var desk = new Queue { Name = "Accounts desk", Hours = ServiceHours.Single(h => h.Name == "Business hours") };
+    new QueueMember { Queue = desk, Member = PersonNamed("Lena") };
+    UnitOfWork.Commit();
+  }
+  TestClock.Set(new DateTime(2026, 6, 5, 14, 50, 0));                 // Fri 16:50 Stockholm: ten minutes of the desk's day left
+  runas (Lena) {
+    var r = Ask("Acme renewal question", org: "Acme", queue: "Accounts desk");
+    Assert.Equal("Mateo", OfferedOf(r));
+    TestClock.Set(new DateTime(2026, 6, 8, 6, 50, 0));                // Mon 08:50: a weekend later, ten minutes used
+    Workflow.Settle(OfferOf(r));
+    Assert.Equal("Mateo", OfferedOf(r));                              // still his — it waited for the desk's morning
+    TestClock.Set(new DateTime(2026, 6, 8, 7, 6, 0));                 // Mon 09:06: fifteen minutes of the desk's hours
+    Workflow.Settle(OfferOf(r));
+    Assert.Equal("Lena", OfferedOf(r));
+  }
+}
+
+[Test(Desk)]
+void responding_to_an_offered_item_accepts_it() {
+  runas (Ada) { Team("Acme", "Mateo", "Lena", new List<string>()); }
+  var id = Guid.Empty;
+  runas (Lena) { id = Ask("Acme login loops", org: "Acme").Id; }
+  runas (Mateo) {
+    var r = Request.Single(x => x.Id == id);
+    Responded(r);                                                     // he answered it — so it is his
+    Workflow.Settle(r);
+    Assert.Equal("Mateo", HolderOf(r));
+    Assert.Equal("Nobody", OfferedOf(r));
+    Assert.Equal(AssignReason.AccountOwner, TrailOf(r)[2].Reason);
+    Assert.Equal("Mateo took the offer (account owner).", Said(TrailOf(r)[2]));
+    Assert.Equal(OfferState.Accepted, OfferOf(r).State);
+    Assert.Equal(ClockOutcome.Met, ClockOf(r, SlaMetric.FirstResponse).Outcome);
+  }
+}
+
+[Test(Desk)]
+void declining_an_offer_falls_through_at_once() {
+  runas (Ada) { Team("Acme", "Mateo", "Lena", new List<string>()); }
+  var id = Guid.Empty;
+  runas (Lena) { id = Ask("Acme wants a call", org: "Acme").Id; }
+  runas (Ines) { Assert.Denied(() => DeclineOffer(Request.Single(x => x.Id == id))); }   // not hers to decline
+  runas (Mateo) {
+    var r = Request.Single(x => x.Id == id);
+    DeclineOffer(r);
+    Workflow.Settle(r);
+    Assert.Equal("Lena", OfferedOf(r));
+    Assert.Equal("Mateo declined it.", Said(TrailOf(r)[2]));
+  }
+}
+
+[Test(Desk)]
+void my_accounts_lists_my_organisations_with_their_open_and_at_risk_work() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  runas (Ada) {
+    Team("Acme", "Mateo", "", new List<string>());
+    Team("Orbit Labs", "Lena", "", new List<string> { "Mateo" });
+  }
+  runas (Lena) {
+    Ask("Acme one", org: "Acme");                                     // offered to Mateo
+    var waiting = Ask("Acme two", org: "Acme");
+    HandWorkTo(waiting, PersonNamed("Lena"));
+    Responded(waiting);
+    WaitOn(waiting, WaitFor.Requester);
+    Ask("Orbit one", org: "Orbit Labs");                              // offered to Lena
+    Ask("Larkspur one");                                             // nobody's account
+    TestClock.Advance(TimeSpan.FromMinutes(100));                     // Enterprise first response: 2h, at risk at 1h30
+    foreach (var r in Request.ToList()) { Workflow.Settle(r); }
+  }
+  runas (Mateo) {
+    var accounts = MyAccounts();
+    Assert.Equal(2, accounts.Count);
+    var acme = accounts.Single(a => a.Name == "Acme");
+    Assert.Equal("Enterprise", acme.Tier);
+    Assert.Equal(1, acme.Open);
+    Assert.Equal(1, acme.AtRisk);
+    Assert.Equal(1, acme.Offered);
+    Assert.Equal(1, acme.Waiting);
+    var orbit = accounts.Single(a => a.Name == "Orbit Labs");
+    Assert.Equal(1, orbit.Open);
+    Assert.Equal(0, orbit.Offered);                                   // offered to Lena, not to him
+    Assert.Equal("Acme one, Acme two, Orbit one", Titles(Rows(BuiltInView.MyAccounts)));
+  }
+  runas (Rahul) { Assert.Equal(0, MyAccounts().Count); }
+}
+
+[Test(Desk)]
+void dedicated_never_means_stuck() {
+  runas (Ada) { Team("Acme", "Mateo", "Lena", new List<string> { "Ines" }); }
+  runas (Lena) {
+    MarkAway(PersonNamed("Mateo"));
+    new Availability { Person = PersonNamed("Lena"), Status = Presence.Busy };
+    new Availability { Person = PersonNamed("Ines"), Status = Presence.Offline };
+    UnitOfWork.Commit();
+  }
+  runas (Lena) {
+    var r = Ask("Acme is down", org: "Acme", queue: "Rota");
+    Assert.Equal("Rahul", HolderOf(r));                               // the whole team is out: the rota has it, in the same step
+    Assert.Equal("Nobody", OfferedOf(r));
+    Assert.False(RoutingOffer.Any(o => o.Item.Id == r.Id));
+    // Each one skipped is a step of its own, with why — the owner away, the backup busy, the pod offline.
+    Assert.Equal("Arrived → OwnerAway → Skipped → Skipped → RoundRobin", Trail(r));
+    Assert.Equal("Lena is busy — skipped.", Said(TrailOf(r)[2]));
+    Assert.Equal("Ines is offline — skipped.", Said(TrailOf(r)[3]));
+  }
+}

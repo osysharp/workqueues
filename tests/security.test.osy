@@ -1,0 +1,338 @@
+// THE INBOX'S FLOOR — what holds whatever the app grants. Each test guards one of the kit's security invariants, and
+// each was watched going RED with its guard removed. The app here grants its
+// agents EVERY request (`allow read, create, update when WorksInbox`), so whatever is refused below is the kit's floor.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+using InboxKitTests;
+
+// ── 1 · inbox-a-restricted-queue-is-read-by-its-members-only ─────────────────────────────────────────────────────────
+[Test(Desk)]
+void restricted_queue_items_are_invisible_and_uncounted_for_agents_outside_it() {
+  var id = Guid.Empty;
+  runas (Lena) { id = Ask("Phishing report", queue: "Security").Id; }   // Security is restricted; Lena is its member
+  runas (Ines) {
+    Assert.False(Request.Any(x => x.Id == id));                       // not in a read, though the app grants all
+    Assert.False(WorkItem.Any(x => x.Id == id));                      // nor through the base
+    Assert.DoesNotContain("Phishing report", Titles(Rows(BuiltInView.Open)));
+    Assert.Equal(0, Counts().Queues.Single(q => q.Name == "Security").Open);
+    Assert.Equal(Rows(BuiltInView.Open).Count, Counts().Open);
+  }
+  runas (Lena) {
+    Assert.True(Request.Any(x => x.Id == id));
+    Assert.Equal(1, Counts().Queues.Single(q => q.Name == "Security").Open);
+  }
+  runas (Ada) { Assert.True(Request.Any(x => x.Id == id)); }          // an inbox admin sees every queue
+  runas (Olivia) { Assert.True(Request.Any(x => x.Id == id)); }       // the requester's own read is the app's
+}
+
+// ── 2 · inbox-work-goes-only-to-who-may-hold-it ──────────────────────────────────────────────────────────────────────
+[Test(Desk)]
+void an_item_is_never_assigned_offered_or_covered_to_someone_who_may_not_hold_it() {
+  var billing = Guid.Empty;
+  var secure = Guid.Empty;
+  runas (Lena) {
+    billing = Ask("Chargeback", queue: "Billing").Id;
+    secure = Ask("Leaked key", queue: "Security").Id;
+    // A lead may hand on anything — but never to somebody who may not hold it; least of all a restricted item.
+    Assert.Throws<ValidationException>(() => HandWorkTo(Request.Single(x => x.Id == secure), PersonNamed("Ines")));
+    Assert.Throws<ValidationException>(() => HandWorkTo(Request.Single(x => x.Id == billing), PersonNamed("Ines")));
+  }
+  runas (Ines) { Assert.Throws<ValidationException>(() => TakeWork(Request.Single(x => x.Id == billing))); }
+  runas (Ada) { Assert.Throws<ValidationException>(() => TakeWork(Request.Single(x => x.Id == secure))); }   // admin, not a member
+  runas (Lena) {
+    Assert.Null(Request.Single(x => x.Id == billing).Assignee);
+    Assert.Null(Request.Single(x => x.Id == secure).Assignee);
+  }
+  // Routing asks the same question: a rule naming somebody who may not hold it gives it to nobody, and a queue that
+  // hands work out never gives an item to a member who lacks a skill it requires.
+  runas (Ada) {
+    new RoutingRule { Name = "Ines takes billing", Position = 0, Kind = "bill", ToQueue = QueueOf("Billing"),
+                      AssignTo = PersonNamed("Ines") };
+    new RoutingRule { Name = "Database work", Position = 1, Kind = "db", NeedSkill = RoutingSkill.Single(s => s.Name == "Databases") };
+    UnitOfWork.Commit();
+  }
+  runas (Lena) {
+    var ruled = Ask("Card refused", kind: "bill");
+    Assert.Equal("Nobody", HolderOf(ruled));                         // Ines is not in Billing
+    Assert.True(WasTold(ruled, "inbox.routing-skipped"));
+    foreach (var title in new List<string> { "Slow query", "Lock wait", "Vacuum" }) {
+      Assert.Equal("Rahul", HolderOf(Ask(title, kind: "db", queue: "Rota")));   // only Rahul holds Databases
+    }
+  }
+  // …and so do account offers: an owner who may not hold it is skipped, never offered it.
+  runas (Ada) { Team("Acme", "Mateo", "Rahul", new List<string>()); }
+  runas (Lena) {
+    var r = Ask("Acme replica lag", org: "Acme", kind: "db");
+    Assert.Equal("Rahul", OfferedOf(r));
+    Assert.Equal("Mateo may not hold it — skipped.", Said(TrailOf(r)[1]));
+  }
+}
+
+// ── 3 · inbox-assignment-only-through-the-run ────────────────────────────────────────────────────────────────────────
+[Test(Desk)]
+[runas(Lena)]
+void the_assignee_queue_and_priority_cannot_be_written_except_through_the_kit() {
+  var r = Ask("Disk full");
+  var lena = PersonNamed("Lena");
+  // The app grants Lena `update` on every request — and still none of these is hers to write.
+  Assert.Denied(() => { var x = Request.Single(y => y.Id == r.Id); x.Assignee = lena; UnitOfWork.Commit(); });
+  Assert.Denied(() => { var x = Request.Single(y => y.Id == r.Id); x.Queue = QueueOf("Billing"); UnitOfWork.Commit(); });
+  Assert.Denied(() => { var x = Request.Single(y => y.Id == r.Id); x.Priority = WorkPriority.Urgent; UnitOfWork.Commit(); });
+  Assert.Denied(() => { var x = Request.Single(y => y.Id == r.Id); x.ResolutionWithin = TimeSpan.FromDays(30); UnitOfWork.Commit(); });
+  Assert.Denied(() => { var x = Request.Single(y => y.Id == r.Id); x.EscalationLevel = 3; UnitOfWork.Commit(); });
+  // (An `Escalation`, like an `Assignment`, has no create grant at all — app code writing one does not even compile.)
+  Assert.Denied(() => { new Request { Title = "Pre-held", Assignee = lena }; UnitOfWork.Commit(); });
+  // …while the app's own fields stay the app's.
+  var mine = Request.Single(y => y.Id == r.Id);
+  mine.Body = "Cleared the logs.";
+  UnitOfWork.Commit();
+  var after = Request.Single(y => y.Id == r.Id);
+  Assert.Null(after.Assignee);
+  Assert.Equal("Support", after.Queue!.Name);
+  Assert.Equal(WorkPriority.Normal, after.Priority);
+  // The kit's verbs are the door.
+  TakeWork(after);
+  MoveWork(after, QueueOf("Billing"));
+  Prioritise(after, WorkPriority.High);
+  Workflow.Settle(after);
+  Assert.Equal("Lena", after.Assignee!.DisplayName);
+  Assert.Equal("Billing", after.Queue!.Name);
+  Assert.Equal(WorkPriority.High, after.Priority);
+}
+
+[Test(Desk)]
+[runas(Lena)]
+void every_change_of_holder_is_recorded_with_its_reason() {
+  var r = Ask("Keyboard broken");
+  TakeWork(r);
+  HandWorkTo(r, PersonNamed("Rahul"), PersonNamed("Lena").Id);     // the page shows Lena holding it
+  ReleaseWork(r);
+  MoveWork(r, QueueOf("Billing"));
+  Workflow.Settle(r);
+  Assert.Equal("Arrived → Claimed → HandedOn → Released → Moved", Trail(r));
+  var trail = TrailOf(r);
+  Assert.Equal("Lena", trail[1].To!.DisplayName);
+  Assert.Equal("Lena", trail[2].From!.DisplayName);
+  Assert.Equal("Rahul", trail[2].To!.DisplayName);
+  Assert.Equal("Rahul", trail[3].From!.DisplayName);
+  Assert.Equal("Billing", trail[4].ToQueue!.Name);
+  Assert.True(trail.All(a => a.By == null || a.By.DisplayName == "Lena"));
+}
+
+// ── 4 · inbox-moving-anothers-work-is-a-leads ────────────────────────────────────────────────────────────────────────
+[Test(Desk)]
+void an_agent_cannot_take_or_hand_on_work_a_colleague_holds() {
+  var id = Guid.Empty;
+  var rahul = Guid.Empty;
+  runas (Ines) { id = Ask("Laptop won't boot").Id; }
+  runas (Rahul) { TakeWork(Request.Single(x => x.Id == id)); rahul = PersonNamed("Rahul").Id; }
+  runas (Ines) {
+    var r = Request.Single(x => x.Id == id);
+    // She knows Rahul holds it — and still may not take it from him, hand it on, or release it for him.
+    Assert.Throws<ValidationException>(() => TakeWork(r, rahul));
+    Assert.Throws<ValidationException>(() => HandWorkTo(r, PersonNamed("Ines"), rahul));
+    Assert.Denied(() => ReleaseWork(r));
+    // …nor by raising the lead's own event herself.
+    Assert.Denied(() => WorkHandling.RaiseTakeOver(r, rahul));
+    Assert.Equal("Rahul", Request.Single(x => x.Id == id).Assignee!.DisplayName);
+  }
+  runas (Lena) {
+    TakeWork(Request.Single(x => x.Id == id), rahul);                 // a lead may
+    Assert.Equal("Lena", Request.Single(x => x.Id == id).Assignee!.DisplayName);
+  }
+}
+
+// ── 5 · inbox-service-internals-are-staffs ───────────────────────────────────────────────────────────────────────────
+[Test(Desk)]
+void a_requester_reads_none_of_the_service_internals() {
+  var id = Guid.Empty;
+  runas (Ines) {
+    var r = Ask("Where is my refund?", priority: WorkPriority.Urgent);
+    id = r.Id;
+    TakeWork(r);
+    Assert.NotNull(Request.Single(x => x.Id == id).Policy);           // staff see the promise
+  }
+  runas (Olivia) {
+    var mine = Request.Single(x => x.Id == id);                       // her own request, which she may read
+    Assert.Null(mine.Policy);
+    Assert.Null(mine.FirstResponseWithin);
+    Assert.Null(mine.ResolutionWithin);
+    Assert.False(Assignment.Any(a => a.Item.Id == id));               // no history of who held it
+    Assert.False(SlaClock.Any(c => c.Item.Id == id));                 // no clock records
+    Assert.False(SlaPolicy.Any());                                    // no policies
+    Assert.False(Queue.Any());                                        // no queues
+    Assert.False(Escalation.Any(e => e.Item.Id == id));               // no escalations
+    Assert.False(RoutingOffer.Any(o => o.Item.Id == id));             // no offers
+    Assert.False(Absence.Any());                                      // nobody's time away
+  }
+}
+
+// ── 6 · inbox-a-count-is-the-viewers-own ─────────────────────────────────────────────────────────────────────────────
+[Test(Desk)]
+void a_queue_count_never_includes_items_the_viewer_cannot_read() {
+  runas (Lena) {
+    Ask("Open in Security", queue: "Security");
+    Ask("Second in Security", queue: "Security");
+    Ask("Open in Support");
+  }
+  runas (Ines) {
+    var counts = Counts();
+    Assert.Equal(1, counts.Open);
+    Assert.Equal(1, counts.Unassigned);
+    Assert.Equal(0, counts.Queues.Single(q => q.Name == "Security").Open);
+  }
+  runas (Lena) { Assert.Equal(3, Counts().Open); }
+  runas (Olivia) { Assert.Equal(3, Counts().Open); }                  // all three are hers — her own reads
+  runas (Dev) { Assert.Equal(0, Counts().Open); }                     // none are his
+}
+
+// ── 7 · inbox-a-view-grants-nothing ──────────────────────────────────────────────────────────────────────────────────
+[Test(Desk)]
+void a_personal_view_is_its_owners_and_a_shared_view_shows_each_reader_only_their_own_reads() {
+  var personal = Guid.Empty;
+  var shared = Guid.Empty;
+  runas (Lena) { Ask("Badge cloned", queue: "Security"); }
+  runas (Ines) {
+    personal = new InboxView { Name = "My urgent", Owner = PersonNamed("Ines"), AtLeast = WorkPriority.Urgent }.Id;
+    UnitOfWork.Commit();
+    // An agent keeps her own views — never a shared one, and never one in a colleague's name.
+    Assert.Denied(() => { new InboxView { Name = "Everybody's" }; UnitOfWork.Commit(); });
+    Assert.Denied(() => { new InboxView { Name = "Rahul's", Owner = PersonNamed("Rahul") }; UnitOfWork.Commit(); });
+  }
+  runas (Rahul) { Assert.False(InboxView.Any(v => v.Id == personal)); }   // hers alone
+  runas (Ada) {
+    shared = new InboxView { Name = "Security desk", Queue = QueueOf("Security") }.Id;
+    UnitOfWork.Commit();
+  }
+  runas (Ines) {
+    var view = InboxView.Single(v => v.Id == shared);                 // she sees the shared view…
+    Assert.Equal(0, RowsOf(view).Count);                              // …and none of what she may not read through it
+    Assert.Denied(() => { var v = InboxView.Single(x => x.Id == shared); v.Name = "Mine now"; UnitOfWork.Commit(); });
+  }
+  runas (Lena) { Assert.Equal(1, RowsOf(InboxView.Single(v => v.Id == shared)).Count); }
+}
+
+// ── 8 · inbox-only-you-or-a-lead-set-your-availability ───────────────────────────────────────────────────────────────
+[Test(Desk)]
+void nobody_but_you_or_a_lead_marks_you_away_or_names_your_cover() {
+  runas (Ines) {
+    // A colleague cannot mark Rahul away — and collect his work — nor name herself his cover.
+    Assert.Denied(() => { new Availability { Person = PersonNamed("Rahul"), Status = Presence.Away }; UnitOfWork.Commit(); });
+    Assert.Denied(() => { new Availability { Person = PersonNamed("Rahul"), CoveredBy = PersonNamed("Ines") }; UnitOfWork.Commit(); });
+    new Availability { Person = PersonNamed("Ines"), Status = Presence.Busy };   // her own, she may
+    UnitOfWork.Commit();
+  }
+  runas (Rahul) {
+    Assert.Denied(() => { var a = Availability.Single(x => x.Person.Email == "ines@desk.test"); a.Status = Presence.Away; UnitOfWork.Commit(); });
+  }
+  runas (Lena) {                                                     // a lead may, for anybody
+    new Availability { Person = PersonNamed("Rahul"), Status = Presence.Away, CoveredBy = PersonNamed("Lena") };
+    UnitOfWork.Commit();
+  }
+  runas (Olivia) { Assert.False(Availability.Any()); }               // a requester reads nobody's
+}
+
+// ── 9 · inbox-cover-grants-no-access ─────────────────────────────────────────────────────────────────────────────────
+[Test(Desk)]
+void cover_hands_work_only_to_someone_who_may_hold_it() {
+  runas (Ada) {
+    new RoutingRule { Name = "Database work", Kind = "db", NeedSkill = RoutingSkill.Single(s => s.Name == "Databases") };
+    UnitOfWork.Commit();
+  }
+  var secure = Guid.Empty;
+  var plain = Guid.Empty;
+  var db = Guid.Empty;
+  runas (Lena) {
+    var s = Ask("Leaked key", queue: "Security");                    // restricted: Lena's alone
+    TakeWork(s);
+    secure = s.Id;
+    var p = Ask("Monitor dead");
+    TakeWork(p);
+    plain = p.Id;
+    GoAway(cover: PersonNamed("Ines"));
+  }
+  runas (Rahul) {
+    var d = Ask("Replica lag", kind: "db");                          // needs Databases, which Ines does not hold
+    TakeWork(d);
+    db = d.Id;
+    GoAway(cover: PersonNamed("Ines"));
+  }
+  runas (Ines) {
+    Assert.False(Request.Any(x => x.Id == secure));                  // the restricted item did not come to her — nor into her reads
+    Assert.Equal("Ines", HolderOf(Request.Single(x => x.Id == plain)));   // what she may hold, she covers
+    Assert.Equal("Nobody", HolderOf(Request.Single(x => x.Id == db)));
+  }
+  runas (Ada) {
+    Assert.Equal("Nobody", HolderOf(Request.Single(x => x.Id == secure)));
+    Assert.Equal("Security", Request.Single(x => x.Id == secure).Queue!.Name);
+  }
+}
+
+[Test(Desk)]
+void a_delegate_never_acts_on_their_own_request() {
+  var id = Guid.Empty;
+  runas (Lena) {
+    id = new Spend { Title = "Conference trip", Amount = 1400, Kind = "spend", Requester = PersonNamed("Rahul"),
+                     Approver = PersonNamed("Ines") }.Id;
+    UnitOfWork.Commit();
+  }
+  runas (Ines) { GoAway(cover: PersonNamed("Rahul")); }               // Rahul covers for Ines…
+  runas (Rahul) {
+    var s = Spend.Single(x => x.Id == id);
+    Assert.True(ActsFor(PersonNamed("Rahul"), PersonNamed("Ines")));
+    Assert.Denied(() => SpendApproval.RaiseApprove(s));              // …but this is his own request
+  }
+  runas (Mateo) { Assert.Denied(() => SpendApproval.RaiseApprove(Spend.Single(x => x.Id == id))); }   // covers for nobody
+  runas (Ines) {
+    ComeBack();
+    GoAway(cover: PersonNamed("Mateo"));
+  }
+  runas (Rahul) { Assert.False(ActsFor(PersonNamed("Rahul"), PersonNamed("Ines"))); }   // the cover ended with the absence
+  runas (Mateo) {
+    var s = Spend.Single(x => x.Id == id);
+    SpendApproval.RaiseApprove(s);
+    Workflow.Settle(s);
+    Assert.Equal(ApprovalStep.Finance, Spend.Single(x => x.Id == id).Step);
+  }
+}
+
+// ── 10 · inbox-service-levels-are-the-admins ─────────────────────────────────────────────────────────────────────────
+[Test(Desk)]
+void only_an_inbox_admin_changes_queues_policies_hours_and_rules() {
+  runas (Lena) {
+    Assert.Denied(() => { new Queue { Name = "Lena's own" }; UnitOfWork.Commit(); });
+    Assert.Denied(() => { new SlaPolicy { Name = "Lena's promise" }; UnitOfWork.Commit(); });
+    Assert.Denied(() => { var p = SlaPolicy.Single(x => x.Name == "Standard"); p.AtRiskAt = 0.99; UnitOfWork.Commit(); });
+    Assert.Denied(() => { var t = SlaTarget.First(x => x.Policy.Name == "Standard"); t.Within = TimeSpan.FromDays(9); UnitOfWork.Commit(); });
+    Assert.Denied(() => { var q = QueueOf("Support"); q.Restricted = true; UnitOfWork.Commit(); });
+    Assert.Denied(() => { new ServiceHours { Name = "Lena's hours", Zone = Zone.Of("UTC") }; UnitOfWork.Commit(); });
+    Assert.Denied(() => { new RoutingRule { Name = "Lena's rule", ToQueue = QueueOf("Billing") }; UnitOfWork.Commit(); });
+    Assert.Denied(() => { new RoutingSkill { Name = "Lena's skill" }; UnitOfWork.Commit(); });
+    Assert.Denied(() => { var q = QueueOf("Rota"); q.Distribution = Distribution.Manual; UnitOfWork.Commit(); });
+  }
+  runas (Ada) {
+    new Queue { Name = "Escalations", Level = 2 };
+    var p = SlaPolicy.Single(x => x.Name == "Standard");
+    p.AtRiskAt = 0.8;
+    UnitOfWork.Commit();
+    Assert.True(Queue.Any(q => q.Name == "Escalations"));
+  }
+}
+
+[Test(Desk)]
+void an_anonymous_caller_reads_none_of_the_inbox() {
+  runas (Ines) { Ask("Anything"); }
+  Assert.False(WorkItem.Any());
+  Assert.False(Request.Any());
+  Assert.False(Queue.Any());
+  Assert.False(Assignment.Any());
+  Assert.False(SlaClock.Any());
+  Assert.False(InboxView.Any());
+  Assert.False(RoutingRule.Any());
+  Assert.False(Availability.Any());
+  Assert.False(HeldSkill.Any());
+}

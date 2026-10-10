@@ -1,0 +1,50 @@
+// Osysharp.WorkQueues — work queues, who holds what, and the service levels promised on it, over ANY item.
+//
+// An app's item joins the inbox by deriving from `WorkItem` (`Ticket : WorkItem`, `PurchaseRequest : WorkItem`,
+// `Lead : WorkItem`). The app keeps what the item IS — its own states, its fields, its guards. It tells the kit four facts
+// as they happen, and the kit keeps the time:
+//     Responded(item)                 we answered the requester
+//     RequesterWrote(item)            they wrote
+//     WaitOn(item, WaitFor.Requester) we are waiting on someone (… WaitFor.Others, WaitFor.Pause) — ResumeWork(item) ends it
+//     WorkDone(item)                  it is done (ReopenWork / CloseWork / CancelWork)
+//
+// THE KIT OWNS: the item's `Handling` phase (one durable `WorkHandling` run per item, of ANY subtype — beside the app's
+// own lifecycle run, if it has one); the promise (`SlaPolicy` chosen by the item's priority, tier, queue, channel,
+// segment and kind — the most specific match wins — with first-response, next-response and resolution targets); the
+// clocks (in business hours with holidays, paused while the app says it waits, at risk at a fraction, breached and
+// RECORDED, never fatal, retargeted on a change of priority); queues, views and live counts; who holds an item, with
+// every change of holder recorded with its reason; who is GIVEN it — routing rules, round robin or least loaded within
+// capacity, skills and languages, and a pool that refills the moment somebody is free; the account's own people first
+// (its owner, backup and pod — offered, falling through on time); out-of-office, cover and follow-the-sun; escalation levels
+// and what a promise does at its moments.
+//
+// ⚑ THE APP SAYS THREE THINGS — who works the inbox, who leads it, who administers it:
+//     policy WorksInbox       => IsAgent;
+//     policy LeadsInbox       => IsLead;
+//     policy AdministersInbox => IsAdmin;
+//   and grants its own item kind's reads (grants are never inherited): `entity Ticket : WorkItem { security { … } }`.
+//   The kit's DENIES on `WorkItem` are the floor every grant — the app's included — stands on.
+//
+// Docs: osy docs workflow-inbox-kit · osy docs security-inbox-kit.
+package Osysharp.WorkQueues {
+  version "0.21.1";
+  minPlatform "0.9.0";
+  summary     "work queues, who holds what, and the service levels promised on it, over any item an app derives from WorkItem — and typed links between items, of kinds the app declares — with the screens a team works it from.";
+  model "model/**/*.osy";
+  // The personal data its own fields hold (`[Classification(Personal.X)]`): an app maps a level onto its own
+  // classification, or leaves it to each row's own security.
+  personal Content;
+  use Osysharp.Identity@0;
+  // Who an item is for — a customer organisation (`CustomerAccount`) — and its tier, account team and VIPs, read from
+  // the Accounts add-on — never written.
+  use Osysharp.Organizations@0;
+  use Osysharp.Organizations.ServicePlans@0;
+  // The "moved first" sentence, and (from the UI slice) who else is on an item.
+  use Osysharp.Presence@0;
+  use Osysharp.Observability;
+  use Osysharp.Workflow;
+  use Osysharp.ServiceHours;
+  // The screens a team works it from — `Size`, `Tone` and the controls are the Ui kit's.
+  use Osysharp.Ui;
+  tests "tests";
+}

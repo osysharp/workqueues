@@ -1,0 +1,478 @@
+// THE INBOX ON SCREEN — the kit's components as the test desk places them (model/pages.osy), driven as a team drives
+// them: the rail and its counts, the list and its countdowns, the hand-to menu, the keyboard, the team's load, the
+// settings. `osy test --pixels` photographs each (`Ui.Shot`) and judges the layout claims in a real browser — the lamps
+// and the countdown's colours are only visible there. The desk is in desk.test.osy.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using InboxKitTests;
+
+/// A request from Dev at Orbit Labs (Enterprise: promised around the clock — first response 2h), arrived `ago` ago.
+Request Arrived(string title, TimeSpan ago) {
+  var r = new Request { Title = title, Organization = CompanyNamed("Orbit Labs"), Requester = PersonNamed("Dev"),
+                        ArrivedAt = DateTime.UtcNow - ago };
+  Workflow.Settle(r);
+  return r;
+}
+
+/// The Enterprise tier, read as the admin (a tier is staff's to read).
+OrganizationTier Enterprise() {
+  OrganizationTier? t = null;
+  runas (Ada) { t = OrganizationTier.Single(x => x.Name == "Enterprise"); }
+  return t!;
+}
+
+/// The row of `title` in `rows`.
+WorkRow RowOf(List<WorkRow> rows, string title) { return rows.Single(r => r.Title == title); }
+
+/// ⭐ THE ACCENT IS SPENT ON WHAT IS YOURS AND LIVE. The rail counts every view and queue from ONE grouped read; "Mine"
+/// wears a breathing lamp only while it holds something, "Offered to me" is not there at all until something is, and
+/// the "go to" keys take the reader anywhere without the mouse.
+[Test(Desk)]
+void the_rail_lights_only_what_is_yours() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));   // Tue 09:00 Stockholm — the browser's clock too
+  runas (Ines) {
+    var mine = Arrived("Printer jams on page two", TimeSpan.FromMinutes(5));
+    Arrived("VPN drops every hour", TimeSpan.FromMinutes(12));
+    Arrived("Invoice shows the old address", TimeSpan.FromMinutes(40));
+    TakeWork(mine);
+    Workflow.Settle(mine);
+    var c = Counts();
+    Assert.Equal(1, c.Mine);
+    Assert.Equal(2, c.Unassigned);
+    Assert.Equal(0, c.Offered);
+    // The rows the rail is built from — the lamp is on "Mine" because it holds something, and "Offered to me" is absent.
+    var nav = InboxNav(c, Queue.Where(q => q.Active).ToList(), new List<InboxView>(), "/inbox");
+    var work = nav[0].Children;
+    Assert.True(work.Single(n => n.Label == "Mine").Live);
+    Assert.False(work.Any(n => n.Label == "Offered to me"));
+    Assert.False(work.Single(n => n.Label == "Unassigned").Live);
+    Assert.Equal(Tone.Primary, work.Single(n => n.Label == "Unassigned").BadgeTone);
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ines);
+  Ui.Visit("/inbox/mine");
+  Assert.Visible("Printer jams on page two", within: "Work");
+  Assert.Hidden("Offered to me");
+  Assert.Clickable("Unassigned");
+  Ui.Shot("rail-wide-light");
+  // The "go to" keys: G, then U.
+  Ui.Press("G then U");
+  Assert.OnPage("/inbox/unassigned");
+  Assert.Visible("VPN drops every hour", within: "Unassigned list");
+  Assert.Hidden("Printer jams on page two", within: "Unassigned list");
+  Ui.Theme("dark");
+  Ui.Shot("rail-wide-dark");
+  // On a phone the rail is a drawer and the list is the screen — nothing pushes the page sideways.
+  Ui.Theme("light");
+  Ui.Viewport(390, 844);
+  Ui.Visit("/inbox/unassigned");
+  Assert.NoOverflow();
+  Assert.Clickable("VPN drops every hour");
+  Ui.Shot("list-phone-light");
+}
+
+/// ⭐ COLOUR HAS ONE JOB. A countdown is ink while there is time, amber in its last quarter, red once it is past — and
+/// has no colour at all while the item waits on the requester (every clock is paused, and the screen says "waiting").
+[Test(Desk)]
+void a_chip_is_coloured_only_when_we_owe_it_and_it_is_late() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));   // Tue 09:00 Stockholm — the browser's clock too
+  var now = DateTime.UtcNow;
+  runas (Lena) {
+    Arrived("Fresh: login loops on Safari", TimeSpan.FromMinutes(10));       // 1:50 of 2:00 left
+    Arrived("At risk: exports time out", TimeSpan.FromMinutes(100));         // 0:20 left — past 75%
+    Arrived("Late: the API returns 500s", TimeSpan.FromMinutes(150));        // −0:30, and 9:30 of its resolution left
+    var waiting = Arrived("Waiting: needs their invoice number", TimeSpan.FromMinutes(30));
+    Responded(waiting);
+    WaitOn(waiting, WaitFor.Requester);
+    Workflow.Settle(waiting);
+    var open = Rows(BuiltInView.Open);
+    var fresh = RowOf(open, "Fresh: login loops on Safari");
+    var risky = RowOf(open, "At risk: exports time out");
+    var late = RowOf(open, "Late: the API returns 500s");
+    Assert.Equal(Tone.Default, DueTone(fresh.Handling, fresh.Sla, fresh.DueAt, fresh.Budget, now));
+    Assert.Equal(Tone.Warning, DueTone(risky.Handling, risky.Sla, risky.DueAt, risky.Budget, now));
+    // The late row's countdown is its resolution, with 9:30 left — ink; the broken first response is its LAMP's.
+    Assert.Equal(Tone.Default, DueTone(late.Handling, late.Sla, late.DueAt, late.Budget, now));
+    Assert.Equal("first response", fresh.DueWord);
+    Assert.Equal("", fresh.OfferedTo);                                  // nothing is offered: no name, no countdown
+    Assert.True(fresh.OfferEndsAt == null);
+    Assert.Equal("Dev", fresh.Requester);
+    Assert.Equal("Enterprise", fresh.Tier);
+    var paused = RowOf(Rows(BuiltInView.Waiting), "Waiting: needs their invoice number");
+    Assert.Equal(Tone.Ghost, DueTone(paused.Handling, paused.Sla, paused.DueAt, paused.Budget, now));
+    // The LAMP says what each waits on; only the broken promise is red there too.
+    Assert.Equal(Tone.Danger, LampFor(late.Handling, late.Sla).Tone);
+    Assert.True(LampFor(fresh.Handling, fresh.Sla).Live);
+    Assert.True(LampFor(paused.Handling, paused.Sla).Waiting);
+    Assert.Equal("1:50", Countdown(fresh.DueAt.Value, now));
+    Assert.Equal("−0:30", Countdown(late.BreachedAt.Value, now));       // the first response, missed half an hour ago…
+    Assert.Equal("9:30", Countdown(late.DueAt!.Value, now));             // …and what still runs: the resolution
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Lena);
+  Ui.Visit("/inbox/open");
+  Assert.Visible("1:50", within: "Work");
+  Assert.Visible("0:20", within: "Work");
+  // The late row counts down what it can still keep, in ink — its red lamp says a promise on it was broken.
+  Assert.Visible("9:30", within: "Work");
+  Ui.Shot("list-chips-light");
+  Ui.Theme("dark");
+  Ui.Shot("list-chips-dark");
+  Ui.Theme("light");
+  Ui.Visit("/inbox/waiting");
+  Assert.Visible("waiting", within: "Work");
+  Assert.Hidden("0:00");
+}
+
+/// ⭐ NOTHING OPEN IS NEVER A VOID — never a blank grey pane beside the list, light or dark.
+/// With no item open, the pane beside the list says what the view holds — how many, how many late and at risk, from
+/// the rail's own grouped read — and the keys that work it; an empty view says it is clear, and why. On a phone the
+/// list is the whole screen and the pane is not drawn at all.
+[Test(Desk)]
+void with_nothing_open_the_pane_beside_the_list_says_what_the_view_holds() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));   // Tue 09:00 Stockholm — the browser's clock too
+  runas (Lena) {
+    Arrived("Fresh: login loops on Safari", TimeSpan.FromMinutes(10));       // 1:50 of 2:00 left
+    Arrived("At risk: exports time out", TimeSpan.FromMinutes(100));         // past 75% of the promise
+    Arrived("Late: the API returns 500s", TimeSpan.FromMinutes(150));        // missed
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Lena);
+  Ui.Visit("/inbox/open");
+  Assert.Visible("All open", within: "No item selected");
+  Assert.Visible("3 items — 1 late and 1 at risk. Due first puts them at the top.", within: "No item selected");
+  Assert.Visible("nobody on it", within: "What All open holds");
+  Assert.Visible("take it", within: "No item selected");
+  Ui.Shot("nothing-open-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("nothing-open-wide-dark");
+  Ui.Theme("light");
+  // A view with nothing in it is clear, and says why it is empty.
+  Ui.Visit("/inbox/waiting");
+  Assert.Visible("All clear", within: "No item selected");
+  Assert.Visible("Nothing is waiting on anybody.", within: "No item selected");
+  // Opening an item puts it where the overview was.
+  Ui.Visit("/inbox/open");
+  Ui.Press("J");
+  Ui.Press("Enter");
+  Assert.Hidden("No item selected");
+  Assert.Visible("Why this is here");
+  // On a phone the list is the screen, nothing pushing sideways — and no divider down its edge, which only the shot
+  // shows (a border is not a box an assertion can find; the pane beside it is hidden by a width rule, which only a
+  // real browser applies).
+  Ui.Viewport(390, 844);
+  Ui.Visit("/inbox/open");
+  Assert.Visible("Late: the API returns 500s", within: "Work");
+  Assert.NoOverflow();
+  Ui.Theme("dark");
+  Ui.Shot("list-phone-dark");
+  Ui.Theme("light");
+}
+
+/// ⭐ THE HAND-TO MENU LISTS ONLY WHO MAY HOLD IT, WITH WHAT THEY CARRY. A routing rule says a database item NEEDS the
+/// Databases skill: only Rahul holds it, so the menu lists Rahul alone (not Lena, who leads Support, nor Mateo, who is
+/// not in it), with his load against his capacity — and choosing him hands it to him.
+[Test(Desk)]
+void the_assign_menu_lists_only_who_may_hold_it_with_their_load() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));   // Tue 09:00 Stockholm — the browser's clock too
+  var id = Guid.Empty;
+  runas (Ada) {
+    new RoutingRule { Name = "Databases", TitleContains = "database", NeedSkill = RoutingSkill.Single(s => s.Name == "Databases"),
+                      SkillRequired = true };
+    UnitOfWork.Commit();
+  }
+  runas (Lena) {
+    var r = Arrived("Database backups fail at night", TimeSpan.FromMinutes(8));
+    id = r.Id;
+    var people = Eligible(r);
+    Assert.Equal("Rahul", string.Join(", ", people.Select(p => p.Name).ToList()));
+    Assert.Equal(0, people[0].Load);
+    Assert.Equal(8, people[0].Capacity);
+    Assert.True(people[0].Free);
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Lena);
+  Ui.Visit("/inbox/open/i/" + id);
+  Ui.Click("Assignee: Nobody");
+  Assert.Visible("Rahul", within: "Hand to");
+  Assert.Visible("0/8", within: "Hand to");
+  Assert.Hidden("Mateo");
+  Assert.Clickable("Rahul");
+  Ui.Shot("assign-menu-wide-light");
+  Ui.Click("Rahul");
+  runas (Lena) { Assert.Equal("Rahul", HolderOf(Request.Single(x => x.Id == id))); }
+  Ui.AwaitChange(WorkItem);
+  Assert.Visible("Lena handed it to Rahul", within: "Why this is here");
+  // On a phone the item is the screen, and the menu still fits on it.
+  Ui.Viewport(390, 844);
+  Ui.Visit("/inbox/open/i/" + id);
+  Ui.Click("Assignee: Rahul");
+  Assert.Clickable("Rahul");
+  Assert.NoOverflow();
+  Ui.Shot("assign-menu-phone-light");
+}
+
+[Test(Desk)]
+void an_item_with_only_a_due_date_shows_its_clock_and_never_says_no_promise_applies() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  var id = Guid.Empty;
+  runas (Lena) {
+    var r = new Request { Title = "A request the law gives a month", Organization = CompanyNamed("Larkspur"),
+                          Requester = PersonNamed("Olivia"), DueAt = new DateTime(2026, 7, 2, 7, 0, 0) };
+    Workflow.Settle(r);
+    id = r.Id;
+    // The desk's policies are all active, and one would match — but an item with its own due date takes none: the
+    // date is its only promise, and no first-reply clock is invented for it.
+    Assert.True(PolicyMatching(WorkPriority.Normal, CompanyNamed("Larkspur").Tier, null, "", "", "", false) != null);
+    Assert.Null(Request.Single(x => x.Id == id).Policy);
+    Assert.True(HasPromise(r));
+    // …and its arrival says what it is promised, not that nothing is.
+    Assert.Equal("Arrived — due by 2 July 2026 07:00 UTC.", Told.Single(t => t.Item == id && t.Kind == "inbox.item-arrived").Text);
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Lena);
+  Ui.Visit("/inbox/open/i/" + id);
+  Assert.Hidden("No promise applies");
+  Assert.Visible("resolution", within: "Promises");
+  Assert.Hidden("first reply", within: "Promises");
+  Ui.Shot("item-due-date-only");
+}
+
+/// ⭐ THE LIST IS WORKED FROM THE KEYBOARD: J moves, T takes what is under the cursor (it leaves Unassigned), X picks,
+/// Enter opens — and the `?` sheet lists every key, the rail's "go to" keys included.
+[Test(Desk)]
+void the_list_is_worked_from_the_keyboard() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));   // Tue 09:00 Stockholm — the browser's clock too
+  runas (Ines) {
+    Arrived("First in line", TimeSpan.FromMinutes(50));
+    Arrived("Second in line", TimeSpan.FromMinutes(30));
+    Arrived("Third in line", TimeSpan.FromMinutes(10));
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ines);
+  Ui.Visit("/inbox/unassigned");
+  runas (Ines) {                                                   // due first: the oldest promise runs out first
+    Assert.Equal("First in line, Second in line, Third in line",
+                 string.Join(", ", Ordered(Rows(BuiltInView.Unassigned), WorkSort.Due).Select(r => r.Title).ToList()));
+  }
+  Ui.Press("J");
+  Ui.Press("T");
+  runas (Ines) { Assert.Equal(1, Counts().Mine); }
+  Assert.Hidden("First in line", within: "Unassigned list");
+  Ui.Press("J");
+  Ui.Press("X");
+  Assert.Visible("1 selected", within: "Selected");
+  Ui.Shot("list-bulk-light");
+  Ui.Press("?");
+  Assert.Dialog("Keyboard shortcuts");
+  Assert.Visible("Take", within: "Keyboard shortcuts");
+  Assert.Visible("Mine", within: "Keyboard shortcuts");
+  Assert.Visible("then", within: "Keyboard shortcuts");      // "G then M": a keycap per step
+  Ui.Shot("keys-sheet-light");
+  Ui.Press("Escape");
+  Ui.Press("Enter");
+  Assert.Visible("Second in line", within: "Item");
+}
+
+/// ⭐ "WHICH POLICY APPLIES?" — the settings answer for an example item before anything is saved: an urgent item from an
+/// Enterprise customer gets the most specific policy, with what it promises and the hours it counts in.
+[Test(Desk)]
+void the_settings_say_which_policy_applies_to_an_example_item() {
+  runas (Ada) {
+    Assert.Equal("“Enterprise urgent” — first response 30m, next response 1h, resolution 4h, around the clock.",
+                 WhichPolicy(WorkPriority.Urgent, OrganizationTier.Single(t => t.Name == "Enterprise").Id, null, "", "", false));
+    Assert.Equal("“Standard” — first response 8h, next response 8h, resolution 1d, in Business hours.",
+                 WhichPolicy(WorkPriority.Normal, null, null, "", "", false));
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ada);
+  Ui.Visit("/settings/sla");
+  Ui.Within("Which policy applies?") {
+    Ui.Select("Priority", WorkPriority.Urgent);
+    Ui.Select("Tier", Enterprise());
+    Ui.Click("Which policy?");
+  }
+  Assert.Visible("“Enterprise urgent” — first response 30m");
+  Ui.Shot("settings-sla-light");
+  // An agent sees the page, locked, with the reason — the server refuses the write whatever a page shows.
+  Ui.SignInAs(Ines);
+  Ui.Visit("/settings/queues");
+  Assert.Visible("Only inbox admins change queues");
+  Ui.Shot("settings-queues-locked-light");
+}
+
+/// ⭐ AN OFFER COUNTS DOWN IN THE LIST: an Acme item is offered to Mateo, its account owner, first — the row says so
+/// ("→ Mateo") with the time left before it falls through to the next of the account's people.
+[Test(Desk)]
+void an_offer_counts_down_in_the_list() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));   // Tue 09:00 Stockholm — the browser's clock too
+  runas (Ada) { Team("Acme", "Mateo", "Lena", new List<string> { "Ines" }); }
+  runas (Lena) {
+    var r = Ask("Acme cannot export", org: "Acme");
+    var row = RowOf(Rows(BuiltInView.Open), "Acme cannot export");
+    Assert.Equal("Mateo", row.OfferedTo);
+    Assert.True(row.OfferEndsAt != null);
+    Assert.True(About(row.OfferEndsAt!.Value - DateTime.UtcNow, TimeSpan.FromMinutes(15)));
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Lena);
+  Ui.Visit("/inbox/open");
+  Assert.Visible("Mateo", within: "Work");
+  Assert.Visible("0:15", within: "Work");
+  Ui.Shot("list-offer-light");
+  // Mateo sees it lit on HIS rail: offered to him first.
+  Ui.SignInAs(Mateo);
+  Ui.Visit("/inbox/offered");
+  Assert.Visible("Acme cannot export", within: "Work");
+  Ui.Shot("rail-offered-light");
+}
+
+/// ⭐ THE TEAM'S LOAD, FOR A LEAD: each person against their capacity — amber at capacity — what of it is at risk, and
+/// who is away with who covering; the busiest first.
+[Test(Desk)]
+void team_load_shows_who_is_at_capacity() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));   // Tue 09:00 Stockholm — the browser's clock too
+  runas (Lena) {
+    new Availability { Person = PersonNamed("Rahul"), Capacity = 2 };   // his ceiling across every queue
+    UnitOfWork.Commit();
+  }
+  runas (Rahul) {
+    TakeWork(Arrived("One for Rahul", TimeSpan.FromMinutes(20)));
+    TakeWork(Arrived("Two for Rahul", TimeSpan.FromMinutes(110)));
+  }
+  runas (Lena) {
+    MarkAway(PersonNamed("Ines"), DateTime.UtcNow.AddDays(1), PersonNamed("Rahul"));
+    var rows = TeamRows();
+    var rahul = rows.Single(r => r.Name == "Rahul");
+    Assert.Equal("Rahul", rows[0].Name);                              // the busiest first
+    Assert.Equal(2, rahul.Load);
+    Assert.Equal(2, rahul.Capacity);
+    Assert.Equal(1, rahul.AtRisk);
+    var ines = rows.Single(r => r.Name == "Ines");
+    Assert.True(ines.Away);
+    Assert.Equal("Rahul", ines.Cover);
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Lena);
+  Ui.Visit("/inbox/team");
+  Assert.Visible("2/2", within: "Team load");
+  Assert.Visible("1 at risk", within: "Team load");
+  Assert.Visible("Rahul covers", within: "Team load");
+  Ui.Shot("team-load-light");
+  Ui.Theme("dark");
+  Ui.Shot("team-load-dark");
+}
+
+/// ⭐ MY STATUS IS WHAT ROUTING READS: Busy takes the reader out of the round, and the switch says so; nothing about an
+/// open tab counts.
+[Test(Desk)]
+void my_status_is_what_routing_reads() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));   // Tue 09:00 Stockholm — the browser's clock too
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ines);
+  Ui.Visit("/inbox/mine");
+  Ui.Click("My status: Available");
+  Ui.Click("Busy — nothing new");
+  Assert.Visible("Busy");
+  runas (Ines) {
+    Assert.Equal(Presence.Busy, MyPresence().Status);
+    Assert.False(OnDuty(PersonNamed("Ines"), DateTime.UtcNow));
+  }
+  Ui.Shot("my-status-busy-light");
+}
+
+/// The list opens the way the reader left it — its order and density are kept in this browser ([Remembered]). (That
+/// another browser starts from the defaults is the helpdesk's test of the same list: this desk has no sign-in page for
+/// a new device to land on.)
+[Test(Desk)]
+void the_lists_order_and_density_are_remembered_in_this_browser() {
+  runas (Lena) { Arrived("Fresh: login loops on Safari", TimeSpan.FromMinutes(10)); }
+  Ui.SignInAs(Lena);
+  Ui.Visit("/inbox/open");
+  Ui.Click("Due first");
+  Ui.Click("Newest");
+  Ui.Click("Newest");
+  Ui.Click("Compact rows");
+  Ui.Visit("/inbox/open");
+  Assert.Visible("Newest", within: "Work");
+  Ui.Click("Newest");
+  Assert.Checked("Compact rows");
+}
+
+/// The home page is the reader's own work.
+[Test(Desk)]
+void the_front_door_is_my_work() {
+  Ui.SignInAs(Ines);
+  Ui.Visit("/");
+  Assert.Visible("Mine");
+}
+
+/// ⭐ MY ACCOUNTS: the organisations whose account team I am on, with their open, at-risk and offered work.
+[Test(Desk)]
+void my_accounts_lists_my_organisations() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));   // Tue 09:00 Stockholm — the browser's clock too
+  runas (Ada) { Team("Acme", "Mateo", "", new List<string>()); }
+  runas (Lena) { Ask("Acme sync stalls", org: "Acme"); }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Mateo);
+  Ui.Visit("/inbox/my-accounts");
+  Assert.Visible("Acme", within: "Accounts I look after");
+  Assert.Visible("1 offered", within: "Accounts I look after");
+  Ui.Click("Acme");
+  Assert.Visible("Acme sync stalls", within: "Work");
+}
+
+/// The settings pages draw, and an admin's change is saved by the save bar.
+[Test(Desk)]
+void the_inbox_settings_pages_draw_for_an_admin() {
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ada);
+  foreach (var page in new List<string> { "/settings/queues", "/settings/hours", "/settings/routing", "/settings/skills", "/settings/views" }) {
+    Ui.Visit(page);
+    Assert.OnPage(page);
+  }
+  // THE SECTIONS ARE ANNOUNCED: the kit's provider puts all six in the area, grouped, with no list
+  // written by the app — and its pages sit in the app's settings frame.
+  foreach (var section in new List<string> { "Queues", "Routing", "Skills", "Shared views", "SLA policies", "Business hours" }) {
+    Assert.Visible(section, within: "Settings sections");
+  }
+  Assert.Before("Inbox", "Service");
+  Ui.Visit("/settings/skills");
+  Assert.Visible("Spanish");
+  Assert.Visible("Mateo", within: "Who has Spanish");
+  Ui.Shot("settings-skills-light");
+  Ui.Visit("/settings/queues");
+  Assert.Visible("3 working it", within: "Support");
+  Ui.Click("Change Support");
+  Assert.Visible("Who works it");
+  Ui.Shot("settings-queues-light");
+}
+
+/// ⭐ A SAVED VIEW WITH THE APP'S OWN FILTER LISTS WHAT THE FILTER KEEPS — reached from another view, as a person
+/// reaches it. The list asks the app's filter when a view's list mounts, so a list moved from one view to another must
+/// mount afresh for the new view (its rows are keyed by view, not by place); otherwise the filter would never be asked for
+/// the saved view and it would list nothing while the server's `AppFilteredBy` named its items.
+[Test(Desk)]
+void a_saved_view_with_the_apps_own_filter_lists_what_the_filter_keeps() {
+  Guid view = Guid.Empty;
+  runas (Ines) {
+    Ask("Refund for invoice 77", body: "Please refund the second charge");
+    Ask("Printer offline", body: "It will not print");
+    var refunds = new InboxView { Name = "Refunds", Owner = PersonNamed("Ines"), AppFilter = "says:refund" };
+    UnitOfWork.Commit();
+    view = refunds.Id;
+    Assert.Equal(1, AppFilteredBy(view).Count);
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ines);
+  // The list lives in the layout (model/pages.osy `PanesFrame`), so the second view is the SAME list handed a new one.
+  Ui.Visit("/panes/open");
+  Assert.Visible("Printer offline", within: "Work");
+  Ui.Click("Refunds", within: "Saved views");
+  Assert.OnPage("/panes/v-" + view);
+  Assert.Visible("Refund for invoice 77", within: "Work");
+  Assert.Hidden("Printer offline", within: "Work");
+}

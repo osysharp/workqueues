@@ -1,0 +1,265 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Presence;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+
+// ── who holds an item, and every change of it ─────────────────────────────────────────────────────────────────────────
+//
+// Each verb is a kit function that raises an event on the item's `WorkHandling` run; the event's `[Authorize]` decides
+// who may raise it, and the run's body does the write as the system — so the holder, the queue and the priority are
+// written ONLY there (SECURITY-INVARIANT inbox-assignment-only-through-the-run), and every change is an `Assignment`.
+//
+// ⚑ THE PAGE SAYS WHO IT SAW HOLDING THE ITEM (`expected`). If somebody else holds it now, the take is refused with
+//   the sentence that names them — "Rahul took this 2 minutes ago" — instead of quietly taking it from them.
+
+/// Why an item moved — one per `Assignment`.
+public enum AssignReason {
+  [Label("Arrived")] Arrived,
+  [Label("Claimed")] Claimed,
+  [Label("Released")] Released,
+  [Label("Handed on")] HandedOn,
+  [Label("Moved")] Moved,
+  [Label("Round robin")] RoundRobin,
+  [Label("Least loaded")] LeastLoaded,
+  [Label("Account owner")] AccountOwner,
+  [Label("Account backup")] AccountBackup,
+  [Label("Account pod")] AccountPod,
+  [Label("Fell through")] FellThrough,
+  [Label("Owner away")] OwnerAway,
+  [Label("Cover")] Cover,
+  [Label("Off-hours cover")] OffHoursCover,
+  [Label("Escalated")] Escalated,
+  [Label("Refill")] Refill,
+  [Label("Rule")] Rule,
+  [Label("Imported")] Imported,
+  /// Somebody on the account team after its owner could not take it just then (`Because`), so the next was asked.
+  [Label("Skipped")] Skipped,
+}
+
+/// ONE change of who holds an item, or where it waits — the history "why is this here" reads, and reports' raw data.
+/// Written by the run only: it has no create grant.
+///
+/// ⚑ FACTS, NOT A SENTENCE: "Moved to Billing by Lena — Ines is not in Billing, so it is unheld." is said
+///   from `Reason`, `By`, `From`, `To` and `ToQueue` when it is read (`InboxStepWords`), in the reader's language.
+public entity Assignment {
+  [Required] WorkItem Item;
+  Principal? From;
+  Principal? To;
+  Queue? FromQueue;
+  Queue? ToQueue;
+  AssignReason Reason;
+  /// Who did it — none: the inbox did (routing, a timer).
+  Principal? By;
+  /// The routing rule that routed it, when one did.
+  RoutingRule? Rule;
+  /// Who the step is about when it was not handed to them — offered to, skipped, the one whose offer fell through.
+  Principal? About;
+  /// Why they could not take it just then, and until when they are away.
+  Unavailability? Because;
+  DateTime? Until;
+  /// Minutes — an offer's window, or how long it went untaken.
+  int? Minutes;
+  /// The level it was escalated to, and the promise whose moment escalated it, when one did.
+  int? Level;
+  SlaMetric? Metric;
+  SlaMoment? Moment;
+  /// Somebody's own words — why it was escalated.
+  [MaxLength(300)] string Detail = "";
+  DateTime At;
+  /// Its place in the item's trail: 1, 2, 3 …
+  int Step;
+  // SECURITY-INVARIANT(inbox-service-internals-are-staffs) — the requester's side reads no assignment history.
+  security {
+    allow read when WorksInbox;
+    // SECURITY-INVARIANT(inbox-a-restricted-queue-is-read-by-its-members-only), the trail half: a step of the trail says that an item exists, who holds it and why. So it follows its item —
+    // unreadable to staff outside a restricted queue, as the item is, or a technician outside "Locks" would count
+    // promises on a job he cannot see. Guarded by Osysharp.WorkQueues.Reports'
+    // tests/security.test.osy `a_job_in_a_restricted_queue_counts_only_for_those_who_may_see_it`.
+    deny read when WorksInbox && !AdministersInbox where Item.Queue != null && Item.Queue.Restricted
+      && !QueueMember.Any(m => m.Queue == Item.Queue && m.Member == user && m.Active) && Item.Assignee != user;
+  }
+}
+
+/// What a bulk verb did: how many it moved, and for each one it did not, why.
+public class BulkResult {
+  public int Moved = 0;
+  public List<string> NotMoved = new List<string>();
+}
+
+// ── the verbs ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Take `item`. `expected` is who the page showed holding it (none: nobody) — if somebody else holds it now, this is
+/// refused with the sentence naming them. A lead may take it from a colleague; an agent may when the app lets agents
+/// hand on (`InboxSetup.AgentsHandOn`). Refused for anybody who may not hold it.
+public void TakeWork(WorkItem item, Guid? expected = null) {
+  if (LeadsInbox) { WorkHandling.RaiseTakeOver(item, expected); } else { WorkHandling.RaiseTake(item, expected); }
+}
+
+/// Give `item` back to its queue. The holder may; a lead may for anybody.
+public void ReleaseWork(WorkItem item) { WorkHandling.RaiseRelease(item); }
+
+/// Hand `item` to `person` — who must be able to hold it. A lead always may; an agent may hand on what they hold, or
+/// anything when the app lets agents hand on.
+public void HandWorkTo(WorkItem item, Principal person, Guid? expected = null) {
+  if (LeadsInbox) { WorkHandling.RaiseHandOver(item, person, expected); } else { WorkHandling.RaiseHandTo(item, person, expected); }
+}
+
+/// Move `item` to `queue`. A member of that queue may; a lead always may. Its holder keeps it only when they may hold it
+/// there. The promise is read again — a policy may be keyed by queue.
+public void MoveWork(WorkItem item, Queue queue) {
+  if (LeadsInbox) { WorkHandling.RaiseMoveOver(item, queue); } else { WorkHandling.RaiseMove(item, queue); }
+}
+
+/// Take every item that can be taken; say why for the rest.
+public BulkResult TakeMany(List<WorkItem> items) {
+  var result = new BulkResult();
+  foreach (var item in items) {
+    try { TakeWork(item, item.Assignee == null ? null : item.Assignee.Id); result.Moved = result.Moved + 1; }
+    catch (Exception e) { result.NotMoved.Add(item.Title + ": " + e.Message); }
+  }
+  return result;
+}
+
+/// Move every item that can be moved to `queue`; say why for the rest.
+public BulkResult MoveMany(List<WorkItem> items, Queue queue) {
+  var result = new BulkResult();
+  foreach (var item in items) {
+    try { MoveWork(item, queue); result.Moved = result.Moved + 1; }
+    catch (Exception e) { result.NotMoved.Add(item.Title + ": " + e.Message); }
+  }
+  return result;
+}
+
+/// The trail of `item`, oldest first — "why is this here".
+[SuppressWarning("cost-unbounded-read")]   // one item's trail
+public List<Assignment> TrailOf(WorkItem item) {
+  return Assignment.Where(a => a.Item == item).OrderBy(a => a.Step).ToList();
+}
+
+/// The next step of `item`'s trail.
+int NextStep(WorkItem item) {
+  item.Steps = item.Steps + 1;
+  return item.Steps;
+}
+
+// ── what the run does (called from WorkHandling's bodies) ─────────────────────────────────────────────────────────────
+
+string NameOf(Principal? p) {
+  if (p == null) { return "Nobody"; }
+  return p.DisplayName != "" ? p.DisplayName : p.Email;
+}
+
+/// Somebody other than the page expected holds `item` — refused, naming them and since when.
+void RefuseIfMovedFirst(WorkItem item, Guid? expected) {
+  if (item.Assignee == null) { return; }
+  if (expected != null && expected.Value == item.Assignee.Id) { return; }
+  var holder = item.Assignee;
+  var since = Assignment.Where(a => a.Item == item && a.To == holder).OrderByDescending(a => a.At).FirstOrDefault();
+  throw new ValidationException(TookFirst(NameOf(holder), since == null ? DurableClock.UtcNow : since.At, now: DurableClock.UtcNow) + ".");
+}
+
+/// Put `item` on `to`, done `by`.
+void HoldFor(WorkItem item, Principal to, Principal? by, AssignReason reason, Guid? expected, bool asLead) {
+  if (item.Assignee != null && item.Assignee.Id == to.Id) { return; }               // already theirs
+  RefuseIfMovedFirst(item, expected);
+  // SECURITY-INVARIANT(inbox-moving-anothers-work-is-a-leads): unless the app lets agents hand on, only the holder or a
+  // lead moves a held item — an agent cannot take, or hand on, work a colleague holds. The lead path is its own event,
+  // gated `[Authorize(u => LeadsInbox)]`. Guarded by tests/security.test.osy
+  // `an_agent_cannot_take_or_hand_on_work_a_colleague_holds`.
+  var mine = by != null && item.Assignee != null && item.Assignee.Id == by.Id;
+  if (!asLead && !App.Setting<InboxSetup>().AgentsHandOn) {
+    if (item.Assignee != null && !mine) {
+      throw new ValidationException(NameOf(item.Assignee) + " holds this — only a lead can move work a colleague holds.");
+    }
+    if (reason == AssignReason.HandedOn && !mine) {
+      throw new ValidationException("Only a lead can hand on work you do not hold — take it first.");
+    }
+  }
+  // SECURITY-INVARIANT(inbox-work-goes-only-to-who-may-hold-it): every path that puts an item on a person asks
+  // `MayHold` — so a restricted item is never handed to somebody who then cannot read it. Guarded by
+  // tests/security.test.osy `an_item_is_never_assigned_offered_or_covered_to_someone_who_may_not_hold_it`.
+  if (!MayHold(to, item)) { throw new ValidationException(WhyNot(to, item)); }
+  var from = item.Assignee;
+  // Taking what was offered to you accepts the offer: the trail says which step of the account chain it came by.
+  var offer = OfferOn(item);
+  var accepted = offer != null && item.OfferedTo != null && item.OfferedTo.Id == to.Id;
+  if (accepted) { reason = offer.Step; }
+  item.Assignee = to;
+  // Said when read: an accepted offer "took the offer", handing it to yourself "took it", else "handed it to".
+  var step = new Assignment { Item = item, Step = NextStep(item), From = from, To = to, FromQueue = item.Queue, ToQueue = item.Queue,
+                              Reason = reason, By = by, At = DurableClock.UtcNow };
+  Raise(new HolderChanged { Item = item, Step = StepOf(step) });
+  SettleOffer(item, to);
+  if (from != null) { Refill(from, item); }                                          // their load dropped
+}
+
+/// Responding to an item offered to you, and held by nobody, accepts it — you are answering it, so it is yours.
+void AcceptOnResponse(WorkItem item, Principal? responder) {
+  if (responder == null || item.Assignee != null || item.OfferedTo == null || item.OfferedTo.Id != responder.Id) { return; }
+  var offer = OfferOn(item);
+  if (offer == null || !MayHold(responder!, item)) { return; }
+  item.Assignee = responder;
+  var step = new Assignment { Item = item, Step = NextStep(item), To = responder, FromQueue = item.Queue, ToQueue = item.Queue,
+                              Reason = offer.Step, By = responder, At = DurableClock.UtcNow };
+  Raise(new HolderChanged { Item = item, Step = StepOf(step) });
+  SettleOffer(item, responder);
+}
+
+/// Why `person` may not hold `item` — the sentence a refusal carries.
+[SuppressWarning("cost-unbounded-read")]   // one item's needed skills
+string WhyNot(Principal person, WorkItem item) {
+  var member = QueueMember.Any(m => m.Queue == item.Queue && m.Member == person && m.Active);
+  var onTheAccount = item.Organization != null && !item.Queue.Restricted
+    && AccountTeamMember.Any(t => t.Organization == item.Organization && t.Member == person);
+  if (!member && !onTheAccount) {
+    return NameOf(person) + " may not hold this — they are not in the " + item.Queue.Name + " queue.";
+  }
+  var lacking = new List<string>();
+  foreach (var n in NeededSkill.Where(n => n.Item == item && n.Required).Include(n => n.Skill).ToList()) {
+    if (!HeldSkill.Any(h => h.Person == person && h.Skill == n.Skill)) { lacking.Add(n.Skill.Name); }
+  }
+  return NameOf(person) + " may not hold this — it needs " + string.Join(", ", lacking) + ", which they do not hold.";
+}
+
+/// `item` goes back to its queue, unheld — and, in a queue that hands work out, to whoever is free next (never back to
+/// who let it go).
+void LetGo(WorkItem item, Principal? by) {
+  if (item.Assignee == null) { return; }
+  var from = item.Assignee;
+  item.Assignee = null;
+  var step = new Assignment { Item = item, Step = NextStep(item), From = from, FromQueue = item.Queue, ToQueue = item.Queue,
+                              Reason = AssignReason.Released, By = by, At = DurableClock.UtcNow };
+  Raise(new HolderChanged { Item = item, Step = StepOf(step) });
+  Distribute(item, null, from.Id);
+  Refill(from, item);
+}
+
+/// `item` moves to `queue`; its holder keeps it only when they may hold it there. Left unheld in a queue that hands
+/// work out, it is given out there.
+void MoveTo(WorkItem item, Queue queue, Principal? by, bool asLead) {
+  if (item.Queue != null && item.Queue.Id == queue.Id) { return; }
+  if (!queue.Active) { throw new ValidationException("The " + queue.Name + " queue is closed."); }
+  if (!asLead) {
+    if (by == null || !QueueMember.Any(m => m.Queue == queue && m.Member == by && m.Active)) {
+      throw new ValidationException("Only a member of " + queue.Name + " (or a lead) can move work into it.");
+    }
+    var mine = item.Assignee != null && item.Assignee.Id == by.Id;
+    if (item.Assignee != null && !mine && !App.Setting<InboxSetup>().AgentsHandOn) {
+      throw new ValidationException(NameOf(item.Assignee) + " holds this — only a lead can move work a colleague holds.");
+    }
+  }
+  var fromQueue = item.Queue;
+  var holder = item.Assignee;
+  item.Queue = queue;
+  // Its holder keeps it only when they may hold it there — a step from them to nobody says it is unheld.
+  if (holder != null && !MayHold(holder, item)) { item.Assignee = null; }
+  var step = new Assignment { Item = item, Step = NextStep(item), From = holder, To = item.Assignee, FromQueue = fromQueue, ToQueue = queue,
+                              Reason = AssignReason.Moved, By = by, At = DurableClock.UtcNow };
+  Raise(new ItemMoved { Item = item, Step = StepOf(step) });
+  if (holder != null && item.Assignee == null) {
+    Distribute(item, null);
+    Refill(holder, item);
+  }
+}

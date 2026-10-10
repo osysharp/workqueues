@@ -1,0 +1,194 @@
+// WHERE WORK WAITS, AND WHAT EACH VIEW HOLDS — the default queue, the built-in views, saved views, and the counts the
+// rail shows. Every list and every count is the viewer's own read. The desk is in desk.test.osy.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using InboxKitTests;
+
+[Test(Desk)]
+[runas(Ines)]
+void an_item_no_rule_names_lands_in_the_default_queue() {
+  var r = Ask("Password reset loops");
+  Assert.Equal("Support", r.Queue!.Name);                            // the app's DefaultQueue
+  Assert.Equal("Arrived", Trail(r));
+  Assert.True(WasTold(r, "inbox.item-queued"));
+  Assert.False(WasTold(r, "inbox.item-routed"));                      // no rule placed it
+}
+
+/// A routing rule's placement is its OWN event, `ItemRouted`, beside the `ItemQueued` every arrival raises — so a
+/// timeline (or an automation) that cares about "a rule put it there" hears that, and not every arrival.
+[Test(Desk)]
+void a_rules_placement_raises_item_routed_as_well_as_item_queued() {
+  runas (Ada) {
+    new RoutingRule { Name = "Money words", Position = 1, TitleContains = "invoice", ToQueue = QueueOf("Billing") };
+    UnitOfWork.Commit();
+  }
+  runas (Lena) {
+    var invoice = Ask("Invoice 42 is wrong");
+    Assert.True(WasTold(invoice, "inbox.item-queued"));
+    Assert.True(WasTold(invoice, "inbox.item-routed"));
+    Assert.Equal("Arrived in Billing — rule “Money words”.",
+      Told.Single(t => t.Item == invoice.Id && t.Kind == "inbox.item-routed").Text);
+  }
+}
+
+/// A rule's APP ACTION is the app's to do: every matching rule that has one is handed to `InboxRouting.Act`, in the
+/// rules' order, as the item arrives — the kit's closed set of actions stays closed, and a helpdesk still tags.
+[Test(Desk)]
+void a_matching_rules_app_action_is_handed_to_the_app_in_order() {
+  runas (Ada) {
+    new RoutingRule { Name = "Refunds are flagged", Position = 0, TitleContains = "refund", AppAction = "flag:refund",
+                      ContinueAfter = true };
+    new RoutingRule { Name = "Money to Billing", Position = 1, TitleContains = "refund", ToQueue = QueueOf("Billing"),
+                      AppAction = "flag:money" };
+    new RoutingRule { Name = "Never reached", Position = 2, TitleContains = "refund", AppAction = "flag:late" };
+    UnitOfWork.Commit();
+  }
+  runas (Lena) {
+    var refund = Ask("Refund for invoice 42");
+    Assert.Equal("Billing", refund.Queue!.Name);
+    Assert.Equal("[money] [refund] ", Request.Single(x => x.Id == refund.Id).Body);   // in the rules' order
+    Assert.True(WasTold(refund, "act:flag:refund"));
+    Assert.False(WasTold(refund, "act:flag:late"));                   // the second rule stopped the matching
+    var other = Ask("Printer offline");
+    Assert.False(WasTold(other, "act:flag:refund"));
+  }
+}
+
+[Test(Desk)]
+void an_item_lands_in_the_queue_its_first_matching_rule_names() {
+  runas (Ada) {
+    new RoutingRule { Name = "Money words", Position = 1, TitleContains = "invoice|refund", ToQueue = QueueOf("Billing") };
+    new RoutingRule { Name = "Anything with money", Position = 2, TitleContains = "refund", ToQueue = QueueOf("Security") };
+    new RoutingRule { Name = "Enterprise is urgent", Position = 0, Tier = OrganizationTier.Single(t => t.Name == "Enterprise"),
+                      SetPriority = WorkPriority.Urgent, ContinueAfter = true };
+    new RoutingRule { Name = "Ines takes chat", Position = 3, Channel = "chat", AssignTo = PersonNamed("Ines") };
+    UnitOfWork.Commit();
+  }
+  runas (Lena) {
+    var refund = Ask("Refund for INVOICE 42");
+    Assert.Equal("Billing", refund.Queue!.Name);                     // the FIRST match names the queue — the next one never runs
+    var routed = TrailOf(refund)[0];
+    Assert.Equal(AssignReason.Rule, routed.Reason);
+    Assert.Equal("Money words", routed.Rule!.Name);
+    Assert.Equal("Arrived in Billing — rule “Money words”.", Said(routed));
+
+    var orbit = Ask("Refund please", org: "Orbit Labs");             // a rule that continues: priority, then the queue
+    Assert.Equal(WorkPriority.Urgent, orbit.Priority);
+    Assert.Equal("Enterprise urgent", orbit.Policy!.Name);           // the promise is read with the rule's priority
+    Assert.Equal("Billing", orbit.Queue!.Name);
+
+    var other = Ask("Printer offline");                               // no rule: the default queue
+    Assert.Equal("Support", other.Queue!.Name);
+    Assert.Equal(AssignReason.Arrived, TrailOf(other)[0].Reason);
+
+    var chat = new Request { Title = "Hi there", Channel = "chat", Organization = CompanyNamed("Larkspur") };
+    Workflow.Settle(chat);
+    Assert.Equal("Ines", HolderOf(chat));                             // a rule may give it to a person who may hold it
+    Assert.Equal("Arrived → Rule", Trail(chat));
+    var named = Ask("Refund, from the app", queue: "Support");       // the app's own choice of queue beats a rule's
+    Assert.Equal("Support", named.Queue!.Name);
+  }
+}
+
+[Test(Desk)]
+[runas(Lena)]
+void an_item_the_app_names_a_queue_for_lands_there() {
+  var r = Ask("Refund twice", queue: "Billing");
+  Assert.Equal("Billing", r.Queue!.Name);
+  Assert.Equal("Billing", TrailOf(r)[0].ToQueue!.Name);
+}
+
+[Test(Desk)]
+void the_views_hold_what_their_names_say() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));                  // Tue 09:00 Stockholm — business hours run
+  var ids = new List<Guid>();
+  runas (Ines) {
+    var mine = Ask("Mine");
+    TakeWork(mine);
+    var pooled = Ask("Pooled");
+    var rahuls = Ask("Rahul's");
+    var waiting = Ask("Waiting on them");
+    TakeWork(waiting);
+    Responded(waiting);
+    WaitOn(waiting, WaitFor.Requester);
+    var done = Ask("Done");
+    Responded(done);
+    WorkDone(done);
+    TestClock.Advance(TimeSpan.FromHours(7));                         // the Standard 8h first response: at risk at 6h
+    Workflow.Settle(mine); Workflow.Settle(pooled); Workflow.Settle(rahuls); Workflow.Settle(waiting); Workflow.Settle(done);
+    ids.Add(rahuls.Id);
+  }
+  runas (Rahul) { TakeWork(Request.Single(x => x.Id == ids[0])); }
+  runas (Ines) {
+    Assert.Equal("Mine, Waiting on them", Titles(Rows(BuiltInView.Mine)));
+    Assert.Equal("Pooled", Titles(Rows(BuiltInView.Unassigned)));
+    Assert.Equal("Mine, Pooled, Rahul's", Titles(Rows(BuiltInView.Open)));
+    Assert.Equal("Waiting on them", Titles(Rows(BuiltInView.Waiting)));
+    Assert.Equal("Done", Titles(Rows(BuiltInView.Done)));
+    Assert.Equal("Mine, Pooled, Rahul's", Titles(Rows(BuiltInView.AtRisk)));    // waiting pauses; done is done
+    Assert.Equal("", Titles(Rows(BuiltInView.Offered)));
+    Assert.Equal("Mine, Pooled, Rahul's, Waiting on them", Titles(RowsIn(QueueOf("Support"))));
+  }
+}
+
+[Test(Desk)]
+void every_count_agrees_with_the_list_it_counts() {
+  runas (Ines) {
+    var a = Ask("One"); TakeWork(a);
+    var b = Ask("Two");
+    var c = Ask("Three"); Responded(c); WaitOn(c, WaitFor.Others);
+    var d = Ask("Four"); Responded(d); WorkDone(d);
+    Workflow.Settle(a); Workflow.Settle(b); Workflow.Settle(c); Workflow.Settle(d);
+  }
+  runas (Lena) { Ask("Five", queue: "Billing"); Ask("Six", queue: "Security"); }
+  runas (Ines) { Assert.Equal("", Disagreements()); }
+  runas (Lena) { Assert.Equal("", Disagreements()); }
+  runas (Ada) { Assert.Equal("", Disagreements()); }
+  runas (Ada) { Assert.Equal(1, Counts().Queues.Single(q => q.Name == "Security").Open); }   // an admin sees every queue
+}
+
+[Test(Desk)]
+void a_saved_view_filters_by_queue_tier_priority_language_and_the_apps_own_filter() {
+  runas (Ines) {
+    Ask("Larkspur, normal");
+    Ask("Orbit, urgent", org: "Orbit Labs", priority: WorkPriority.Urgent);
+    Ask("Orbit, low, Spanish", org: "Orbit Labs", priority: WorkPriority.Low, language: "es");
+    Ask("Says refund", body: "Please refund the second charge");
+  }
+  runas (Lena) { Ask("Billing, normal", queue: "Billing"); }
+  runas (Ines) {
+    var me = PersonNamed("Ines");
+    var enterprise = OrganizationTier.Single(t => t.Name == "Enterprise");
+    var tier = new InboxView { Name = "Enterprise", Owner = me, Tier = enterprise };
+    var urgent = new InboxView { Name = "High and up", Owner = me, AtLeast = WorkPriority.High };
+    var spanish = new InboxView { Name = "Spanish", Owner = me, Language = "es" };
+    var refunds = new InboxView { Name = "Refunds", Owner = me, AppFilter = "says:refund" };
+    var billing = new InboxView { Name = "Billing", Owner = me, Queue = QueueOf("Billing") };
+    Assert.Equal("Orbit, low, Spanish, Orbit, urgent", Titles(RowsOf(tier)));
+    Assert.Equal("Orbit, urgent", Titles(RowsOf(urgent)));
+    Assert.Equal("Orbit, low, Spanish", Titles(RowsOf(spanish)));
+    Assert.Equal("Says refund", Titles(RowsOf(refunds)));
+    Assert.Equal("Billing, normal", Titles(RowsOf(billing)));
+  }
+}
+
+/// Where the rail's counts and the lists they count disagree, for the viewer — "" when they agree.
+string Disagreements() {
+  var counts = Counts();
+  var found = "";
+  if (Rows(BuiltInView.Mine).Count != counts.Mine) { found = found + "Mine "; }
+  if (Rows(BuiltInView.Unassigned).Count != counts.Unassigned) { found = found + "Unassigned "; }
+  if (Rows(BuiltInView.Open).Count != counts.Open) { found = found + "Open "; }
+  if (Rows(BuiltInView.AtRisk).Count != counts.AtRisk) { found = found + "AtRisk "; }
+  if (Rows(BuiltInView.Waiting).Count != counts.Waiting) { found = found + "Waiting "; }
+  if (Rows(BuiltInView.Done).Count != counts.Done) { found = found + "Done "; }
+  foreach (var q in counts.Queues) {
+    var open = RowsIn(Queue.Single(x => x.Id == q.Queue)).Count(r => r.Handling == Handling.New
+      || r.Handling == Handling.Owed || r.Handling == Handling.Answered);
+    if (open != q.Open) { found = found + q.Name + " "; }
+  }
+  return found;
+}

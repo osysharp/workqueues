@@ -1,0 +1,198 @@
+// TYPED LINKS BETWEEN ITEMS — a kind from the closed set the app declares (here: related, duplicate, incident, and a
+// split only the desk's code makes), shown on both items from each one's side, refused when it makes no sense, told to
+// both items' history, and the team's alone.
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using InboxKitTests;
+
+/// A request with the reference people quote.
+Request Numbered(string title, string reference) {
+  var r = Ask(title);
+  r.Reference = reference;
+  UnitOfWork.Commit();
+  return r;
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void a_link_shows_on_both_items_from_each_side_and_both_histories_say_it() {
+  var first = Numbered("Sign-in fails on the app", "R-1");
+  var again = Numbered("Cannot sign in", "R-2");
+  LinkWork(again.Id, first.Id, "duplicate");
+
+  var mine = ItemLinksOf(again.Id);
+  Assert.Equal(1, mine.Count);
+  Assert.Equal("Duplicate of", mine[0].Words);
+  Assert.Equal("R-1", mine[0].Reference);
+  Assert.Equal(first.Id, mine[0].Other);
+  var theirs = ItemLinksOf(first.Id);
+  Assert.Equal("Duplicated by", theirs[0].Words);
+  Assert.Equal("R-2", theirs[0].Reference);
+  Assert.True(theirs[0].Removable);
+
+  // Both items' history is told — facts, said from each one's side.
+  var told = Told.Where(t => t.Kind == "inbox.item-linked").OrderBy(t => t.At).ToList();
+  Assert.Equal(2, told.Count);
+  Assert.Equal("Linked: Duplicate of R-1.", Told.Single(t => t.Kind == "inbox.item-linked" && t.Item == again.Id).Text);
+  Assert.Equal("Linked: Duplicated by R-2.", Told.Single(t => t.Kind == "inbox.item-linked" && t.Item == first.Id).Text);
+  // …and a link moves nothing: who holds them and where they wait are as they were.
+  Assert.Equal(LinkedTo(again, "duplicate")!.Id, first.Id);
+  Assert.Equal(1, LinkedFrom(first, "duplicate").Count);
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void a_link_made_from_the_item_it_names_points_the_right_way() {
+  var outage = Numbered("Carrier API is down", "R-10");
+  var report = Numbered("Labels will not print", "R-11");
+  // From the problem: "Has incident R-11" — so R-11 is the incident OF the problem.
+  LinkWork(outage.Id, report.Id, "incident", back: true);
+  Assert.Equal(outage.Id, LinkedTo(report, "incident")!.Id);
+  Assert.Equal("Has incident", ItemLinksOf(outage.Id)[0].Words);
+  Assert.Equal("Incident of", ItemLinksOf(report.Id)[0].Words);
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void a_link_that_makes_no_sense_is_refused_saying_why() {
+  var a = Numbered("Invoice is wrong", "R-20");
+  var b = Numbered("Invoice total off", "R-21");
+  var c = Numbered("Wrong VAT on invoice", "R-22");
+
+  Assert.Equal("There is no kind of link called “blocks” here.", Assert.Throws<ValidationException>(() => LinkWork(a.Id, b.Id, "blocks")).Message);
+  Assert.Equal("An item cannot be linked to itself.", Assert.Throws<ValidationException>(() => LinkWork(a.Id, a.Id, "related")).Message);
+  LinkWork(a.Id, b.Id, "related");
+  // A mutual link stands for both ways — linking back is the same link.
+  Assert.Equal("R-21 is already linked to R-20 that way.", Assert.Throws<ValidationException>(() => LinkWork(b.Id, a.Id, "related")).Message);
+
+  LinkWork(b.Id, a.Id, "duplicate");
+  // One original per duplicate.
+  Assert.Equal("R-21 is already “Duplicate of” R-20 — remove that link first.", Assert.Throws<ValidationException>(() => LinkWork(b.Id, c.Id, "duplicate")).Message);
+  // A one-way link does not run back.
+  Assert.Equal("R-21 is already “Duplicate of” R-20 — the link cannot run both ways.", Assert.Throws<ValidationException>(() => LinkWork(a.Id, b.Id, "duplicate")).Message);
+  // No chains: R-21 is itself a duplicate, so its duplicates belong to R-20.
+  Assert.Equal("R-21 is itself “Duplicate of” R-20 — link to R-20 instead.", Assert.Throws<ValidationException>(() => LinkWork(c.Id, b.Id, "duplicate")).Message);
+  // …and an original cannot become a duplicate of something else while it has duplicates.
+  Assert.Equal("Other items are “Duplicate of” R-20, so it cannot be “Duplicate of” another — that would make a chain.", Assert.Throws<ValidationException>(() => LinkWork(a.Id, c.Id, "duplicate")).Message);
+  Assert.Equal(2, WorkLink.Count());
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void removing_a_link_takes_it_off_both_and_both_histories_say_so() {
+  var a = Numbered("Export is slow", "R-30");
+  var b = Numbered("Reports time out", "R-31");
+  LinkWork(a.Id, b.Id, "related");
+  UnlinkWork(ItemLinksOf(a.Id)[0].Link);
+  Assert.Equal(0, ItemLinksOf(a.Id).Count);
+  Assert.Equal(0, ItemLinksOf(b.Id).Count);
+  Assert.Equal("Link removed: Related to R-31.", Told.Single(t => t.Kind == "inbox.item-unlinked" && t.Item == a.Id).Text);
+  Assert.Equal("Link removed: Related to R-30.", Told.Single(t => t.Kind == "inbox.item-unlinked" && t.Item == b.Id).Text);
+  Assert.Equal("That link was already removed.", Assert.Throws<ValidationException>(() => UnlinkWork(Guid.NewGuid())).Message);
+}
+
+/// A kind the app keeps for its own code — a split — is shown, and neither made nor removed by hand.
+[Test(Desk)]
+[runas(Ines)]
+void a_link_only_the_apps_code_makes_is_neither_made_nor_removed_by_hand() {
+  var original = Numbered("Two problems in one mail", "R-40");
+  var split = Numbered("The second problem", "R-41");
+  Assert.Equal("That kind of link is made by the app itself, not by hand.", Assert.Throws<ValidationException>(() => LinkWork(split.Id, original.Id, "split")).Message);
+  Link(split, original, "split");
+  UnitOfWork.Commit();
+  var shown = ItemLinksOf(original.Id);
+  Assert.Equal("Split into", shown[0].Words);
+  Assert.False(shown[0].Removable);
+  Assert.Equal("That link was made by the app itself, and stays.", Assert.Throws<ValidationException>(() => UnlinkWork(shown[0].Link)).Message);
+}
+
+/// SECURITY-INVARIANT(inbox-links-are-staffs).
+[Test(Desk)]
+void a_requester_reads_no_link_and_makes_none() {
+  Guid mine = Guid.Empty;
+  Guid other = Guid.Empty;
+  runas (Ines) {
+    var a = Numbered("Printer offline", "R-50");
+    var b = Numbered("Printer offline again", "R-51");
+    LinkWork(b.Id, a.Id, "duplicate");
+    mine = a.Id;
+    other = b.Id;
+  }
+  runas (Olivia) {
+    // Both are hers, and she reads them — never how the team linked them.
+    Assert.Equal(2, Request.Count(r => r.Id == mine || r.Id == other));
+    Assert.Equal(0, WorkLink.Count());
+    Assert.Throws<NotAuthorized>(() => LinkWork(mine, other, "related"));
+    Assert.Denied(() => {
+      new WorkLink { From = Request.Single(r => r.Id == mine), To = Request.Single(r => r.Id == other), Kind = "related",
+                     At = DateTime.UtcNow };
+      UnitOfWork.Commit();
+    });
+  }
+  runas (Ines) { Assert.Equal(1, WorkLink.Count()); }
+}
+
+/// The links on an item's screen: shown from its side, made by finding the other item by its reference, removed — with
+/// the refusal said in place.
+[Test(Desk)]
+void the_links_on_an_item_are_made_found_and_removed_on_its_screen() {
+  Guid id = Guid.Empty;
+  runas (Ines) {
+    var a = Numbered("Mail stuck in the outbox", "R-60");
+    var b = Numbered("Outbox not sending", "R-61");
+    TakeWork(a);
+    id = a.Id;
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ines);
+  Ui.Visit("/inbox/mine/i/" + id);
+  Assert.Visible("Not linked to anything.");
+  Ui.Click("Link…");
+  Ui.Click("Kind of link: Related to");
+  Ui.Click("Duplicated by");
+  Ui.Fill("Find the other one", "R-61");
+  Ui.Click("Find");
+  Ui.Click("Link R-61");
+  Assert.Visible("Duplicated by", within: "Links");
+  Assert.Visible("Outbox not sending", within: "Links");
+  Ui.Shot("links-wide-light");
+  // Linking it again is refused, in place — the picker keeps the way it was last used.
+  Ui.Click("Link…");
+  Assert.Visible("Duplicated by", within: "Link to another");
+  Ui.Fill("Find the other one", "outbox not");
+  Ui.Click("Find");
+  Ui.Click("Link R-61");
+  Assert.Visible("R-61 is already linked to R-60 that way.");
+  Ui.Click("Cancel");
+  Ui.Click("Remove the link to R-61");
+  Assert.Visible("Not linked to anything.");
+}
+
+/// A kind may carry a step the item that says it takes on the other — here a duplicate is folded into the item it
+/// repeats. The step shows only on that side, only while the item is still worked, and the app does it.
+[Test(Desk)]
+void a_kinds_step_is_offered_on_the_side_that_says_it_and_the_app_takes_it() {
+  Guid dup = Guid.Empty;
+  Guid original = Guid.Empty;
+  runas (Ines) {
+    var a = Numbered("Printer offline in bay 3", "R-70");
+    var b = Numbered("Bay 3 printer will not print", "R-71");
+    Link(b, a, "duplicate");
+    UnitOfWork.Commit();
+    dup = b.Id;
+    original = a.Id;
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ines);
+  Ui.Visit("/inbox/mine/i/" + original);
+  Assert.Visible("Duplicated by", within: "Links");
+  Assert.Hidden("Fold into", within: "Links");
+  Ui.Visit("/inbox/mine/i/" + dup);
+  Assert.Visible("Duplicate of", within: "Links");
+  Ui.Shot("links-step-wide-light");
+  Ui.Click("Fold into R-70");
+  Background.Settle();
+  runas (Ines) { Assert.Equal(Handling.Cancelled, WorkItem.Single(w => w.Id == dup).Handling); }
+  Assert.Hidden("Fold into R-70");
+}

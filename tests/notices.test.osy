@@ -1,0 +1,30 @@
+// WHAT THE PERSON TOLD READS — `InboxEvents.Notify` and `NotifyLeads` hand the app the FACTS of what
+// happened, like `Recorded` does, never a sentence in the run's language; the app's notifier says them to the person
+// with `InboxNotice` when they read it — in their language.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+using InboxKitTests;
+
+[Test(Desk)]
+void the_cover_is_told_the_facts_and_reads_them_as_handed_to_them() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  runas (Ada) { Team("Acme", "Rahul", "Lena", new List<string>()); }
+  var held = Guid.Empty;
+  runas (Rahul) {
+    var one = Ask("Printer offline");
+    TakeWork(one);
+    held = one.Id;
+    GoAway(until: new DateTime(2026, 6, 4, 7, 0, 0), cover: PersonNamed("Ines"));
+  }
+  runas (Lena) {
+    var told = Told.Single(t => t.Item == held && t.Kind == "notify:Ines");
+    Assert.Equal("Handed to you — Rahul is away until Thu 4 Jun 07:00 UTC.", told.Text);
+  }
+}
+
+// …said in the reader's language: proven where a notifier SHOWS it (a notice is a message only once something on screen
+// or in a mail says it), so an app's own notifier test reads one in the languages it is translated into.

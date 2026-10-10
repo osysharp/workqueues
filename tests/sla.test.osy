@@ -1,0 +1,376 @@
+// WHAT AN ITEM IS PROMISED, AND THE CLOCKS THAT KEEP IT — first response, every next response, resolution.
+//
+// The app tells the kit four facts (Responded, RequesterWrote, WaitOn/ResumeWork, WorkDone) and the kit keeps the time:
+// the promise is chosen by the most specific policy, the clocks run in the policy's hours, pause while the item waits,
+// are retargeted when the priority changes, and a breach is RECORDED and never ends anything. The desk is in
+// desk.test.osy. Times are UTC; Stockholm is UTC+2 in June.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+using InboxKitTests;
+
+[Test(Desk)]
+[runas(Ines)]
+void the_policy_is_chosen_by_the_most_specific_match() {
+  var plain = Ask("Export is slow");
+  var urgent = Ask("Checkout is down", priority: WorkPriority.Urgent);
+  var enterprise = Ask("Report wrong", org: "Orbit Labs");
+  var both = Ask("API returns 500", org: "Orbit Labs", priority: WorkPriority.Urgent);
+
+  Assert.Equal("Standard", plain.Policy!.Name);
+  Assert.Equal("Urgent", urgent.Policy!.Name);
+  Assert.Equal("Enterprise", enterprise.Policy!.Name);
+  Assert.Equal("Enterprise urgent", both.Policy!.Name);              // two conditions beat one
+  Assert.Equal(TimeSpan.FromMinutes(30), both.FirstResponseWithin);  // …and its promise is the one snapshotted
+  Assert.Equal(TimeSpan.FromHours(4), both.ResolutionWithin);
+  Assert.Null(both.Hours);                                          // around the clock
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void a_premium_organisation_is_promised_around_the_clock_and_tighter() {
+  TestClock.Set(new DateTime(2026, 6, 6, 20, 0, 0));                 // Saturday 22:00 in Stockholm
+  var r = Ask("Checkout returns 500", org: "Orbit Labs", priority: WorkPriority.Urgent);
+  TestClock.Advance(TimeSpan.FromMinutes(25)); Workflow.Settle(r);
+  Assert.Null(ClockOf(r, SlaMetric.FirstResponse).BreachedAt);
+  TestClock.Advance(TimeSpan.FromMinutes(10)); Workflow.Settle(r);                                 // 35 minutes on a Saturday night
+  Assert.NotNull(ClockOf(r, SlaMetric.FirstResponse).BreachedAt);
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void the_first_response_clock_breaches_when_nobody_responds_in_time() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));                  // Tue 09:00 Stockholm; Standard owes 8 business hours
+  var r = Ask("Export stuck");
+  TestClock.Advance(TimeSpan.FromHours(7)); Workflow.Settle(r);
+  Assert.Null(ClockOf(r, SlaMetric.FirstResponse).BreachedAt);       // 7 of 8 gone
+  Assert.False(WasTold(r, "inbox.promise-breached"));
+  TestClock.Advance(TimeSpan.FromHours(2)); Workflow.Settle(r);
+  Assert.NotNull(ClockOf(r, SlaMetric.FirstResponse).BreachedAt);
+  Assert.True(WasTold(r, "inbox.promise-breached"));
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void a_breach_is_recorded_and_the_item_carries_on() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  var r = Ask("Invoice PDF wrong");
+  TestClock.Advance(TimeSpan.FromHours(9)); Workflow.Settle(r);
+  Assert.Equal(Handling.New, r.Handling);                            // still owed, and still shown as owed
+  Assert.Equal(ClockOutcome.Running, ClockOf(r, SlaMetric.FirstResponse).Outcome);
+
+  Responded(r);
+  Workflow.Settle(r);
+  Assert.Equal(Handling.Answered, r.Handling);
+  var first = ClockOf(r, SlaMetric.FirstResponse);
+  Assert.Equal(ClockOutcome.Breached, first.Outcome);                // met — late
+  Assert.NotNull(first.MetAt);
+  Assert.NotNull(r.FirstRespondedAt);
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void a_business_hours_clock_does_not_run_over_the_weekend_or_a_holiday() {
+  TestClock.Set(new DateTime(2026, 6, 5, 13, 0, 0));                 // Fri 15:00 Stockholm: 2h of Friday left
+  var weekend = Ask("Report is slow");
+  TestClock.Advance(TimeSpan.FromHours(60)); Workflow.Settle(weekend);                             // Mon 03:00 — a wall clock would be 2½ days late
+  Assert.Null(ClockOf(weekend, SlaMetric.FirstResponse).BreachedAt);
+  TestClock.Advance(TimeSpan.FromHours(11)); Workflow.Settle(weekend);                             // Mon 14:00: 2h Friday + 5h Monday
+  Assert.Null(ClockOf(weekend, SlaMetric.FirstResponse).BreachedAt);
+  TestClock.Advance(TimeSpan.FromHours(2)); Workflow.Settle(weekend);                              // Mon 16:00: 9h
+  Assert.NotNull(ClockOf(weekend, SlaMetric.FirstResponse).BreachedAt);
+
+  TestClock.Set(new DateTime(2026, 6, 18, 13, 0, 0));                // Thu 15:00, before Midsummer Eve (closed)
+  var holiday = Ask("Login loop");
+  TestClock.Advance(TimeSpan.FromHours(95)); Workflow.Settle(holiday);                             // Mon 22 June 14:00: 2h Thu + 0 Fri + 5h Mon
+  Assert.Null(ClockOf(holiday, SlaMetric.FirstResponse).BreachedAt);
+  TestClock.Advance(TimeSpan.FromHours(2)); Workflow.Settle(holiday);                              // Mon 16:00: 9h
+  Assert.NotNull(ClockOf(holiday, SlaMetric.FirstResponse).BreachedAt);
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void the_next_response_is_owed_only_after_the_requester_writes() {
+  var r = Ask("Webhooks arrive twice", org: "Orbit Labs");           // Enterprise: next response within 4h, 24/7
+  Responded(r);
+  TestClock.Advance(TimeSpan.FromDays(10)); Workflow.Settle(r);                                    // answered: ten quiet days owe nothing
+  Assert.Equal(Handling.Answered, r.Handling);
+  Assert.False(SlaClock.Any(c => c.Item.Id == r.Id && c.Metric == SlaMetric.NextResponse));
+
+  runas (Dev) { RequesterWrote(Request.Single(x => x.Title == "Webhooks arrive twice")); }
+  Workflow.Settle(r);
+  Assert.Equal(Handling.Owed, r.Handling);                           // now a response IS owed
+  TestClock.Advance(TimeSpan.FromHours(5)); Workflow.Settle(r);
+  Assert.NotNull(ClockOf(r, SlaMetric.NextResponse).BreachedAt);
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void every_response_is_promised_not_just_the_first() {
+  var r = Ask("Sync drops rows", org: "Orbit Labs");
+  Responded(r);
+  RequesterWrote(r);
+  TestClock.Advance(TimeSpan.FromHours(1)); Workflow.Settle(r);
+  Responded(r);                                                      // the first next response: met
+  RequesterWrote(r);                                                 // …and they wrote again: a second is owed
+  Workflow.Settle(r);
+  Assert.Equal(ClockOutcome.Met, ClockOf(r, SlaMetric.NextResponse, 1).Outcome);
+  Assert.Equal(ClockOutcome.Running, ClockOf(r, SlaMetric.NextResponse, 2).Outcome);
+  TestClock.Advance(TimeSpan.FromHours(5)); Workflow.Settle(r);
+  Assert.NotNull(ClockOf(r, SlaMetric.NextResponse, 2).BreachedAt);  // the second promise is kept like the first
+  Assert.Null(ClockOf(r, SlaMetric.NextResponse, 1).BreachedAt);
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void waiting_on_the_requester_pauses_every_clock() {
+  var r = Ask("SSO loops after reset", org: "Orbit Labs");           // Enterprise: resolution 12h, 24/7
+  TestClock.Advance(TimeSpan.FromHours(1)); Workflow.Settle(r);
+  Responded(r);
+  WaitOn(r, WaitFor.Requester);
+  Workflow.Settle(r);
+  Assert.Equal(Handling.WaitingOnRequester, r.Handling);
+  TestClock.Advance(TimeSpan.FromDays(5)); Workflow.Settle(r);                                     // far past 12h — but paused
+  var resolution = ClockOf(r, SlaMetric.Resolution);
+  Assert.Null(resolution.BreachedAt);
+  Assert.Null(resolution.RunningSince);
+  Assert.True(About(resolution.BusinessTime, TimeSpan.FromHours(1)));  // the hour before the wait, banked
+
+  RequesterWrote(r);                                                 // their answer ends the wait: a response is owed
+  Workflow.Settle(r);
+  Assert.Equal(Handling.Owed, r.Handling);
+  TestClock.Advance(TimeSpan.FromHours(10)); Workflow.Settle(r);                                   // 1h + 10h of 12h
+  Assert.Null(ClockOf(r, SlaMetric.Resolution).BreachedAt);
+  TestClock.Advance(TimeSpan.FromHours(2)); Workflow.Settle(r);
+  Assert.NotNull(ClockOf(r, SlaMetric.Resolution).BreachedAt);
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void waiting_on_others_keeps_resolution_running_unless_the_policy_pauses_it() {
+  var carrier = Ask("Carrier API down", org: "Orbit Labs");          // Enterprise: resolution 12h — keeps running
+  Responded(carrier);
+  WaitOn(carrier, WaitFor.Others);
+  Workflow.Settle(carrier);
+  Assert.Equal(Handling.WaitingOnOthers, carrier.Handling);
+  TestClock.Advance(TimeSpan.FromHours(13)); Workflow.Settle(carrier);
+  Assert.NotNull(ClockOf(carrier, SlaMetric.Resolution).BreachedAt);  // the requester is still waiting on US
+
+  var vendor = Ask("Vendor patch", kind: "vendor");                  // Vendor work: waiting on others pauses it
+  Responded(vendor);
+  WaitOn(vendor, WaitFor.Others);
+  Workflow.Settle(vendor);
+  Assert.Equal(Handling.Paused, vendor.Handling);
+  TestClock.Advance(TimeSpan.FromHours(13)); Workflow.Settle(vendor);
+  Assert.Null(ClockOf(vendor, SlaMetric.Resolution).BreachedAt);
+  ResumeWork(vendor);
+  Workflow.Settle(vendor);
+  Assert.Equal(Handling.Owed, vendor.Handling);
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void raising_the_priority_retargets_every_clock() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));                  // Tue 09:00; Standard: first response 8h
+  var r = Ask("Payments failing");
+  TestClock.Advance(TimeSpan.FromMinutes(30)); Workflow.Settle(r);
+  Prioritise(r, WorkPriority.Urgent);                                // Urgent: 1h — with 30 minutes already used
+  Workflow.Settle(r);
+  Assert.Equal("Urgent", r.Policy!.Name);
+  Assert.Equal(TimeSpan.FromHours(1), ClockOf(r, SlaMetric.FirstResponse).Target);
+  Assert.Equal(TimeSpan.FromHours(8), ClockOf(r, SlaMetric.Resolution).Target);
+  TestClock.Advance(TimeSpan.FromMinutes(20)); Workflow.Settle(r);
+  Assert.Null(ClockOf(r, SlaMetric.FirstResponse).BreachedAt);
+  TestClock.Advance(TimeSpan.FromMinutes(15)); Workflow.Settle(r);                                 // 65 minutes in all
+  Assert.NotNull(ClockOf(r, SlaMetric.FirstResponse).BreachedAt);
+  Assert.True(WasTold(r, "inbox.priority-changed"));
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void a_reopened_item_resumes_its_resolution_clock() {
+  var r = Ask("Exports time out", org: "Orbit Labs");                // Enterprise: resolution 12h, 24/7
+  TestClock.Advance(TimeSpan.FromHours(4)); Workflow.Settle(r);
+  Responded(r);
+  WorkDone(r);
+  Workflow.Settle(r);
+  Assert.Equal(Handling.Done, r.Handling);
+  Assert.NotNull(r.DoneAt);
+  Assert.Equal(ClockOutcome.Met, ClockOf(r, SlaMetric.Resolution).Outcome);
+  Assert.True(About(ClockOf(r, SlaMetric.Resolution).BusinessTime, TimeSpan.FromHours(4)));
+
+  TestClock.Advance(TimeSpan.FromDays(2)); Workflow.Settle(r);                                     // done: nothing runs
+  ReopenWork(r);
+  Workflow.Settle(r);
+  Assert.Equal(Handling.Owed, r.Handling);
+  Assert.Null(r.DoneAt);
+  Assert.Equal(ClockOutcome.Running, ClockOf(r, SlaMetric.Resolution).Outcome);
+  TestClock.Advance(TimeSpan.FromHours(7)); Workflow.Settle(r);                                    // 4h + 7h of 12h
+  Assert.Null(ClockOf(r, SlaMetric.Resolution).BreachedAt);
+  TestClock.Advance(TimeSpan.FromHours(2)); Workflow.Settle(r);
+  Assert.NotNull(ClockOf(r, SlaMetric.Resolution).BreachedAt);
+}
+
+[Test(Desk)]
+void an_item_with_no_policy_has_no_promise_and_says_so() {
+  runas (Ada) { foreach (var p in SlaPolicy.ToList()) { p.Active = false; } }
+  runas (Ines) {
+    var r = new Request { Title = "Feature idea", Organization = CompanyNamed("Larkspur") };
+    Workflow.Settle(r);
+    Assert.Null(r.Policy);
+    Assert.False(HasPromise(r));
+    Assert.Equal(0, Clocks(r).Count);
+    Assert.False(SlaClock.Any(c => c.Item.Id == r.Id));
+    Assert.True(Told.Any(t => t.Item == r.Id && t.Kind == "inbox.item-arrived" && t.Text.Contains("no promise")));
+    TestClock.Advance(TimeSpan.FromDays(30)); Workflow.Settle(r);
+    Assert.Equal(Handling.New, r.Handling);                          // nothing to breach; the work still stands
+  }
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void an_imported_item_keeps_its_real_history() {
+  TestClock.Set(new DateTime(2026, 6, 2, 12, 0, 0));
+  var opened = new DateTime(2026, 6, 2, 9, 30, 0);                   // 2½ hours ago
+  var answered = new DateTime(2026, 6, 2, 11, 0, 0);                 // 1½ hours after it arrived
+  // As an import does it: the item with its real arrival, then its history raised as it happened, then settled.
+  var r = new Request { Title = "From the old desk", Organization = CompanyNamed("Orbit Labs"), ArrivedAt = opened };
+  UnitOfWork.Commit();
+  Responded(r, at: answered);
+  Workflow.Settle(r);
+  Assert.Equal(opened, ClockOf(r, SlaMetric.FirstResponse).StartedAt);
+  var first = ClockOf(r, SlaMetric.FirstResponse);
+  Assert.Equal(answered, first.MetAt);
+  Assert.Equal(ClockOutcome.Met, first.Outcome);                     // 1½h of Enterprise's 2h: on time, as it really was
+  Assert.Equal(answered, r.FirstRespondedAt);
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void a_breach_found_late_is_recorded_when_it_happened() {
+  TestClock.Set(new DateTime(2026, 6, 2, 12, 0, 0));
+  // Imported 2½ hours after it arrived, never answered: Enterprise's 2h first response ran out at 11:30, and at risk
+  // (75%) at 11:00 — that is when they HAPPENED, whenever the run first heard of them.
+  var r = new Request { Title = "Unanswered from the old desk", Organization = CompanyNamed("Orbit Labs"),
+                        ArrivedAt = new DateTime(2026, 6, 2, 9, 30, 0) };
+  Workflow.Settle(r);
+  var first = ClockOf(r, SlaMetric.FirstResponse);
+  Assert.Equal(new DateTime(2026, 6, 2, 11, 30, 0), first.BreachedAt);
+  Assert.Equal(new DateTime(2026, 6, 2, 11, 0, 0), first.AtRiskAt);
+  Assert.Equal(SlaState.Breached, r.Sla);
+  // …and the app is TOLD them at those minutes, so its timeline reads as it happened (InboxEvents.Recorded's `at`).
+  Assert.True(Told.Any(t => t.Item == r.Id && t.Kind == "inbox.promise-breached" && t.At == new DateTime(2026, 6, 2, 11, 30, 0)));
+  Assert.True(Told.Any(t => t.Item == r.Id && t.Kind == "inbox.promise-at-risk" && t.At == new DateTime(2026, 6, 2, 11, 0, 0)));
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void two_runs_one_item_the_apps_lifecycle_and_the_inbox_agree() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  var s = new Spend { Title = "MacBook Pro ×3", Amount = 7800, Kind = "spend", Requester = PersonNamed("Olivia"),
+                      Approver = PersonNamed("Ines") };
+  Workflow.Settle(s);
+  Assert.Equal(ApprovalStep.Manager, s.Step);
+  Assert.Equal(Handling.New, s.Handling);
+  Assert.Equal("Spend", s.Policy!.Name);
+
+  SpendApproval.RaiseApprove(s);                                     // the manager approves — the inbox hears "responded"
+  Workflow.Settle(s);
+  Assert.Equal(ApprovalStep.Finance, s.Step);
+  Assert.Equal(Handling.Answered, s.Handling);
+  Assert.Equal(ClockOutcome.Met, ClockOf(s, SlaMetric.FirstResponse).Outcome);
+
+  SpendApproval.RaiseApprove(s);                                     // finance approves — the inbox hears "done"
+  Workflow.Settle(s);
+  Assert.Equal(ApprovalStep.Approved, s.Step);
+  Assert.Equal(Handling.Done, s.Handling);
+  Assert.Equal(ClockOutcome.Met, ClockOf(s, SlaMetric.Resolution).Outcome);
+  Assert.Equal(1, Workflow.WorkByItem<Spend>().Count(x => x.Item.Id == s.Id));   // one row per item, across both runs
+}
+
+[Test(Desk)]
+void only_the_team_says_it_responded() {
+  var id = Guid.Empty;
+  runas (Ines) { id = Ask("Where is my order?").Id; }
+  runas (Olivia) {
+    var mine = Request.Single(x => x.Id == id);
+    Assert.Denied(() => Responded(mine));                 // the requester cannot stop the team's clock
+    Assert.Denied(() => Prioritise(mine, WorkPriority.Urgent));
+  }
+  runas (Ines) { Assert.Equal(Handling.New, Request.Single(x => x.Id == id).Handling); }
+}
+
+// THE BOARD'S CLOCK FALLS BACK TO THE RESOLUTION DEADLINE. A missed first response retires its
+// clock, and an answered item owes no response at all — but both still owe the RESOLUTION, and a row with no countdown
+// told the team nothing about the promise they could still keep.
+[Test(Desk)]
+[runas(Ines)]
+void a_missed_response_and_an_answered_item_both_count_down_the_resolution_deadline() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));                  // Tue 09:00 Stockholm; Standard owes 8 business hours
+  var late = Ask("Invoice PDF wrong");
+  var answered = Ask("Export stuck");
+  Responded(answered);
+  Workflow.Settle(answered);
+  TestClock.Advance(TimeSpan.FromHours(9)); Workflow.Settle(late); Workflow.Settle(answered);
+  Assert.NotNull(ClockOf(late, SlaMetric.FirstResponse).BreachedAt);
+
+  var rows = Rows(BuiltInView.Open);
+  var l = rows.Single(r => r.Id == late.Id);
+  Assert.NotNull(l.BreachedAt);                                      // the first response was missed — still said…
+  Assert.Equal("first response", l.MissedWord);
+  Assert.Equal(SlaMetric.Resolution, l.Metric);                      // …and the row counts what still runs
+  Assert.Equal(ClockOf(late, SlaMetric.Resolution).DueAt, l.DueAt);
+
+  var a = rows.Single(r => r.Id == answered.Id);
+  Assert.Equal(Handling.Answered, a.Handling);
+  Assert.Null(a.BreachedAt);
+  Assert.Equal(SlaMetric.Resolution, a.Metric);                      // nothing to reply to, the resolution still owed
+  Assert.Equal(ClockOf(answered, SlaMetric.Resolution).DueAt, a.DueAt);
+}
+
+// ── an absolute due date: a statutory deadline is real time ─────────────────────────────────────────────────────────
+
+[Test(Desk)]
+[runas(Ines)]
+void an_absolute_due_date_runs_in_real_time_through_a_wait_and_breaches_at_the_instant() {
+  TestClock.Set(new DateTime(2026, 6, 5, 13, 0, 0));                  // Fri 15:00 Stockholm — business hours would stop tonight
+  var due = new DateTime(2026, 6, 15, 13, 0, 0);                      // ten days, in real time
+  var r = new Request { Title = "A request with a statutory deadline", Organization = CompanyNamed("Larkspur"),
+                        Requester = PersonNamed("Olivia"), DueAt = due };
+  Workflow.Settle(r);
+  Assert.Equal(due, ClockOf(r, SlaMetric.Resolution).DueAt);
+  Assert.True(HasPromise(r));
+
+  WaitOn(r, WaitFor.Requester);                                       // a wait pauses an SLA clock — not this one
+  Workflow.Settle(r);
+  Assert.NotNull(ClockOf(r, SlaMetric.Resolution).RunningSince);
+
+  TestClock.Advance(TimeSpan.FromDays(7) + TimeSpan.FromHours(13)); Workflow.Settle(r);   // past 75% of ten days
+  Assert.NotNull(ClockOf(r, SlaMetric.Resolution).AtRiskAt);
+  Assert.Null(ClockOf(r, SlaMetric.Resolution).BreachedAt);
+  Assert.True(WasTold(r, "inbox.promise-at-risk"));
+
+  TestClock.Advance(TimeSpan.FromDays(3)); Workflow.Settle(r);
+  Assert.Equal(due, ClockOf(r, SlaMetric.Resolution).BreachedAt);     // recorded at the instant it ran out
+  Assert.True(WasTold(r, "inbox.promise-breached"));
+  Assert.Equal(SlaState.Breached, Request.Single(x => x.Id == r.Id).Sla);
+}
+
+[Test(Desk)]
+[runas(Ines)]
+void an_absolute_due_date_moves_only_through_the_kit_saying_why() {
+  var r = new Request { Title = "A request with a statutory deadline", Organization = CompanyNamed("Larkspur"),
+                        Requester = PersonNamed("Olivia"), DueAt = DateTime.UtcNow.AddDays(30) };
+  Workflow.Settle(r);
+  Assert.Denied(() => { var x = Request.Single(y => y.Id == r.Id); x.DueAt = DateTime.UtcNow.AddDays(90); UnitOfWork.Commit(); });
+  Assert.Throws<ValidationException>(() => MoveDue(r, DateTime.UtcNow.AddDays(90), " "));
+
+  var later = new DateTime(2027, 1, 15, 12, 0, 0);
+  MoveDue(r, later, "Extended by two months: the request is complex.");
+  Assert.Equal(later, Request.Single(x => x.Id == r.Id).DueAt);
+  Assert.Equal(later, ClockOf(r, SlaMetric.Resolution).DueAt);
+  Assert.True(WasTold(r, "inbox.due-moved"));
+}

@@ -1,0 +1,267 @@
+// WHO HOLDS AN ITEM — taking it, the collision sentence, releasing, handing on, moving, and the bulk verbs. Every
+// change of holder is an `Assignment` with its reason. The desk is in desk.test.osy: agents work their own items, and
+// moving work a colleague holds is a lead's (`AgentsHandOn = false`).
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using InboxKitTests;
+
+[Test(Desk)]
+[runas(Ines)]
+void taking_an_item_puts_your_name_on_it_and_records_why() {
+  var r = Ask("Printer offline");
+  TakeWork(r);
+  Workflow.Settle(r);
+  Assert.Equal("Ines", r.Assignee!.DisplayName);
+  var last = TrailOf(r)[1];
+  Assert.Equal(AssignReason.Claimed, last.Reason);
+  Assert.Equal("Ines", last.To!.DisplayName);
+  Assert.Equal("Ines", last.By!.DisplayName);
+  Assert.Equal("Ines took it.", Said(last));
+  Assert.True(WasTold(r, "inbox.holder-changed"));
+}
+
+[Test(Desk)]
+void two_agents_taking_one_item_one_wins_and_the_other_is_told_who() {
+  var id = Guid.Empty;
+  runas (Ines) { id = Ask("VPN drops").Id; }                         // both see it unheld
+  runas (Rahul) { TakeWork(Request.Single(x => x.Id == id)); }       // Rahul is first
+  runas (Ines) {
+    var r = Request.Single(x => x.Id == id);
+    var refused = Assert.Throws<ValidationException>(() => TakeWork(r, null));   // Ines still believes it is unheld
+    Assert.Equal("Rahul took this just now.", refused.Message);
+    Assert.Equal("Rahul", Request.Single(x => x.Id == id).Assignee!.DisplayName);
+  }
+}
+
+[Test(Desk)]
+void releasing_returns_it_to_the_pool_and_redistributes_it() {
+  runas (Ines) {
+    var r = Ask("Mailbox full");                                     // Support hands nothing out: back to the pool
+    TakeWork(r);
+    ReleaseWork(r);
+    Workflow.Settle(r);
+    Assert.Null(r.Assignee);
+    Assert.Equal("Arrived → Claimed → Released", Trail(r));
+    Assert.Contains("Mailbox full", Titles(Rows(BuiltInView.Unassigned)));
+
+    var turn = Ask("Printer jammed", queue: "Rota");                 // the rota gives it to Ines — her turn
+    Assert.Equal("Ines", HolderOf(turn));
+    ReleaseWork(turn);                                               // …she lets it go: the next one free gets it, never her
+    Workflow.Settle(turn);
+    Assert.Equal("Mateo", HolderOf(turn));
+    Assert.Equal("Arrived → RoundRobin → Released → RoundRobin", Trail(turn));
+  }
+}
+
+[Test(Desk)]
+void handing_on_is_refused_for_a_target_who_may_not_hold_it() {
+  var id = Guid.Empty;
+  runas (Lena) {
+    var r = Ask("Card declined", queue: "Billing");                  // Billing: Rahul and Lena
+    id = r.Id;
+    var refused = Assert.Throws<ValidationException>(() => HandWorkTo(r, PersonNamed("Ines")));   // Ines is not in Billing
+    Assert.Equal("Ines may not hold this — they are not in the Billing queue.", refused.Message);
+    HandWorkTo(r, PersonNamed("Rahul"));
+    Workflow.Settle(r);
+    Assert.Equal("Rahul", r.Assignee!.DisplayName);
+    Assert.Equal(AssignReason.HandedOn, TrailOf(r)[1].Reason);
+    Assert.Equal("Lena", TrailOf(r)[1].By!.DisplayName);
+  }
+}
+
+[Test(Desk)]
+void a_move_keeps_the_holder_only_when_they_may_hold_it_in_the_new_queue() {
+  runas (Lena) {
+    var stays = Ask("Invoice question");
+    HandWorkTo(stays, PersonNamed("Rahul"));
+    MoveWork(stays, QueueOf("Billing"));                             // Rahul is in Billing: he keeps it
+    Workflow.Settle(stays);
+    Assert.Equal("Billing", stays.Queue!.Name);
+    Assert.Equal("Rahul", stays.Assignee!.DisplayName);
+
+    var goes = Ask("Refund query");
+    HandWorkTo(goes, PersonNamed("Ines"));
+    MoveWork(goes, QueueOf("Billing"));                              // Ines is not: it is unheld there
+    Workflow.Settle(goes);
+    Assert.Null(goes.Assignee);
+    var moved = TrailOf(goes)[2];
+    Assert.Equal(AssignReason.Moved, moved.Reason);
+    Assert.Equal("Support", moved.FromQueue!.Name);
+    Assert.Equal("Moved to Billing by Lena. Ines is not in Billing, so it is unheld.", Said(moved));
+  }
+  runas (Ines) {
+    var mine = Ask("Not mine to move");
+    Assert.Throws<ValidationException>(() => MoveWork(mine, QueueOf("Billing")));   // Ines is not a member of Billing
+  }
+}
+
+[Test(Desk)]
+void bulk_take_and_bulk_move_move_every_item_they_can_and_say_why_not_the_rest() {
+  var ids = new List<Guid>();
+  runas (Ines) {
+    ids.Add(Ask("Bulk one").Id);
+    ids.Add(Ask("Bulk two").Id);
+    ids.Add(Ask("Bulk three").Id);
+  }
+  runas (Rahul) { TakeWork(Request.Single(x => x.Id == ids[2])); }
+  runas (Ines) {
+    var items = new List<WorkItem>();
+    foreach (var id in ids) { items.Add(Request.Single(x => x.Id == id)); }
+    var taken = TakeMany(items);
+    Assert.Equal(2, taken.Moved);
+    Assert.Equal(1, taken.NotMoved.Count);
+    Assert.Equal("Bulk three: Rahul holds this — only a lead can move work a colleague holds.", taken.NotMoved[0]);
+  }
+  runas (Lena) {
+    var items = new List<WorkItem>();
+    foreach (var id in ids) { items.Add(Request.Single(x => x.Id == id)); }
+    var moved = MoveMany(items, QueueOf("Billing"));
+    Assert.Equal(3, moved.Moved);
+    Assert.Equal(0, moved.NotMoved.Count);
+  }
+  runas (Rahul) { Assert.Equal(3, Request.Count(x => ids.Contains(x.Id) && x.Queue!.Name == "Billing")); }
+}
+
+// ── distribution: the queue gives its work out ───────────────────────────────────────────────────────────────────────
+
+[Test(Desk)]
+[runas(Lena)]
+void round_robin_offers_each_member_in_turn_and_skips_the_away() {
+  var holders = new List<string>();
+  foreach (var title in new List<string> { "Turn one", "Turn two", "Turn three", "Turn four" }) {
+    holders.Add(HolderOf(Ask(title, queue: "Rota")));
+  }
+  Assert.Equal("Ines, Mateo, Rahul, Ines", string.Join(", ", holders));    // each in turn, and round again
+  var given = TrailOf(Request.Single(x => x.Title == "Turn two"))[1];
+  Assert.Equal(AssignReason.RoundRobin, given.Reason);
+  Assert.Equal("Given to Mateo — their turn in Rota.", Said(given));
+  Assert.Null(given.By);                                             // the inbox did it
+
+  new Availability { Person = PersonNamed("Mateo"), Status = Presence.Away };   // a lead marks Mateo away
+  UnitOfWork.Commit();
+  Assert.Equal("Rahul", HolderOf(Ask("Turn five", queue: "Rota")));  // his turn — skipped
+  Assert.Equal("Ines", HolderOf(Ask("Turn six", queue: "Rota")));
+}
+
+[Test(Desk)]
+void least_loaded_counts_only_work_that_needs_attention() {
+  runas (Ines) {                                                    // Ines holds two that need her
+    TakeWork(Ask("Ines one"));
+    TakeWork(Ask("Ines two"));
+  }
+  runas (Rahul) {                                                   // Rahul holds two — both waiting on the requester
+    foreach (var title in new List<string> { "Rahul one", "Rahul two" }) {
+      var r = Ask(title);
+      TakeWork(r);
+      Responded(r);
+      WaitOn(r, WaitFor.Requester);
+    }
+    var done = Ask("Rahul done");                                   // …and one he finished
+    TakeWork(done);
+    Responded(done);
+    WorkDone(done);
+  }
+  runas (Mateo) { TakeWork(Ask("Mateo one", queue: "Floor")); }     // given to someone, then taken by Mateo
+  runas (Lena) {
+    var first = Ask("Floor one", queue: "Floor");
+    Assert.Equal("Rahul", HolderOf(first));                          // 0 that need him, against Mateo 1 and Ines 2
+    Assert.Equal(AssignReason.LeastLoaded, TrailOf(first)[1].Reason);
+    Assert.Equal("Mateo", HolderOf(Ask("Floor two", queue: "Floor")));   // 1 and 1: the one given least recently
+    Assert.Equal("Rahul", HolderOf(Ask("Floor three", queue: "Floor")));
+    Assert.Equal(2, LoadOf(PersonNamed("Rahul")));
+  }
+}
+
+[Test(Desk)]
+void nobody_is_given_more_than_their_capacity() {
+  runas (Ada) {
+    var tiny = new Queue { Name = "Tiny", Distribution = Distribution.RoundRobin, DefaultCapacity = 2 };
+    new QueueMember { Queue = tiny, Member = PersonNamed("Ines") };
+    new QueueMember { Queue = tiny, Member = PersonNamed("Rahul") };
+    UnitOfWork.Commit();
+  }
+  runas (Ines) {                                                    // Ines's own ceiling is one, whatever the queue's
+    new Availability { Person = PersonNamed("Ines"), Capacity = 1 };
+    UnitOfWork.Commit();
+  }
+  runas (Lena) {
+    var holders = new List<string>();
+    foreach (var title in new List<string> { "Tiny one", "Tiny two", "Tiny three", "Tiny four" }) {
+      holders.Add(HolderOf(Ask(title, queue: "Tiny")));
+    }
+    Assert.Equal("Ines, Rahul, Rahul, Nobody", string.Join(", ", holders));
+    var pooled = Request.Single(x => x.Title == "Tiny four");
+    Assert.True(WasTold(pooled, "inbox.item-pooled"));
+    Assert.Contains("Tiny four", Titles(Rows(BuiltInView.Unassigned)));
+    HandWorkTo(pooled, PersonNamed("Ines"));                        // capacity limits what the inbox GIVES — a lead may still
+    Workflow.Settle(pooled);
+    Assert.Equal("Ines", HolderOf(pooled));                          // hand her more by hand
+  }
+}
+
+[Test(Desk)]
+void capacity_freed_pulls_the_oldest_due_pooled_item() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  runas (Ada) {
+    var tiny = new Queue { Name = "Tiny", Distribution = Distribution.RoundRobin, DefaultCapacity = 1 };
+    new QueueMember { Queue = tiny, Member = PersonNamed("Ines") };
+    new QueueMember { Queue = tiny, Member = PersonNamed("Rahul") };
+    UnitOfWork.Commit();
+  }
+  var ids = new List<Guid>();
+  runas (Lena) {
+    foreach (var title in new List<string> { "Ines's", "Rahul's", "Oldest waiting", "Next waiting" }) {
+      ids.Add(Ask(title, queue: "Tiny").Id);
+      TestClock.Advance(TimeSpan.FromMinutes(5));
+    }
+    Assert.Equal("Nobody", HolderOf(Request.Single(x => x.Id == ids[2])));
+    Assert.Equal("Nobody", HolderOf(Request.Single(x => x.Id == ids[3])));
+  }
+  runas (Ines) {                                                    // Ines finishes hers: the oldest waiting comes to her
+    var mine = Request.Single(x => x.Id == ids[0]);
+    Responded(mine);
+    WorkDone(mine);
+    Workflow.Settle(mine);
+  }
+  runas (Lena) {
+    var oldest = Request.Single(x => x.Id == ids[2]);
+    Assert.Equal("Ines", HolderOf(oldest));
+    Assert.Equal(AssignReason.Refill, TrailOf(oldest)[1].Reason);
+    Assert.Equal("Nobody", HolderOf(Request.Single(x => x.Id == ids[3])));
+  }
+  runas (Rahul) {                                                   // waiting on the requester frees him too
+    var his = Request.Single(x => x.Id == ids[1]);
+    Responded(his);
+    WaitOn(his, WaitFor.Requester);
+    Workflow.Settle(his);
+  }
+  runas (Lena) { Assert.Equal("Rahul", HolderOf(Request.Single(x => x.Id == ids[3]))); }
+}
+
+[Test(Desk)]
+void an_unclaimed_item_past_pickup_tells_the_leads() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  runas (Ada) {
+    var support = QueueOf("Support");
+    support.PickupWithin = TimeSpan.FromMinutes(30);
+    UnitOfWork.Commit();
+  }
+  runas (Ines) {
+    var left = Ask("Nobody's");
+    var taken = Ask("Picked up");
+    TestClock.Advance(TimeSpan.FromMinutes(10));
+    TakeWork(taken);
+    TestClock.Advance(TimeSpan.FromMinutes(19));
+    Workflow.Settle(left); Workflow.Settle(taken);
+    Assert.False(WasTold(left, "notify:leads"));                     // 29 minutes: not yet
+    TestClock.Advance(TimeSpan.FromMinutes(2));
+    Workflow.Settle(left); Workflow.Settle(taken);
+    Assert.True(WasTold(left, "notify:leads"));
+    Assert.True(WasTold(left, "inbox.pickup-overdue"));
+    Assert.False(WasTold(taken, "notify:leads"));                    // held in time: nobody is told
+    TestClock.Advance(TimeSpan.FromHours(2));
+    Workflow.Settle(left);
+    Assert.Equal(1, Told.Count(t => t.Item == left.Id && t.Kind == "notify:leads"));   // once
+  }
+}

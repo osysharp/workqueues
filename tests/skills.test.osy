@@ -1,0 +1,65 @@
+// WHO CAN TAKE AN ITEM, AND WHO IS BEST FOR IT — skills an item requires, skills it prefers, and its language. A
+// required skill limits who may hold it at all; a preferred one, and its language, rank who is given it first. For a
+// queue's language wait only speakers are given it — after that, anybody free. The desk is in desk.test.osy: Mateo
+// speaks Spanish, Rahul knows Databases.
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using InboxKitTests;
+
+[Test(Desk)]
+void a_required_skill_limits_who_may_hold_it() {
+  runas (Ada) {
+    new RoutingRule { Name = "Database work", Kind = "db", NeedSkill = RoutingSkill.Single(s => s.Name == "Databases") };
+    UnitOfWork.Commit();
+  }
+  var id = Guid.Empty;
+  runas (Ines) {
+    var r = Ask("Replica lag", kind: "db");
+    id = r.Id;
+    Assert.Equal("Databases (required)", NeedsOf(r));
+    var refused = Assert.Throws<ValidationException>(() => TakeWork(r));
+    Assert.Equal("Ines may not hold this — it needs Databases, which they do not hold.", refused.Message);
+  }
+  runas (Lena) {
+    var r = Request.Single(x => x.Id == id);
+    Assert.Throws<ValidationException>(() => HandWorkTo(r, PersonNamed("Ines")));   // a lead cannot hand it to her either
+    var rota = Ask("Index bloat", kind: "db", queue: "Rota");        // the rota skips whoever's turn it is, to Rahul
+    Assert.Equal("Rahul", HolderOf(rota));
+  }
+  runas (Rahul) {
+    TakeWork(Request.Single(x => x.Id == id));
+    Assert.Equal("Rahul", HolderOf(Request.Single(x => x.Id == id)));
+  }
+}
+
+[Test(Desk)]
+[runas(Lena)]
+void a_speaker_of_the_items_language_is_preferred() {
+  var spanish = Ask("No puedo entrar", queue: "Rota", language: "es-MX");
+  Assert.Equal("Spanish", NeedsOf(spanish));                         // its language: a PREFERRED skill, never a required one
+  Assert.Equal("Mateo", HolderOf(spanish));                          // Ines's turn — but Mateo speaks it
+  Assert.Equal("Ines", HolderOf(Ask("Cannot log in", queue: "Rota")));
+  Assert.Equal("Rahul", HolderOf(Ask("Still cannot", queue: "Rota")));   // the turn carries on from there
+}
+
+[Test(Desk)]
+void after_the_language_wait_anyone_may_take_it() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  runas (Mateo) {                                                     // the only speaker is away
+    new Availability { Person = PersonNamed("Mateo"), Status = Presence.Away };
+    UnitOfWork.Commit();
+  }
+  runas (Lena) {
+    var r = Ask("La factura está mal", queue: "Rota", language: "es");
+    Assert.Equal("Nobody", HolderOf(r));                              // for the queue's 10 minutes, only a speaker
+    Assert.True(WasTold(r, "inbox.item-pooled"));
+    TestClock.Advance(TimeSpan.FromMinutes(9));
+    Workflow.Settle(r);
+    Assert.Equal("Nobody", HolderOf(r));
+    TestClock.Advance(TimeSpan.FromMinutes(2));
+    Workflow.Settle(r);
+    Assert.Equal("Ines", HolderOf(r));                                // then anybody free — dedicated never means stuck
+    Assert.Equal(AssignReason.RoundRobin, TrailOf(r)[1].Reason);
+  }
+}

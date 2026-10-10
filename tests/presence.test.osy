@@ -1,0 +1,39 @@
+// WHO ELSE IS ON AN ITEM — the Presence kit's record presence, addressed by the item's id (`ItemSeats`). Staff
+// only, by the app's `CollaboratesOnRecords` (here: whoever works the inbox); a seat is who (stamped by the platform)
+// and what they are doing — never what they wrote (SECURITY-INVARIANT realtime-broadcast-signal-only).
+using Osysharp.Identity;
+using Osysharp.Presence;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using InboxKitTests;
+
+[Test(Desk)]
+void item_presence_is_staff_only_and_carries_seats_not_words() {
+  var id = Guid.Empty;
+  runas (Lena) { id = Ask("Printer jams on page two").Id; }
+  // The requester whose item it is may not sit on it — staff seats are staff's.
+  runas (Olivia) { Assert.Denied(() => RecordPresence.For(id).Listen()); }
+  runas (Rahul) {
+    RecordPresence.For(id).Listen();
+    SeatActivity(id, "replying");
+  }
+  runas (Ines) {
+    RecordPresence.For(id).Listen();
+    var seat = RecordPresence.For(id).Here.Single(s => s.Who != null && s.Who.DisplayName == "Rahul");
+    // Two members — who, and an activity word. A reply's text has nowhere to ride.
+    Assert.Equal("replying", seat.Activity);
+  }
+}
+
+[Test(Desk)]
+void a_colleague_on_an_item_is_named_on_its_head() {
+  var id = Guid.Empty;
+  runas (Lena) { id = Ask("VPN drops every hour").Id; }
+  runas (Rahul) { RecordPresence.For(id).Listen(); SeatActivity(id, "replying"); }
+  runas (Ines) {
+    RecordPresence.For(id).Listen();
+    var me = PersonNamed("Ines");
+    // The line the item's head draws (`ItemSeats` → `RecordSeats`): colleagues only, never yourself.
+    Assert.Equal("Rahul is replying", WhoIsHere(Colleagues(RecordPresence.For(id).Here, me.Id)));
+  }
+}

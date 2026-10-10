@@ -1,0 +1,105 @@
+// WHAT THE INBOX COSTS AS IT GROWS — a settings page reads what it draws, and routing asks the database once for a set,
+// so neither costs more because the desk has more history or a bigger team. Each test compares the same act at two
+// sizes; a read that started fetching every row of a table, or a statement per element, turns it red with both numbers.
+// The desk is in desk.test.osy.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+using InboxKitTests;
+
+/// Visit `page` from another settings page and wait for `shows`; the mark taken just before the visit.
+string OpenSettings(string page, string shows) {
+  Ui.Visit("/settings/queues");
+  Assert.Visible("Support");
+  var mark = Cost.Mark();
+  Ui.Visit(page);
+  Assert.Visible(shows);
+  return mark;
+}
+
+/// ⭐ THE SLA PAGE READS THE STEPS OF THE POLICY THAT IS OPEN — a desk with many escalation steps opens the page for
+/// what one with none does, and opening a policy shows its own steps and nobody else's.
+[Test(Desk)]
+void the_sla_page_reads_only_the_open_policys_steps() {
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ada);
+  var before = OpenSettings("/settings/sla", "Enterprise urgent");
+  var bare = Cost.RowsReadSince(before);
+  Log.Information("SLA page, no steps: " + Cost.StatementsSince(before) + " statements, " + Cost.RequestsSince(before)
+    + " requests, " + bare + " rows");
+  runas (Ada) {
+    foreach (var p in SlaPolicy.ToList()) {
+      foreach (var m in new List<SlaMetric> { SlaMetric.FirstResponse, SlaMetric.NextResponse, SlaMetric.Resolution }) {
+        new SlaEscalation { Policy = p, Metric = m, When = SlaMoment.Breached,
+                            Action = p.Name == "Spend" ? SlaAction.RaisePriority : SlaAction.TellLeads };
+      }
+    }
+    UnitOfWork.Commit();
+    Assert.Equal(18, SlaEscalation.Count());
+  }
+  var after = OpenSettings("/settings/sla", "Enterprise urgent");
+  var rows = Cost.RowsReadSince(after);
+  Log.Information("SLA page, 18 steps: " + Cost.StatementsSince(after) + " statements, " + Cost.RequestsSince(after)
+    + " requests, " + rows + " rows");
+  Assert.Equal(bare, rows);
+  Ui.Click("Change Spend");
+  Assert.Visible("Raise the priority", within: "Steps of Spend");
+  Assert.Hidden("Tell the leads", within: "Steps of Spend");
+}
+
+/// ⭐ THE HOURS PAGE READS THE HOLIDAYS STILL TO COME — ten years of holidays that are over cost it nothing, and it
+/// lists the one ahead.
+[Test(Desk)]
+void the_hours_page_does_not_grow_with_holidays_that_are_over() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));      // before Midsummer Eve — the browser's clock too
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ada);
+  var before = OpenSettings("/settings/hours", "Midsummer Eve");
+  var bare = Cost.RowsReadSince(before);
+  Log.Information("Hours page, one holiday: " + Cost.StatementsSince(before) + " statements, " + Cost.RequestsSince(before)
+    + " requests, " + bare + " rows");
+  runas (Ada) {
+    var business = Osysharp.ServiceHours.ServiceHours.Single(h => h.Name == "Business hours");
+    for (var y = 2016; y < 2026; y++) {
+      new ServiceException { ServiceHours = business, From = new DateTime(y, 12, 24), To = new DateTime(y, 12, 26),
+                             IsClosed = true, Reason = "Christmas " + y };
+    }
+    UnitOfWork.Commit();
+  }
+  var after = OpenSettings("/settings/hours", "Midsummer Eve");
+  var rows = Cost.RowsReadSince(after);
+  Log.Information("Hours page, ten past holidays more: " + Cost.StatementsSince(after) + " statements, "
+    + Cost.RequestsSince(after) + " requests, " + rows + " rows");
+  Assert.Equal(bare, rows);
+  Assert.Hidden("Christmas 2025");
+}
+
+/// Route an item of `org` (with `pod` as its pod) to its backup; the mark taken just before it falls through to the pod.
+string ToThePod(string org, List<string> pod) {
+  runas (Ada) { Team(org, "Mateo", "Lena", pod); }
+  var mark = "";
+  runas (Lena) {
+    var r = Ask(org + " sync stalls", org: org);
+    TestClock.Advance(TimeSpan.FromMinutes(16));
+    Workflow.Settle(OfferOf(r));
+    Assert.Equal("Lena", OfferedOf(r));
+    TestClock.Advance(TimeSpan.FromMinutes(16));
+    mark = Cost.Mark();
+    Workflow.Settle(OfferOf(r));
+    Assert.Equal("Ines", OfferedOf(r));                              // the pod, least loaded first
+  }
+  return mark;
+}
+
+/// ⭐ A BIGGER POD COSTS NO MORE TO ROUTE THROUGH — the pod's loads are one grouped read, not a count per member.
+[Test(Desk)]
+void routing_to_the_pod_reads_every_members_load_at_once() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  var one = Cost.StatementsSince(ToThePod("Acme", new List<string> { "Ines" }));
+  var two = Cost.StatementsSince(ToThePod("Orbit Labs", new List<string> { "Ines", "Rahul" }));
+  Log.Information("To the pod: " + one + " statements for a pod of one, " + two + " for a pod of two");
+  Assert.Equal(one, two);
+}

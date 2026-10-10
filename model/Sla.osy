@@ -1,0 +1,522 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.ServiceHours;
+
+// ── what an item is promised ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// What an item is promised. The MOST SPECIFIC active policy whose every stated condition matches wins — Enterprise +
+/// Urgent beats Urgent beats the catch-all — and ties go to the lower `Position`. A condition left empty matches
+/// anything.
+public entity SlaPolicy {
+  [Required("Name the policy."), MaxLength(80)] string Name;
+  WorkPriority? Priority;
+  /// The tier of the item's organisation (its own, or the default tier when it has none).
+  OrganizationTier? Tier;
+  Queue? Queue;
+  [MaxLength(40)] string Channel = "";
+  [MaxLength(60)] string Segment = "";
+  [MaxLength(60)] string Kind = "";
+  /// Only items whose requester is a VIP of an organisation they belong to.
+  bool ForVip = false;
+  /// The hours its clocks run in. None: around the clock.
+  Osysharp.ServiceHours.ServiceHours? Hours;
+  /// Waiting on a third party pauses resolution too. Most desks keep it running — the requester still waits on us.
+  bool PauseWhileWaitingOnOthers = false;
+  /// The fraction of a budget at which a clock is "at risk".
+  double AtRiskAt = 0.75;
+  int Position = 0;
+  bool Active = true;
+  [ForeignKey(Policy)] SlaTarget[] Targets;
+  [ForeignKey(Policy)] SlaEscalation[] Escalations;
+  security {
+    allow read when WorksInbox;
+    // SECURITY-INVARIANT(inbox-service-levels-are-the-admins) — see Queue.
+    allow create, update, delete when AdministersInbox;
+  }
+}
+
+/// One promise of a policy: "first response within 4h".
+[Unique(Policy, Metric, "The policy already promises that.")]
+public entity SlaTarget {
+  [Required] SlaPolicy Policy;
+  SlaMetric Metric;
+  TimeSpan Within;
+  security {
+    allow read when WorksInbox;
+    allow create, update, delete when AdministersInbox;
+  }
+}
+
+/// When a clock goes at risk, or is breached.
+public enum SlaMoment { [Label("At risk")] AtRisk, [Label("Breached")] Breached }
+
+/// The closed set of things a clock may do at that moment. Anything richer is an automation's, not the inbox's.
+public enum SlaAction {
+  [Label("Tell the holder")] TellHolder,
+  [Label("Tell the leads")] TellLeads,
+  [Label("Raise the priority")] RaisePriority,
+  [Label("Escalate")] Escalate,
+  [Label("Move to a queue")] MoveTo,
+}
+
+/// What a policy does when one of its clocks is at risk or breached — each once per clock cycle (`Escalations`).
+public entity SlaEscalation {
+  [Required] SlaPolicy Policy;
+  SlaMetric Metric;
+  SlaMoment When;
+  SlaAction Action;
+  Queue? MoveTo;
+  security {
+    allow read when WorksInbox;
+    allow create, update, delete when AdministersInbox;
+  }
+}
+
+public enum ClockOutcome {
+  /// Still owed — breached or not (`BreachedAt` says).
+  [Label("Running")] Running,
+  [Label("Met")] Met,
+  /// Ended late: responded, or done, after the promise ran out.
+  [Label("Met late")] Breached,
+  /// Ended with nothing to measure — the item was cancelled, or moved on before it was answered.
+  [Label("Cancelled")] Cancelled,
+}
+
+/// One promise on one item: its first response; each next response (`Cycle` 1, 2, …); its resolution. Written by the
+/// run as the clock starts, pauses, goes at risk, is met or is breached. The LIVE due time is the run's
+/// (`Workflow.WorkByItem` / `Work`); this row is the RECORD that outlives the run, and what reports aggregate.
+public entity SlaClock {
+  [Required] WorkItem Item;
+  SlaMetric Metric;
+  int Cycle = 1;
+  /// The budget, in the item's hours — retargeted with the item's priority.
+  TimeSpan Target;
+  DateTime StartedAt;
+  /// When it went at risk, was met, was breached — each once.
+  DateTime? AtRiskAt;
+  DateTime? MetAt;
+  DateTime? BreachedAt;
+  /// Business time consumed: while it runs, up to `RunningSince`; once it ends, all of it.
+  TimeSpan BusinessTime = TimeSpan.Zero;
+  /// When it last started or resumed running. None while paused or ended.
+  DateTime? RunningSince;
+  /// When it runs out, while it runs — what is left of its budget, walked in the item's hours from `RunningSince`
+  /// (`ServiceHours.After`, the engine's walk). Kept as the clock starts, resumes, pauses and is retargeted, so a screen
+  /// counts down to it live without asking the server how much business time has passed. None while paused or ended.
+  DateTime? DueAt;
+  ClockOutcome Outcome = ClockOutcome.Running;
+  security {
+    allow read when WorksInbox;
+    // SECURITY-INVARIANT(inbox-a-restricted-queue-is-read-by-its-members-only), the promise half: a promise says that an item exists, when it arrived, and when it was late. So it follows its item —
+    // unreadable to staff outside a restricted queue, as the item is, or a technician outside "Locks" would count
+    // promises on a job he cannot see. Guarded by Osysharp.WorkQueues.Reports'
+    // tests/security.test.osy `a_job_in_a_restricted_queue_counts_only_for_those_who_may_see_it`.
+    deny read when WorksInbox && !AdministersInbox where Item.Queue != null && Item.Queue.Restricted
+      && !QueueMember.Any(m => m.Queue == Item.Queue && m.Member == user && m.Active) && Item.Assignee != user;
+  }
+}
+
+// ── choosing the policy ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The tier an item is served at: its organisation's, else the default tier.
+public OrganizationTier? TierOf(WorkItem item) {
+  if (item.Organization != null && item.Organization.Tier != null) { return item.Organization.Tier; }
+  return DefaultTier();
+}
+
+/// The policy `item` is promised by: of the active policies whose every stated condition matches, the one stating the
+/// MOST conditions; ties by `Position`. Null: no policy matches, and the item has no promise.
+/// ⚑ AN ITEM THAT BRINGS ITS OWN DUE DATE (`DueAt` — a statutory deadline) TAKES NO POLICY: that date IS its promise, set
+///   by whatever made it: a privacy request, due in a calendar month by law, must not take the desk's ticket policy
+///   and show a "first reply" clock nobody owes it. Guarded by tests/ui.test.osy
+///   `an_item_with_only_a_due_date_shows_its_clock_and_never_says_no_promise_applies`.
+public SlaPolicy? PolicyFor(WorkItem item) {
+  if (item.DueAt != null) { return null; }
+  return PolicyAt(item, TierOf(item));
+}
+
+/// `PolicyFor`, for an item whose tier the caller has already read.
+SlaPolicy? PolicyAt(WorkItem item, OrganizationTier? tier) {
+  if (item.DueAt != null) { return null; }
+  var vip = item.Requester != null && IsVipPerson(item.Requester!);
+  return PolicyMatching(item.Priority, tier, item.Queue, item.Channel, item.Segment, item.Kind, vip);
+}
+
+/// The policy an item with these attributes is promised by — THE rule `PolicyFor` applies, and what the settings'
+/// "which policy applies?" tester asks without an item.
+[SuppressWarning("cost-unbounded-read")]   // the desk's active SLA policies — configuration, not data
+public SlaPolicy? PolicyMatching(WorkPriority priority, OrganizationTier? tier, Queue? queue, string channel, string segment,
+                                 string kind, bool vip) {
+  SlaPolicy? best = null;
+  var bestScore = -1;
+  foreach (var p in SlaPolicy.Where(p => p.Active).OrderBy(p => p.Position).ToList()) {
+    var score = 0;
+    if (p.Priority != null) { if (p.Priority != priority) { continue; } score = score + 1; }
+    if (p.Tier != null) { if (tier == null || p.Tier.Id != tier.Id) { continue; } score = score + 1; }
+    if (p.Queue != null) { if (queue == null || p.Queue.Id != queue.Id) { continue; } score = score + 1; }
+    if (p.Channel != "") { if (p.Channel != channel) { continue; } score = score + 1; }
+    if (p.Segment != "") { if (p.Segment != segment) { continue; } score = score + 1; }
+    if (p.Kind != "") { if (p.Kind != kind) { continue; } score = score + 1; }
+    if (p.ForVip) { if (!vip) { continue; } score = score + 1; }
+    if (score > bestScore) { best = p; bestScore = score; }
+  }
+  return best;
+}
+
+/// "Which policy applies to an item like this?" — the settings' tester, as a sentence: the policy, what it promises, and
+/// the hours it counts in; or that nothing is promised. `tier` none: the default tier.
+[SuppressWarning("cost-unbounded-read")]   // one policy's targets — at most one per metric
+public string WhichPolicy(WorkPriority priority, Guid? tier, Guid? queue, string channel, string kind, bool vip) {
+  var t = tier == null ? DefaultTier() : OrganizationTier.FirstOrDefault(x => x.Id == tier.Value);
+  var q = queue == null ? null : Queue.FirstOrDefault(x => x.Id == queue.Value);
+  var p = PolicyMatching(priority, t, q, channel, "", kind, vip);
+  if (p == null) { return "No policy applies — an item like this is promised nothing, and says so."; }
+  var parts = new List<string>();
+  foreach (var target in SlaTarget.Where(x => x.Policy == p).OrderBy(x => x.Metric).ToList()) {
+    parts.Add(Words(target.Metric) + " " + BudgetWords(target.Within));
+  }
+  var hours = p.Hours == null ? "around the clock" : "in " + p.Hours.Name;
+  return "“" + p.Name + "” — " + (parts.Count == 0 ? "no targets yet" : string.Join(", ", parts)) + ", " + hours + ".";
+}
+
+/// A budget as a person says it: "45m", "4h", "3d", "1d 4h".
+public string BudgetWords(TimeSpan t) {
+  var mins = Convert.ToInt(Math.Round(t.TotalMinutes));
+  if (mins < 60) { return mins + "m"; }
+  if (mins % 1440 == 0) { return (mins / 1440) + "d"; }
+  if (mins % 60 == 0 && mins < 1440 * 2) { return (mins / 60) + "h"; }
+  if (mins >= 1440) { return (mins / 1440) + "d " + ((mins % 1440) / 60) + "h"; }
+  return (mins / 60) + "h " + (mins % 60) + "m";
+}
+
+/// The target `policy` sets for `metric`, or null.
+TimeSpan? TargetOf(SlaPolicy policy, SlaMetric metric) { return TargetIn(policy.Targets.ToList(), metric); }
+
+/// The target for `metric` among a policy's `targets`, read once by the caller.
+TimeSpan? TargetIn(List<SlaTarget> targets, SlaMetric metric) {
+  var t = targets.FirstOrDefault(x => x.Metric == metric);
+  if (t == null) { return null; }
+  return t.Within;
+}
+
+/// Snapshot the promise onto the item — at start, and on every change the policy is chosen by — and carry the new
+/// budgets onto the clocks still running. The run calls `Workflow.Retarget()` after it, so the live due times follow.
+void TakePolicy(WorkItem item) { TakePolicyAt(item, item.DueAt != null ? null : TierOf(item)); }
+
+/// `TakePolicy`, for an item whose tier the caller has already read. `started`: the item's run is past its start, so it
+/// may have clocks to carry the new budgets to — at the start it has none yet (only the run starts them), and asking
+/// for them is two reads for nothing.
+void TakePolicyAt(WorkItem item, OrganizationTier? tier, bool started = true) {
+  var policy = PolicyAt(item, tier);
+  item.Policy = policy;
+  if (policy == null) {
+    item.FirstResponseWithin = null;
+    item.NextResponseWithin = null;
+    item.ResolutionWithin = null;
+    item.Hours = null;
+    return;
+  }
+  // Its three targets, read once.
+  var targets = policy.Targets.ToList();
+  item.FirstResponseWithin = TargetIn(targets, SlaMetric.FirstResponse);
+  item.NextResponseWithin = TargetIn(targets, SlaMetric.NextResponse);
+  item.ResolutionWithin = TargetIn(targets, SlaMetric.Resolution);
+  item.Hours = policy.Hours;
+  item.AtRiskAt = policy.AtRiskAt;
+  if (!started) { return; }
+  foreach (var c in item.Clocks.Where(c => c.Outcome == ClockOutcome.Running).ToList()) {
+    var target = TargetFor(item, c.Metric);
+    if (target != null) { c.Target = target.Value; c.DueAt = DueOf(item, c); }
+  }
+  Reassess(item);
+}
+
+/// After an absolute due date moved: its open resolution clock takes the new budget and the new instant.
+void RetimeAbsolute(WorkItem item) {
+  var open = OpenClock(item, SlaMetric.Resolution);
+  var target = TargetFor(item, SlaMetric.Resolution);
+  if (open == null || target == null || !IsAbsolute(item, SlaMetric.Resolution)) { return; }
+  open.Target = target.Value;
+  open.DueAt = DueOf(item, open);
+  Reassess(item);
+}
+
+/// What `item` is promised for `metric`, or null. An absolute due date is the resolution promise: the time from arrival
+/// to it, in real time.
+TimeSpan? TargetFor(WorkItem item, SlaMetric metric) {
+  if (metric == SlaMetric.FirstResponse) { return item.FirstResponseWithin; }
+  if (metric == SlaMetric.NextResponse) { return item.NextResponseWithin; }
+  if (item.DueAt != null) {
+    var span = item.DueAt.Value - item.ArrivedAt;
+    return span < TimeSpan.Zero ? TimeSpan.Zero : span;
+  }
+  return item.ResolutionWithin;
+}
+
+/// Is `metric`'s clock on `item` counted to an ABSOLUTE instant (`WorkItem.DueAt`) — real time, never paused?
+bool IsAbsolute(WorkItem item, SlaMetric metric) { return metric == SlaMetric.Resolution && item.DueAt != null; }
+
+/// When an absolute due date goes at risk, counted from the run's start (the item's arrival) — what the run's
+/// real-time reminder waits. Null: no absolute due date.
+TimeSpan? AbsoluteAtRiskIn(WorkItem item) {
+  if (item.DueAt == null) { return null; }
+  var span = item.DueAt.Value - item.ArrivedAt;
+  if (span < TimeSpan.Zero) { span = TimeSpan.Zero; }
+  return TimeSpan.FromTicks((long)(span.Ticks * item.AtRiskAt));
+}
+
+/// When an absolute due date is reached, counted from the run's start. Null: no absolute due date.
+TimeSpan? AbsoluteDueIn(WorkItem item) {
+  if (item.DueAt == null) { return null; }
+  var span = item.DueAt.Value - item.ArrivedAt;
+  return span < TimeSpan.Zero ? TimeSpan.Zero : span;
+}
+
+// ── the clock records ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The newest clock of `metric` on `item`, or null.
+SlaClock? LatestClock(WorkItem item, SlaMetric metric) {
+  return item.Clocks.Where(c => c.Metric == metric).OrderByDescending(c => c.Cycle).FirstOrDefault();
+}
+
+/// The open (still owed) clock of `metric` on `item`, or null.
+SlaClock? OpenClock(WorkItem item, SlaMetric metric) {
+  return item.Clocks.FirstOrDefault(c => c.Metric == metric && c.Outcome == ClockOutcome.Running);
+}
+
+/// Start `metric`'s clock — or resume the one still owed. Nothing when the item is promised nothing for it.
+void RunClock(WorkItem item, SlaMetric metric) { RunClocks(item, [metric]); }
+
+/// Start (or resume) each of `metrics`' clocks — what a state's `enter` owes — reading the item's clocks ONCE for all of
+/// them and its standing after. One at a time, a new item's two clocks would read them six times.
+void RunClocks(WorkItem item, List<SlaMetric> metrics) {
+  var now = DurableClock.UtcNow;
+  var clocks = item.Clocks.ToList();
+  foreach (var metric in metrics) {
+    var open = clocks.FirstOrDefault(c => c.Metric == metric && c.Outcome == ClockOutcome.Running);
+    if (open != null) {
+      if (open.RunningSince == null) { open.RunningSince = now; open.DueAt = DueOf(item, open); }
+      continue;
+    }
+    var target = TargetFor(item, metric);
+    if (target == null) { continue; }
+    var last = clocks.Where(c => c.Metric == metric).OrderByDescending(c => c.Cycle).FirstOrDefault();
+    var cycle = last == null ? 1 : last.Cycle + 1;
+    var started = new SlaClock { Item = item, Metric = metric, Cycle = cycle, Target = target.Value, StartedAt = now,
+                                 RunningSince = now };
+    started.DueAt = DueOf(item, started);
+    clocks.Add(started);
+  }
+  ReassessOver(item, clocks);
+}
+
+/// When `clock` runs out if it keeps running from `RunningSince`: the rest of its budget, in the item's hours — or the
+/// item's absolute due date. None while it is not running.
+DateTime? DueOf(WorkItem item, SlaClock clock) {
+  if (clock.RunningSince == null) { return null; }
+  if (IsAbsolute(item, clock.Metric)) { return item.DueAt; }
+  var left = clock.Target - clock.BusinessTime;
+  if (left < TimeSpan.Zero) { left = TimeSpan.Zero; }
+  return ServiceHours.After(item.Hours, clock.RunningSince.Value, left);
+}
+
+/// Pause `metric`'s clock: the business time it ran is banked, and it stops counting until it runs again. A clock
+/// counted to an absolute due date does not pause — a statutory deadline runs while the item waits.
+void PauseClock(WorkItem item, SlaMetric metric) {
+  if (IsAbsolute(item, metric)) { return; }
+  StopClock(item, metric);
+}
+
+/// Stop `metric`'s clock: bank the time it ran (real time for an absolute due date), and stop counting.
+void StopClock(WorkItem item, SlaMetric metric) { StopClockIn(item, RunningClocks(item), metric); }
+
+/// The item's clocks still owed — read ONCE by a step that stops, meets or ends several of them, which then works on
+/// this list and reassesses over it (read per step, a ticket's solve would read them nine times).
+List<SlaClock> RunningClocks(WorkItem item) { return item.Clocks.Where(c => c.Outcome == ClockOutcome.Running).ToList(); }
+
+/// `StopClock`, over the item's running clocks as the caller holds them.
+void StopClockIn(WorkItem item, List<SlaClock> clocks, SlaMetric metric) {
+  var open = clocks.FirstOrDefault(c => c.Metric == metric && c.Outcome == ClockOutcome.Running);
+  if (open == null || open.RunningSince == null) { return; }
+  var ran = IsAbsolute(item, metric) ? DurableClock.UtcNow - open.RunningSince.Value
+    : ServiceHours.BusinessTime(item.Hours, open.RunningSince.Value, DurableClock.UtcNow);
+  open.BusinessTime = open.BusinessTime + ran;
+  open.RunningSince = null;
+  open.DueAt = null;
+  ReassessOver(item, clocks);
+}
+
+/// What is left of `metric`'s budget — the target less the business time banked before this stretch. What a slot's
+/// `Within` reads, so a clock that was paused resumes where it stopped instead of starting over. Null: no promise.
+TimeSpan? Left(WorkItem item, SlaMetric metric) {
+  var target = TargetFor(item, metric);
+  if (target == null) { return null; }
+  var open = OpenClock(item, metric);
+  if (open == null) { return target; }
+  var left = target.Value - open.BusinessTime;
+  return left < TimeSpan.Zero ? TimeSpan.Zero : left;
+}
+
+/// When, from this stretch, `metric`'s clock reaches the at-risk fraction of its WHOLE budget. Null: no promise, or it
+/// already went at risk.
+TimeSpan? AtRiskIn(WorkItem item, SlaMetric metric) {
+  var target = TargetFor(item, metric);
+  if (target == null) { return null; }
+  var open = OpenClock(item, metric);
+  var used = open == null ? TimeSpan.Zero : open.BusinessTime;
+  var at = TimeSpan.FromTicks((long)(target.Value.Ticks * item.AtRiskAt)) - used;
+  return at < TimeSpan.Zero ? TimeSpan.Zero : at;
+}
+
+/// `metric`'s clock went at risk — recorded once, and the app is told.
+void AtRisk(WorkItem item, SlaMetric metric) {
+  var open = OpenClock(item, metric);
+  if (open == null || open.AtRiskAt != null || open.BreachedAt != null) { return; }
+  open.AtRiskAt = WhenItReached(item, open, TimeSpan.FromTicks((long)(open.Target.Ticks * item.AtRiskAt)));
+  Raise(new PromiseAtRisk { Item = item, Metric = metric, At = open.AtRiskAt ?? DurableClock.UtcNow });
+  Reassess(item);
+  Escalations(item, metric, SlaMoment.AtRisk);
+}
+
+/// `metric`'s promise ran out. RECORDED, never fatal — the requester still has their problem, and the clock stays
+/// owed until it is met.
+void Breached(WorkItem item, SlaMetric metric) {
+  var open = OpenClock(item, metric);
+  if (open == null || open.BreachedAt != null) { return; }
+  open.BreachedAt = WhenItReached(item, open, open.Target);
+  Raise(new PromiseBreached { Item = item, Metric = metric, At = open.BreachedAt ?? DurableClock.UtcNow });
+  Reassess(item);
+  Escalations(item, metric, SlaMoment.Breached);
+}
+
+/// The instant `clock` had used `used` of its budget — when a moment HAPPENED, which is not always when the run heard
+/// of it: an imported item's breach, or one whose timer fired after a pause in the engine, is recorded at the minute
+/// the promise ran out, not the minute somebody noticed (a breach "found" at 09:00 that happened at 07:30 is a
+/// 90-minute-late answer, and reports aggregate the real one). Walked in the item's hours from the stretch now running;
+/// never later than now.
+DateTime WhenItReached(WorkItem item, SlaClock clock, TimeSpan used) {
+  var now = DurableClock.UtcNow;
+  if (clock.RunningSince == null) { return now; }
+  if (IsAbsolute(item, clock.Metric)) {
+    var due = item.ArrivedAt + used;
+    return due < now ? due : now;
+  }
+  var left = used - clock.BusinessTime;
+  if (left <= TimeSpan.Zero) { return clock.RunningSince.Value < now ? clock.RunningSince.Value : now; }
+  var at = ServiceHours.After(item.Hours, clock.RunningSince.Value, left);
+  return at != null && at.Value < now ? at.Value : now;
+}
+
+/// `metric`'s clock is met — on time, or late.
+void Met(WorkItem item, SlaMetric metric) { MetIn(item, RunningClocks(item), metric); }
+
+/// `Met`, over the item's running clocks as the caller holds them.
+void MetIn(WorkItem item, List<SlaClock> clocks, SlaMetric metric) {
+  var open = clocks.FirstOrDefault(c => c.Metric == metric && c.Outcome == ClockOutcome.Running);
+  if (open == null) { return; }
+  StopClockIn(item, clocks, metric);
+  open.MetAt = DurableClock.UtcNow;
+  open.Outcome = open.BreachedAt == null ? ClockOutcome.Met : ClockOutcome.Breached;
+  // Met late: its moment was a breach.
+  Raise(new PromiseMet { Item = item, Metric = metric, Late = open.BreachedAt != null });
+  ReassessOver(item, clocks);
+}
+
+/// `metric`'s clock ends with nothing to measure.
+void EndClock(WorkItem item, SlaMetric metric) { EndClockIn(item, RunningClocks(item), metric); }
+
+/// `EndClock`, over the item's running clocks as the caller holds them.
+void EndClockIn(WorkItem item, List<SlaClock> clocks, SlaMetric metric) {
+  var open = clocks.FirstOrDefault(c => c.Metric == metric && c.Outcome == ClockOutcome.Running);
+  if (open == null) { return; }
+  StopClockIn(item, clocks, metric);
+  open.Outcome = ClockOutcome.Cancelled;
+  ReassessOver(item, clocks);
+}
+
+/// A resolution met when the item was done runs again when it reopens — from where it stopped.
+void ReopenClock(WorkItem item, SlaMetric metric) {
+  if (OpenClock(item, metric) != null) { return; }
+  var last = LatestClock(item, metric);
+  if (last == null) { RunClock(item, metric); return; }
+  last.MetAt = null;
+  last.Outcome = ClockOutcome.Running;
+  last.RunningSince = DurableClock.UtcNow;
+  last.DueAt = DueOf(item, last);
+  Reassess(item);
+}
+
+/// How the item's RUNNING promises stand — the worst of them. A paused promise is nobody's to chase, so it does not
+/// colour the item; a breached one that is met is over. Kept on the item so a list and its counts read a column.
+/// …and with it when the soonest running promise runs out (`DueNext`) and when the earliest one still owed was missed
+/// (`MissedAt`, paused or not) — so a list ORDERS by columns too, and reads only the rows it shows.
+void Reassess(WorkItem item) { ReassessOver(item, item.Clocks.Where(c => c.Outcome == ClockOutcome.Running).ToList()); }
+
+/// `Reassess`, over the item's clocks as the caller already holds them.
+void ReassessOver(WorkItem item, List<SlaClock> clocks) {
+  var worst = SlaState.OnTrack;
+  DateTime? next = null;
+  DateTime? missed = null;
+  foreach (var c in clocks.Where(c => c.Outcome == ClockOutcome.Running).ToList()) {
+    if (c.BreachedAt != null && (missed == null || c.BreachedAt.Value < missed.Value)) { missed = c.BreachedAt; }
+    if (c.RunningSince == null) { continue; }
+    if (c.BreachedAt != null) { worst = SlaState.Breached; }
+    else {
+      if (c.AtRiskAt != null && worst == SlaState.OnTrack) { worst = SlaState.AtRisk; }
+      if (c.DueAt != null && (next == null || c.DueAt.Value < next.Value)) { next = c.DueAt; }
+    }
+  }
+  if (item.Sla != worst) { item.Sla = worst; }
+  if (item.DueNext != next) { item.DueNext = next; }
+  if (item.MissedAt != missed) { item.MissedAt = missed; }
+}
+
+/// The app's word for `metric` ("first response", "feedback due").
+public string Words(SlaMetric metric) { return App.Setting<InboxSetup>().Words.Metric(metric); }
+
+string Capital(string s) { return s == "" ? s : s.Substring(0, 1).ToUpper() + s.Substring(1); }
+
+// ── reading the clocks ────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One promise on an item, as a header chip reads it.
+public class ItemClock {
+  public SlaMetric Metric;
+  /// The app's word for it ("first response", "feedback due").
+  public string Word = "";
+  public ClockOutcome Outcome;
+  /// Counting now (false: paused, or ended).
+  public bool Running;
+  public bool AtRisk;
+  public bool Breached;
+  public TimeSpan Target;
+  /// Business time used so far.
+  public TimeSpan Used;
+}
+
+/// The promises on `item` — the newest clock of each metric. Empty: the item has no promise, and a screen says so
+/// rather than drawing a zero.
+public List<ItemClock> Clocks(WorkItem item) {
+  var result = new List<ItemClock>();
+  if (item.Policy == null && item.DueAt == null) { return result; }
+  // A screen's read, not a run's: the wall clock (a test's, under a test clock).
+  var now = DateTime.UtcNow;
+  foreach (var metric in new List<SlaMetric> { SlaMetric.FirstResponse, SlaMetric.NextResponse, SlaMetric.Resolution }) {
+    var c = LatestClock(item, metric);
+    if (c == null) { continue; }
+    var used = c.BusinessTime;
+    if (c.RunningSince != null) {
+      used = used + (IsAbsolute(item, metric) ? now - c.RunningSince.Value : ServiceHours.BusinessTime(item.Hours, c.RunningSince.Value, now));
+    }
+    result.Add(new ItemClock {
+      Metric = metric, Word = Words(metric), Outcome = c.Outcome, Running = c.RunningSince != null,
+      AtRisk = c.AtRiskAt != null, Breached = c.BreachedAt != null, Target = c.Target, Used = used,
+    });
+  }
+  return result;
+}
+
+/// Is `item` promised anything at all — by a policy, or by an absolute due date?
+public bool HasPromise(WorkItem item) { return item.Policy != null || item.DueAt != null; }

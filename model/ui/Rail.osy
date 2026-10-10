@@ -1,0 +1,117 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+
+// ── the rail: where the work waits, and how much of it — in the app's own shell ─────────────────────────────────────
+//
+// ⚑ THE INBOX'S ROWS LIVE IN THE SHELL'S RAIL, not in a second rail beside it: the views, the queues and the saved views
+//   are `NavItem`s the floor already draws — the same rows, glyphs, current-route marking, collapse and phone drawer as
+//   every other entry — with the counts from ONE grouped read of the items (`Summed`, the same sum `Counts()` makes).
+//
+// ⚑ THE ACCENT IS SPENT ON WHAT IS YOURS AND LIVE: "Mine" and "Offered to me" wear a breathing lamp while they hold
+//   anything, and "Unassigned" an accent count; "At risk" counts in amber; a queue's count turns amber only while it
+//   holds at-risk work. Everything else counts in ink.
+//
+// Keys — every one is the row's own binding, so the `?` sheet lists it and the row's tip shows it:
+//   G then M  mine · G then O  offered to me · G then U  unassigned · G then A  at risk · G then C  my accounts
+
+/// The inbox's rows for a shell's nav — the built-in views with their counts, then the queues (lower levels first),
+/// then the saved views. Routes are `prefix` + the view's word: "/inbox/mine", "/inbox/q-<id>", "/inbox/v-<id>".
+/// `accounts`: show "My accounts" (the viewer is on an account team). `lead`: add "Team" (`prefix/team`).
+public NavItem[] InboxNav(InboxCounts c, List<Queue> queues, List<InboxView> views, string prefix, bool accounts = false,
+                          bool lead = false) {
+  List<NavItem> work = [
+    new NavItem { Label = "Mine", To = prefix + "/mine", Icon = Icons.User, Badge = c.Mine > 0 ? c.Mine.ToString() : "",
+                  BadgeTone = Tone.Default, Live = c.Mine > 0, Shortcut = "G then M" },
+  ];
+  if (c.Offered > 0) {
+    work.Add(new NavItem { Label = "Offered to me", To = prefix + "/offered", Icon = Icons.ArrowRight,
+                           Badge = c.Offered.ToString(), BadgeTone = Tone.Primary, Live = true, Shortcut = "G then O" });
+  }
+  if (accounts) {
+    work.Add(new NavItem { Label = "My accounts", To = prefix + "/accounts", Icon = Icons.Building, Shortcut = "G then C" });
+  }
+  work.Add(new NavItem { Label = "Unassigned", To = prefix + "/unassigned", Icon = Icons.Inbox,
+                         Badge = c.Unassigned > 0 ? c.Unassigned.ToString() : "",
+                         BadgeTone = c.Unassigned > 0 ? Tone.Primary : Tone.Default, Shortcut = "G then U" });
+  work.Add(new NavItem { Label = "At risk", To = prefix + "/at-risk", Icon = Icons.Timer,
+                         Badge = c.AtRisk > 0 ? c.AtRisk.ToString() : "", BadgeTone = Tone.Warning, Shortcut = "G then A" });
+  work.Add(new NavItem { Label = "All open", To = prefix + "/open", Icon = Icons.Messages,
+                         Badge = c.Open > 0 ? c.Open.ToString() : "", BadgeTone = Tone.Ghost });
+  work.Add(new NavItem { Label = "Waiting", To = prefix + "/waiting", Icon = Icons.Hourglass,
+                         Badge = c.Waiting > 0 ? c.Waiting.ToString() : "", BadgeTone = Tone.Ghost });
+  work.Add(new NavItem { Label = "Done", To = prefix + "/done", Icon = Icons.CheckCircle });
+  if (lead) { work.Add(new NavItem { Label = "Team", To = prefix + "/team", Icon = Icons.Users }); }
+
+  List<NavItem> sections = [];
+  sections.Add(new NavItem { Kind = NavKind.Section, Label = "Inbox", Children = work.ToArray() });
+  if (c.Queues.Count > 0) {
+    sections.Add(new NavItem { Kind = NavKind.Section, Label = "Queues", Children = c.Queues.Select(q => new NavItem {
+      Label = q.Name, To = prefix + "/q-" + q.Queue, Icon = Icons.Folder,
+      Badge = q.Open > 0 ? q.Open.ToString() : "", BadgeTone = q.AtRisk > 0 ? Tone.Warning : Tone.Ghost }).ToArray() });
+  }
+  if (views.Count > 0) {
+    sections.Add(new NavItem { Kind = NavKind.Section, Label = "Views", Children = views.Select(v => new NavItem {
+      Label = v.Name, To = prefix + "/v-" + v.Id, Icon = Icons.Filter }).ToArray() });
+  }
+  return sections.ToArray();
+}
+
+/// THE INBOX IN THE APP'S SIDEBAR — the floor's `SidebarShell`, with the inbox's rows (views, queues, saved views and
+/// their live counts) above the app's own nav. Everything else is the app's chrome, and every slot passes through:
+/// `InboxShell(chrome) { Outlet(retain: 8); slot search { … } }`. The counts are ONE grouped read of the items as the
+/// reader may read them, live — a new item ticks "Unassigned" without a reload.
+[Composable]
+public component InboxShell(AppChrome chrome, string prefix = "/inbox") {
+  live var me = Session.CurrentUser;
+  live var meId = me == null ? Guid.Empty : me.Id;
+  live var tallies = WorkItem.Where(w => w.Handling != Handling.Closed && w.Handling != Handling.Cancelled)
+    .GroupBy(w => new() { Queue = w.Queue.Id, Handling = w.Handling, Mine = w.Assignee.Id == meId, Held = w.Assignee != null,
+                          Offered = w.OfferedTo.Id == meId, Sla = w.Sla })
+    .Select(g => new Tally { Queue = g.Key.Queue, Handling = g.Key.Handling, Mine = g.Key.Mine, Held = g.Key.Held,
+                             Offered = g.Key.Offered, Sla = g.Key.Sla, Count = g.Count() })
+    .ToList();
+  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Position).ThenBy(q => q.Name).ToList();
+  live var views = InboxView.Where(v => v.Active).OrderBy(v => v.Position).ThenBy(v => v.Name).ToList();
+  live var accounts = AccountTeamMember.Count(m => m.Member.Id == meId);
+  live var lead = LeadsInbox;
+  live var counts = Summed(tallies, queues);
+
+  // The app's pin, passed through: an `Action` field is set only where the platform runs it — an action of THIS
+  // component — so the app's own `TogglePin` is pressed from here.
+  action Pin() { chrome.TogglePin(); }
+
+  render {
+    // The app's chrome, field for field, with the inbox's rows ahead of its own nav — and its pin only when it keeps
+    // pins (a pin button that pins nothing would be a control that does nothing).
+    if (chrome.TogglePin != null) {
+      SidebarShell(new AppChrome {
+          Product = chrome.Product, Tagline = chrome.Tagline, Mark = chrome.Mark, MarkSrc = chrome.MarkSrc, Home = chrome.Home,
+          Nav = InboxNav(counts, queues, views, prefix, accounts > 0, lead).Concat(chrome.Nav).ToArray(),
+          Immersive = chrome.Immersive, Panes = chrome.Panes, User = chrome.User, Loading = chrome.Loading,
+          Pinned = chrome.Pinned, Recent = chrome.Recent, Apps = chrome.Apps, TogglePin = Pin }) {
+        Slot;
+        slot search { Slot("search"); }
+        slot actions { Slot("actions"); }
+        slot railFoot { Slot("railFoot"); }
+        slot aside { Slot("aside"); }
+        slot primary { Slot("primary"); }
+      }
+    } else {
+      SidebarShell(new AppChrome {
+          Product = chrome.Product, Tagline = chrome.Tagline, Mark = chrome.Mark, MarkSrc = chrome.MarkSrc, Home = chrome.Home,
+          Nav = InboxNav(counts, queues, views, prefix, accounts > 0, lead).Concat(chrome.Nav).ToArray(),
+          Immersive = chrome.Immersive, Panes = chrome.Panes, User = chrome.User, Loading = chrome.Loading,
+          Pinned = chrome.Pinned, Recent = chrome.Recent, Apps = chrome.Apps }) {
+        Slot;
+        slot search { Slot("search"); }
+        slot actions { Slot("actions"); }
+        slot railFoot { Slot("railFoot"); }
+        slot aside { Slot("aside"); }
+        slot primary { Slot("primary"); }
+      }
+    }
+  }
+}

@@ -1,0 +1,281 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+
+// ── typed links between items ─────────────────────────────────────────────────────────────────────────────────────────
+//
+// Two items are often about one thing: a request that repeats another, one caused by another, many reports of the one
+// fault. A LINK says so, with a kind from a closed set the APP declares (`InboxSetup.Links`) — the kit knows nothing of
+// tickets, duplicates or problems; it keeps the link, refuses the ones that make no sense, shows it on both items, and
+// raises an event on both (`ItemLinked`, `ItemUnlinked`), so each item's history says it.
+//
+// ⚑ A LINK IS A FACT ABOUT TWO ITEMS, NEVER A CHANGE TO EITHER. Linking moves no holder, no queue and no clock. What a
+//   kind MEANS to the app — a problem's incidents solved with it — is the app's to do, reading `LinkedFrom`.
+
+/// A kind of link the app declares — `new LinkKind { Key = "duplicate", Says = "Duplicate of", Back = "Duplicated by",
+/// One = true }`. Its words are the app's, said in the reader's language wherever the link is shown or told.
+public class LinkKind {
+  /// What it is stored as — lower case words and hyphens, fixed once a link of it exists: "duplicate", "caused-by".
+  public string Key = "";
+  /// What the item that links says, before the other's reference: "Duplicate of" #1042.
+  public string Says = "";
+  /// What the item linked TO says: "Duplicated by" #1043. Empty: the same as `Says`.
+  public string Back = "";
+  /// It reads the same both ways ("Related to"): one link stands for both, and linking back is the same link.
+  public bool Mutual;
+  /// An item links this way to ONE other at most — a duplicate has one original, an incident one problem — and never to
+  /// an item that itself links this way, so there are no chains to follow.
+  public bool One;
+  /// People choose it. False for a link only the app's own code makes (a message split off into a new item).
+  public bool Offered = true;
+  /// A step the item that SAYS it may take on the other, shown on its link's row with the other's reference — "Merge
+  /// into" on a duplicate reads "Merge into #1042". The app does the step (`ItemLinks(…, onAct:)`); empty: no step.
+  public string Act = "";
+}
+
+/// The kinds of link the app's items may have — `app.Inbox = new InboxSetup { Links = new DeskLinks() }`, overriding
+/// `Kinds`. Default: none, and nothing can be linked.
+public class InboxLinks {
+  public virtual List<LinkKind> Kinds() { return new List<LinkKind>(); }
+}
+
+/// One link between two items, of a kind the app declares. Made and removed by the kit's verbs (`Link`, `Unlink`), which
+/// check it and tell both items' history; never changed.
+[Unique(From, To, Kind, "These two are already linked that way.")]
+public entity WorkLink {
+  /// The item that says it — the duplicate, the incident, the one caused.
+  [Required] WorkItem From;
+  /// The item it names — the original, the problem, the cause.
+  [Required] WorkItem To;
+  /// The kind's `Key`.
+  [Required, MaxLength(60)] string Kind;
+  [Required] DateTime At;
+  /// Who linked them. None: the app's own code did, from a run (a split).
+  Principal? By;
+
+  security {
+    // SECURITY-INVARIANT(inbox-links-are-staffs): a link is the team's view of the work — which reports are one fault,
+    // which request repeats which — and the requester's side never reads it, nor makes or removes one, whatever the app
+    // grants on its own item kind. Guarded by tests/links.test.osy `a_requester_reads_no_link_and_makes_none`.
+    allow read, create, delete when WorksInbox;
+    deny read when !WorksInbox;
+    deny create when !WorksInbox;
+    deny delete when !WorksInbox;
+    // A link is signed by whoever made it, and is a fact once made: removed, never re-pointed.
+    deny create where By != null && By != user;
+    deny update;
+  }
+}
+
+/// The kind the app declares under `key`, or null.
+public LinkKind? LinkKindOf(string key) {
+  foreach (var k in App.Setting<InboxSetup>().Links.Kinds()) { if (k.Key == key) { return k; } }
+  return null;
+}
+
+/// The words a link of `key` is shown with, from one side — `back`: from the item it names. The key itself when the app
+/// no longer declares it, so an old link still reads as something.
+public string LinkWords(string key, bool back) {
+  var kind = LinkKindOf(key);
+  if (kind == null) { return key; }
+  if (back && !kind.Mutual && kind.Back != "") { return kind.Back; }
+  return kind.Says;
+}
+
+/// How an item is named in a link's sentence — its reference, else its title.
+string NameOfItem(WorkItem item) { return item.Reference != "" ? item.Reference : item.Title; }
+
+/// Link `from` to `to` as `key` says — "#1043 duplicates #1042" is `Link(dup, original, "duplicate")`. Refused, with the
+/// sentence that says why, for a kind the app does not declare, an item linked to itself, a link that already stands
+/// (either way, for a mutual kind), a second link of a `One` kind, or a chain of one. Tells both items' history. Does not
+/// commit.
+public WorkLink Link(WorkItem from, WorkItem to, string key) {
+  var kind = LinkKindOf(key);
+  if (kind == null) { throw new ValidationException($"There is no kind of link called “{key}” here."); }
+  if (from.Id == to.Id) { throw new ValidationException("An item cannot be linked to itself."); }
+  var words = kind.Says;
+  if (WorkLink.Any(l => l.From == from && l.To == to && l.Kind == key)
+      || (kind.Mutual && WorkLink.Any(l => l.From == to && l.To == from && l.Kind == key))) {
+    throw new ValidationException($"{NameOfItem(from)} is already linked to {NameOfItem(to)} that way.");
+  }
+  if (!kind.Mutual && WorkLink.Any(l => l.From == to && l.To == from && l.Kind == key)) {
+    throw new ValidationException($"{NameOfItem(to)} is already “{words}” {NameOfItem(from)} — the link cannot run both ways.");
+  }
+  if (kind.One) {
+    var already = WorkLink.FirstOrDefault(l => l.From == from && l.Kind == key);
+    if (already != null) {
+      throw new ValidationException($"{NameOfItem(from)} is already “{words}” {NameOfItem(already.To)} — remove that link first.");
+    }
+    var onward = WorkLink.FirstOrDefault(l => l.From == to && l.Kind == key);
+    if (onward != null) {
+      throw new ValidationException($"{NameOfItem(to)} is itself “{words}” {NameOfItem(onward.To)} — link to {NameOfItem(onward.To)} instead.");
+    }
+    if (WorkLink.Any(l => l.To == from && l.Kind == key)) {
+      throw new ValidationException($"Other items are “{words}” {NameOfItem(from)}, so it cannot be “{words}” another — that would make a chain.");
+    }
+  }
+  var now = DateTime.UtcNow;
+  var link = new WorkLink { From = from, To = to, Kind = key, At = now, By = Session.CurrentUser };
+  Raise(new ItemLinked { Item = from, Link = key, Other = NameOfItem(to), OtherItem = to });
+  Raise(new ItemLinked { Item = to, Link = key, Other = NameOfItem(from), OtherItem = from, Back = true });
+  return link;
+}
+
+/// Remove a link — both items' history says so. Does not commit.
+public void Unlink(WorkLink link) {
+  var from = link.From;
+  var to = link.To;
+  var key = link.Kind;
+  link.Delete();
+  Raise(new ItemUnlinked { Item = from, Link = key, Other = NameOfItem(to), OtherItem = to });
+  Raise(new ItemUnlinked { Item = to, Link = key, Other = NameOfItem(from), OtherItem = from, Back = true });
+}
+
+/// The items that link to `item` as `key` says — a problem's incidents, an original's duplicates.
+[SuppressWarning("cost-unbounded-read")]   // one item's links of one kind, and the app acting on them must reach every one
+public List<WorkItem> LinkedFrom(WorkItem item, string key) {
+  return WorkLink.Where(l => l.To == item && l.Kind == key).Select(l => l.From).ToList();
+}
+
+/// The item `item` links to as `key` says — the problem an incident is of — or null.
+public WorkItem? LinkedTo(WorkItem item, string key) {
+  var link = WorkLink.FirstOrDefault(l => l.From == item && l.Kind == key);
+  return link == null ? null : link.To;
+}
+
+// ── what a screen asks ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A kind of link from one side, as a person reads and picks it: "Duplicate of" (this item links) or "Duplicated by"
+/// (the other one does). `Repeats`: the back side of a mutual kind, which reads as its front and is not a second choice.
+/// `Offered`: people choose it (a link only the app's code makes is shown, never chosen or removed).
+public class LinkChoice {
+  public string Key = "";
+  public bool Reversed;
+  public string Words = "";
+  public bool Offered;
+  public bool Repeats;
+  /// The kind's step, from the side that says it — empty from the other side, and for a kind with none.
+  public string Act = "";
+}
+
+/// Every kind the app declares, from both sides, in its order and the reader's language — said once, on the server,
+/// for a screen that shows links and offers them.
+public List<LinkChoice> AllLinkWords() {
+  List<LinkChoice> words = [];
+  foreach (var k in App.Setting<InboxSetup>().Links.Kinds()) {
+    words.Add(new LinkChoice { Key = k.Key, Reversed = false, Words = k.Says, Offered = k.Offered, Act = k.Act });
+    if (k.Mutual || k.Back == "") {
+      words.Add(new LinkChoice { Key = k.Key, Reversed = true, Words = k.Says, Offered = k.Offered, Repeats = true });
+    } else {
+      words.Add(new LinkChoice { Key = k.Key, Reversed = true, Words = k.Back, Offered = k.Offered });
+    }
+  }
+  return words;
+}
+
+/// The words `said` holds for a link of `key` seen from one side — the key itself for a kind the app no longer declares.
+public string WordsOf(List<LinkChoice> said, string key, bool back) {
+  foreach (var c in said) { if (c.Key == key && c.Reversed == back) { return c.Words; } }
+  return key;
+}
+
+/// The step a link of `key` offers from one side ("Merge into") — empty when it offers none from there.
+public string ActOf(List<LinkChoice> said, string key, bool back) {
+  foreach (var c in said) { if (c.Key == key && c.Reversed == back) { return c.Act; } }
+  return "";
+}
+
+/// People choose (and so may remove) a link of `key` — and of a kind the app no longer declares, which only a person can
+/// tidy away.
+public bool ChosenByPeople(List<LinkChoice> said, string key) {
+  foreach (var c in said) { if (c.Key == key) { return c.Offered; } }
+  return true;
+}
+
+/// One link as an item shows it — the words from its side, and the other item.
+public class ItemLink {
+  public Guid Link;
+  public string Key = "";
+  public string Words = "";
+  public Guid Other;
+  public string Reference = "";
+  public string Title = "";
+  public Handling Handling;
+  /// People may remove it — a kind they may choose. A link only the app's code makes stays.
+  public bool Removable;
+}
+
+/// `item`'s links, from both sides, each said in the reader's language — grouped by kind in the app's order, then
+/// newest first. One read.
+[SuppressWarning("cost-unbounded-read")]   // one item's links — the item shows every one
+public List<ItemLink> ItemLinksOf(Guid itemId) {
+  List<ItemLink> lines = [];
+  var kinds = App.Setting<InboxSetup>().Links.Kinds();
+  var rows = WorkLink.Where(l => l.From.Id == itemId || l.To.Id == itemId).Include(l => l.From).Include(l => l.To)
+    .OrderByDescending(l => l.At).ToList();
+  foreach (var k in kinds) {
+    foreach (var l in rows.Where(r => r.Kind == k.Key).ToList()) {
+      var back = l.To.Id == itemId;
+      var other = back ? l.From : l.To;
+      lines.Add(new ItemLink { Link = l.Id, Key = l.Kind, Words = LinkWords(l.Kind, back), Other = other.Id,
+                               Reference = other.Reference, Title = other.Title, Handling = other.Handling,
+                               Removable = k.Offered });
+    }
+  }
+  // A link of a kind the app no longer declares still shows, under its key, and may be removed.
+  foreach (var l in rows.Where(r => !kinds.Any(k => k.Key == r.Kind)).ToList()) {
+    var back = l.To.Id == itemId;
+    var other = back ? l.From : l.To;
+    lines.Add(new ItemLink { Link = l.Id, Key = l.Kind, Words = l.Kind, Other = other.Id, Reference = other.Reference,
+                             Title = other.Title, Handling = other.Handling, Removable = true });
+  }
+  return lines;
+}
+
+/// An item a person might mean, as the link picker lists it.
+public class WorkPick {
+  public Guid Item;
+  public string Reference = "";
+  public string Title = "";
+  public Handling Handling;
+}
+
+/// The items `words` names — a reference typed with or without its "#" ("1042", "#1042"), or words of a title — for
+/// linking to `except`. The ten newest that match, never `except` itself. Only items the caller may read.
+public List<WorkPick> FindWork(string words, Guid except) {
+  var q = words.Trim();
+  List<WorkPick> picks = [];
+  if (q == "" || q == "#") { return picks; }
+  var bare = q.StartsWith("#") ? q.Substring(1) : q;
+  var lower = q.ToLower();
+  var found = WorkItem.Where(w => w.Id != except
+      && (w.Reference == q || w.Reference == "#" + bare || w.Reference.EndsWith(bare) || w.Title.ToLower().Contains(lower)))
+    .OrderByDescending(w => w.ArrivedAt).Take(10).ToList();
+  foreach (var w in found) {
+    picks.Add(new WorkPick { Item = w.Id, Reference = w.Reference, Title = w.Title, Handling = w.Handling });
+  }
+  return picks;
+}
+
+/// A person links `itemId` to `otherId` — `back`: the other item is the one that says it ("Duplicated by #1043" makes
+/// #1043 the duplicate). Committed; refused with the sentence that says why.
+[Authorize(WorksInbox)]
+public void LinkWork(Guid itemId, Guid otherId, string key, bool back = false) {
+  var kind = LinkKindOf(key);
+  if (kind != null && !kind.Offered) { throw new ValidationException("That kind of link is made by the app itself, not by hand."); }
+  var item = WorkItem.Single(w => w.Id == itemId);
+  var other = WorkItem.Single(w => w.Id == otherId);
+  if (back) { Link(other, item, key); } else { Link(item, other, key); }
+  UnitOfWork.Commit();
+}
+
+/// A person removes a link. Committed.
+[Authorize(WorksInbox)]
+public void UnlinkWork(Guid linkId) {
+  var link = WorkLink.FirstOrDefault(l => l.Id == linkId);
+  if (link == null) { throw new ValidationException("That link was already removed."); }
+  var kind = LinkKindOf(link.Kind);
+  if (kind != null && !kind.Offered) { throw new ValidationException("That link was made by the app itself, and stays."); }
+  Unlink(link);
+  UnitOfWork.Commit();
+}

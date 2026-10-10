@@ -1,0 +1,133 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+
+/// How an item's running promises stand — the worst of them.
+public enum SlaState {
+  [Label("On track")] OnTrack,
+  [Label("At risk")] AtRisk,
+  [Label("Breached")] Breached,
+}
+
+/// Anything a team works through a queue. The app derives its own kind — `Ticket : WorkItem`, `Candidacy : WorkItem`,
+/// `PurchaseRequest : WorkItem` — and keeps everything about what the item IS; this base is what the inbox needs to
+/// route it and keep its promise.
+///
+/// ⚑ GRANTS ARE NEVER INHERITED: the app's kind states its own reads (staff read all; a requester reads their own). The
+///   denies below are the FLOOR — an Extensible package's denies hold on every subtype, whatever the app grants.
+///
+/// `[ConcurrencyCheck]`: two people moving one item at once get one success and one refusal, never a lost update.
+[Authority(Extensible)]
+[ConcurrencyCheck]
+public entity WorkItem {
+  [CreatedAt] DateTime? CreatedAt;
+  /// The line the queue scans — a helpdesk's subject, a candidate's name and role, "MacBook Pro ×3 — €7,800".
+  [Required("Say what the item is — it is the line the whole queue scans."), Classification(Personal.Content), MaxLength(200)] string Title;
+  /// What people quote: "#1042", "PO-2210". The app's own, written once.
+  [MaxLength(40)] string Reference = "";
+  /// The queue it waits in. Written by the kit's run (routing, moves, escalation) — never by app code. The app may name
+  /// one when it creates the item; the run records it.
+  Queue? Queue;
+  /// Who holds it. Written by the kit's run — never by app code; every change is an `Assignment` row.
+  Principal? Assignee;
+  /// Who it is offered to first, while an account-routing offer is live. None otherwise.
+  Principal? OfferedTo;
+  /// How urgent it is. Set at create; changed only through `Prioritise`, which re-reads the policy.
+  WorkPriority Priority = WorkPriority.Normal;
+  /// Where it stands — the `WorkHandling` run's alone.
+  Handling Handling;                                   // no default — WorkHandling owns it
+  /// Who the work is for, when it is for an organisation: its tier and account team are read through it.
+  CustomerAccount? Organization;
+  /// The person it is for, when they have an account (a portal customer, an employee asking for approval).
+  Principal? Requester;
+  /// BCP-47 of the request ("es", "sv-SE"). Empty: any.
+  [MaxLength(20)] string Language = "";
+  /// Free keys the app sets and policies match: how it came in ("email", "web"), the app's segment ("emea-mid"), and
+  /// its kind ("incident", "po-over-10k").
+  [MaxLength(40)] string Channel = "";
+  [MaxLength(60)] string Segment = "";
+  [MaxLength(60)] string Kind = "";
+  /// When the work arrived — the run counts every clock from it, so an imported item keeps its real history. Set it to
+  /// the original's time on an import; a live item leaves it.
+  DateTime ArrivedAt = DateTime.UtcNow;
+
+  // The promise, snapshotted from the policy when the run starts and again on every change of priority (retargeted).
+  /// The policy the promise was read from. None: no promise, and no clocks.
+  SlaPolicy? Policy;
+  TimeSpan? FirstResponseWithin;
+  TimeSpan? NextResponseWithin;
+  TimeSpan? ResolutionWithin;
+  /// The hours its clocks run in. None: around the clock.
+  Osysharp.ServiceHours.ServiceHours? Hours;
+  /// The fraction of a budget at which a clock is "at risk".
+  double AtRiskAt = 0.75;
+  /// An ABSOLUTE due date — "one calendar month from receipt", a statutory deadline no business-hours budget can say.
+  /// The app sets it when it creates the item (the Privacy kit's requests do). When set, it IS the resolution promise:
+  /// counted in real time from `ArrivedAt`, never paused by a wait, at risk at `AtRiskAt` of that time, breached at the
+  /// instant — recorded like any clock. Moved only through `MoveDue`, which is recorded.
+  DateTime? DueAt;
+  DateTime? FirstRespondedAt;
+  DateTime? DoneAt;
+  /// How its running promises stand — the worst of them: on track, at risk, or breached. Kept by the run, so a list
+  /// and its counts read it as a column.
+  SlaState Sla = SlaState.OnTrack;
+  /// When the soonest promise still running runs out — none while nothing runs, or only a missed promise does. Kept by
+  /// the run with `Sla`, so a list orders a desk of thousands by what runs out first and reads only the rows it shows.
+  DateTime? DueNext;
+  /// When the earliest promise still owed was missed — none while nothing is late. Kept with `DueNext`, for the same
+  /// list: what was missed longest ago comes first.
+  DateTime? MissedAt;
+  /// How many changes of holder or queue it has had — the length of its trail, and the order of it (two changes in
+  /// one instant still read in the order they happened).
+  int Steps = 0;
+  /// L1 = 1, L2 = 2, L3 = 3 — raised by escalation, never lowered by it.
+  int EscalationLevel = 1;
+
+  [ForeignKey(Item)] SlaClock[] Clocks;
+  [ForeignKey(Item)] Assignment[] Assignments;
+
+  security {
+    // SECURITY-INVARIANT(inbox-assignment-only-through-the-run): who holds an item, which queue it waits in, how
+    // urgent it is and what it was promised change only inside the kit's run (a workflow body writes as the system and
+    // is not gated by these denies), so every change is authorised by the run's own events and recorded as an
+    // `Assignment`. App code — a page, a function, an import — cannot write them, whatever its own grants say.
+    // Guarded by tests/security.test.osy `the_assignee_queue_and_priority_cannot_be_written_except_through_the_kit` and
+    // `every_change_of_holder_is_recorded_with_its_reason`.
+    // ⚠ "The run" is ANY workflow body, the app's own lifecycle included: a workflow the app writes may set these too.
+    deny update Assignee, OfferedTo, Queue, Priority, Policy, FirstResponseWithin, NextResponseWithin, ResolutionWithin,
+                Hours, AtRiskAt, DueAt, FirstRespondedAt, DoneAt, ArrivedAt, Sla, DueNext, MissedAt, Steps, EscalationLevel;
+    deny create where Assignee != null || OfferedTo != null || Policy != null || Steps != 0 || EscalationLevel != 1;
+    // SECURITY-INVARIANT(inbox-service-internals-are-staffs): the requester's side never reads how the item is routed
+    // or what it was promised — the holder's name is the app's to show or not. Guarded by tests/security.test.osy
+    // `a_requester_reads_none_of_the_service_internals`.
+    deny read OfferedTo, Policy, AtRiskAt, Segment, FirstResponseWithin, NextResponseWithin, ResolutionWithin, Sla,
+              DueNext, MissedAt, EscalationLevel
+      when !WorksInbox;
+    // SECURITY-INVARIANT(inbox-a-restricted-queue-is-read-by-its-members-only): an item in a restricted queue is
+    // invisible to staff outside it — whatever the app's own grant says, in a list and in every count (a count is the
+    // viewer's own read, so it cannot see what the row cannot). Its holder still reads it; an inbox admin reads every
+    // queue; the requester's own read is the app's and unaffected. Guarded by tests/security.test.osy
+    // `restricted_queue_items_are_invisible_and_uncounted_for_agents_outside_it`.
+    deny read when WorksInbox && !AdministersInbox where Queue != null && Queue.Restricted
+      && !QueueMember.Any(m => m.Queue == Queue && m.Member == user && m.Active) && Assignee != user;
+  }
+}
+
+/// Delete `item` with everything the inbox keeps about it — its holding history, its promise clocks, its escalations,
+/// its routing offers, the skills it needed and its links. For the app's own retention (a privacy request kept as evidence until its
+/// period ends): a work item cannot be deleted while any of these still name it. No person has a delete grant on any of
+/// them, so only a run does this — never a page. Answers how many rows went with it.
+[SuppressWarning("cost-unbounded-read")]   // one item's rows, and forgetting it must reach every one
+public int ForgetWorkItem(WorkItem item) {
+  var gone = 0;
+  foreach (var x in Assignment.Where(a => a.Item == item).ToList()) { x.Delete(); gone = gone + 1; }
+  foreach (var x in SlaClock.Where(c => c.Item == item).ToList()) { x.Delete(); gone = gone + 1; }
+  foreach (var x in Escalation.Where(e => e.Item == item).ToList()) { x.Delete(); gone = gone + 1; }
+  foreach (var x in RoutingOffer.Where(o => o.Item == item).ToList()) { x.Delete(); gone = gone + 1; }
+  foreach (var x in NeededSkill.Where(s => s.Item == item).ToList()) { x.Delete(); gone = gone + 1; }
+  foreach (var x in WorkLink.Where(l => l.From == item || l.To == item).ToList()) { x.Delete(); gone = gone + 1; }
+  item.Delete();
+  return gone + 1;
+}

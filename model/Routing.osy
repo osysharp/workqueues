@@ -1,0 +1,342 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.Workflow;
+
+// ── where an item goes, and who is given it ───────────────────────────────────────────────────────────────────────────
+//
+// When an item ARRIVES: the app's own choice of queue, else the first matching ROUTING RULE's, else the app's
+// `InboxRouting.QueueFor`, else the default queue — and every matching rule's priority and skills. Then the QUEUE'S
+// DISTRIBUTION: the pool (nobody is given it), round robin, or least loaded — among the members who may hold it, are on
+// duty (available, on their hours) and are below their capacity, speakers of its language first.
+//
+// It is routed AGAIN when a holder lets it go (released, moved away from them) — and an item left in the pool because
+// nobody was free is pulled the moment somebody is: their load drops (done, waiting on the requester, released, handed
+// on), or the item's language wait ends. Nothing polls.
+//
+// ⚑ LOAD is the work that needs the holder: New, Owed, Answered, WaitingOnOthers. Waiting on the requester and done do
+//   not count. CAPACITY is the least of the person's own ceiling, their membership's and the queue's default. Capacity
+//   limits what the inbox GIVES — a person may still take, or be handed, more by hand.
+
+/// A routing rule: when every stated condition matches an arriving item, do what it says. Ordered by `Position`; the
+/// first match stops, unless it says `ContinueAfter`. The actions are a CLOSED set — the queue, the priority, a skill,
+/// a person. Anything richer (tags, fields, webhooks) is an automation's, or the app's `InboxRouting.Routed`.
+public entity RoutingRule {
+  [Required("Name the rule."), MaxLength(80)] string Name;
+  int Position = 0;
+  bool Active = true;
+  /// Keep matching the rules below this one.
+  bool ContinueAfter = false;
+
+  // ── when (a condition left empty matches anything) ──
+  [MaxLength(40)] string Channel = "";
+  /// Words in the title, any case — "invoice|refund" matches either.
+  [MaxLength(200)] string TitleContains = "";
+  CustomerAccount? Organization;
+  OrganizationTier? Tier;
+  bool ForVip = false;
+  [MaxLength(20)] string Language = "";
+  [MaxLength(60)] string Segment = "";
+  [MaxLength(60)] string Kind = "";
+
+  // ── then ──
+  Queue? ToQueue;
+  WorkPriority? SetPriority;
+  RoutingSkill? NeedSkill;
+  bool SkillRequired = true;
+  /// Give it to this person — when they may hold it. A person who may not is skipped, and the trail says so.
+  Principal? AssignTo;
+  /// The app's own action, by key ("tag:refund") — what the app does with a match the kit has no word for, through
+  /// `InboxSetup.Routing.Act`. Empty: none. The same shape as a saved view's `AppFilter`.
+  [MaxLength(80)] string AppAction = "";
+
+  security {
+    allow read when WorksInbox;
+    // SECURITY-INVARIANT(inbox-service-levels-are-the-admins) — see Queue.
+    allow create, update, delete when AdministersInbox;
+  }
+}
+
+/// One person's load, from the grouped read.
+public class LoadOf {
+  public Guid Person;
+  public int Count;
+}
+
+/// Does `rule` match `item`?
+bool RuleMatches(RoutingRule rule, WorkItem item, OrganizationTier? tier, bool vip) {
+  if (rule.Channel != "" && rule.Channel != item.Channel) { return false; }
+  if (rule.Organization != null && (item.Organization == null || item.Organization.Id != rule.Organization.Id)) { return false; }
+  if (rule.Tier != null && (tier == null || tier.Id != rule.Tier.Id)) { return false; }
+  if (rule.ForVip && !vip) { return false; }
+  if (rule.Language != "" && PrimaryTag(rule.Language) != PrimaryTag(item.Language)) { return false; }
+  if (rule.Segment != "" && rule.Segment != item.Segment) { return false; }
+  if (rule.Kind != "" && rule.Kind != item.Kind) { return false; }
+  if (rule.TitleContains != "") {
+    var title = item.Title.ToLower();
+    var any = false;
+    foreach (var word in rule.TitleContains.Split("|")) {
+      var w = word.Trim().ToLower();
+      if (w != "" && title.Contains(w)) { any = true; }
+    }
+    if (!any) { return false; }
+  }
+  return true;
+}
+
+/// The item arrived: it waits in the queue the app named, else the first matching rule's, else the app's
+/// `QueueFor`, else the default queue (made on first use); the matching rules set its priority and skills, its
+/// language becomes a preferred skill, and the app's own `SkillsFor` and `Routed` are asked. Returns the person a rule
+/// assigns it to, if any.
+Principal? Arrive(WorkItem item) { return ArriveAt(item, TierOf(item)); }
+
+/// `Arrive`, for an item whose tier the caller has already read — the run's start reads it once for where the item
+/// waits and what it is promised.
+[SuppressWarning("cost-unbounded-read")]   // the desk's active routing rules — configuration, not data
+Principal? ArriveAt(WorkItem item, OrganizationTier? tier) {
+  var setup = App.Setting<InboxSetup>();
+  var named = item.Queue != null;
+  var vip = item.Requester != null && IsVipPerson(item.Requester!);
+  RoutingRule? routedBy = null;
+  Principal? assignTo = null;
+  RoutingRule? assignedBy = null;
+  var matched = new List<RoutingRule>();
+  foreach (var rule in RoutingRule.Where(r => r.Active).OrderBy(r => r.Position).ThenBy(r => r.Name).ToList()) {
+    if (!RuleMatches(rule, item, tier, vip)) { continue; }
+    matched.Add(rule);
+    if (rule.ToQueue != null && item.Queue == null) { item.Queue = rule.ToQueue; routedBy = rule; }
+    if (rule.SetPriority != null) { item.Priority = rule.SetPriority.Value; }
+    if (rule.NeedSkill != null) { Need(item, rule.NeedSkill, rule.SkillRequired); }
+    if (rule.AssignTo != null && assignTo == null) { assignTo = rule.AssignTo; assignedBy = rule; }
+    if (!rule.ContinueAfter) { break; }
+  }
+  if (item.Queue == null) { item.Queue = setup.Routing.QueueFor(item); }
+  if (item.Queue == null) {
+    var byDefault = QueueNamed(setup.DefaultQueue);
+    item.Queue = byDefault != null ? byDefault : new Queue { Name = setup.DefaultQueue };
+  }
+  foreach (var need in setup.Routing.SkillsFor(item)) { Need(item, need.Skill, need.Required); }
+  var spoken = LanguageSkill(item.Language);
+  if (spoken != null) { Need(item, spoken, false); }
+
+  var arrived = new Assignment { Item = item, Step = NextStep(item), ToQueue = item.Queue,
+                                 Reason = routedBy != null ? AssignReason.Rule : AssignReason.Arrived, Rule = routedBy,
+                                 At = DurableClock.UtcNow };
+  Raise(new ItemQueued { Item = item, Step = StepOf(arrived) });
+  if (routedBy != null) { Raise(new ItemRouted { Item = item, Step = StepOf(arrived) }); }
+  // Each matching rule's own app action, in the rules' order — the app's words for what the kit has none for.
+  foreach (var rule in matched) {
+    if (rule.AppAction.Trim() != "") { setup.Routing.Act(item, rule.AppAction.Trim(), rule.Name); }
+  }
+  setup.Routing.Routed(item);
+  if (assignTo != null) {
+    if (MayHold(assignTo!, item)) {
+      item.Assignee = assignTo;
+      var given = new Assignment { Item = item, Step = NextStep(item), To = assignTo, FromQueue = item.Queue, ToQueue = item.Queue,
+                                   Reason = AssignReason.Rule, Rule = assignedBy, At = DurableClock.UtcNow };
+      Raise(new HolderChanged { Item = item, Step = StepOf(given) });
+    } else {
+      Raise(new RoutingSkipped { Item = item, Step = new InboxStep { Rule = assignedBy!.Name, About = NameAt(assignTo), At = DurableClock.UtcNow } });
+    }
+  }
+  return item.Assignee;
+}
+
+/// Is `h` work that needs its holder — what load counts?
+bool Loads(Handling h) {
+  return h == Handling.New || h == Handling.Owed || h == Handling.Answered || h == Handling.WaitingOnOthers;
+}
+
+/// How many items `person` holds that need them.
+public int LoadOf(Principal person) {
+  return WorkItem.Count(w => w.Assignee == person && (w.Handling == Handling.New || w.Handling == Handling.Owed
+    || w.Handling == Handling.Answered || w.Handling == Handling.WaitingOnOthers));
+}
+
+/// How much `person` may be given in `queue`: the least of their own ceiling, their membership's and the queue's.
+int CapacityIn(Queue queue, QueueMember member, Availability? availability) {
+  var cap = member.Capacity != null ? member.Capacity.Value : queue.DefaultCapacity;
+  if (availability != null && availability.Capacity != null && availability.Capacity.Value < cap) { cap = availability.Capacity.Value; }
+  return cap;
+}
+
+/// Is `item` waiting for somebody to be given it — in a distributing queue, nobody holds it, nothing is offered,
+/// and it is being worked?
+bool Pooled(WorkItem item) {
+  return item.Queue != null && item.Assignee == null && item.OfferedTo == null
+    && item.Queue.Distribution != Distribution.Manual
+    && (item.Handling == Handling.New || item.Handling == Handling.Owed || item.Handling == Handling.Answered);
+}
+
+/// Give `item` to the member its queue's distribution picks (`Choose`). Nobody free: it stays in the pool, and is
+/// pulled when somebody is. `why` is the reason the trail records when it is a pull (`Refill`); an arrival records the
+/// distribution's own (`RoundRobin`, `LeastLoaded`). `except`: never them — they have just let it go.
+void Distribute(WorkItem item, AssignReason? why, Guid? except = null) {
+  if (item.Queue == null || item.Assignee != null || item.OfferedTo != null) { return; }
+  var queue = item.Queue;
+  if (queue.Distribution == Distribution.Manual || !queue.Active) { return; }
+  var best = Choose(item, queue, queue.Distribution, except);
+  if (best == null) {
+    var speakersOnly = item.Language != "" && DurableClock.UtcNow < item.ArrivedAt + queue.LanguageWait;
+    Raise(new ItemPooled { Item = item, Queue = queue.Name, Language = speakersOnly ? item.Language : "" });
+    return;
+  }
+  var reason = why != null ? why.Value
+    : (queue.Distribution == Distribution.RoundRobin ? AssignReason.RoundRobin : AssignReason.LeastLoaded);
+  Give(item, best, reason);
+}
+
+/// Who `queue` would give `item` to now, in `order` — on duty (available, inside their hours, not away), below
+/// capacity, who may hold it, a speaker of its language while the language wait lasts, those holding more of its
+/// preferred skills first. Null: nobody is free. `except`: never them.
+[SuppressWarning("cost-unbounded-read")]   // one queue's members; every other read here is keyed by them or by one item
+QueueMember? Choose(WorkItem item, Queue queue, Distribution order, Guid? except) {
+  var now = DurableClock.UtcNow;
+  // Everything the choice reads, read once: the members, their availability and absences, their skills, their loads.
+  // In a stable order (by name), so a turn among people never given anything is the same on every run.
+  var members = QueueMember.Where(m => m.Queue == queue && m.Active).Include(m => m.Member)
+    .OrderBy(m => m.Member.DisplayName).ToList();
+  if (members.Count == 0) { return null; }
+  var ids = new List<Guid>();
+  foreach (var m in members) { ids.Add(m.Member.Id); }
+  var availability = new Dictionary<Guid, Availability>();
+  foreach (var a in Availability.Where(a => ids.Contains(a.Person.Id)).ToList()) { availability[a.Person.Id] = a; }
+  var away = new List<Guid>();
+  foreach (var a in Absence.Where(a => ids.Contains(a.Person.Id) && a.State == AbsenceState.Away).ToList()) { away.Add(a.Person.Id); }
+  var needs = NeededSkill.Where(n => n.Item == item).ToList();
+  var held = HeldSkill.Where(h => ids.Contains(h.Person.Id)).ToList();
+  var loads = new Dictionary<Guid, int>();
+  var counted = WorkItem.Where(w => w.Assignee != null && ids.Contains(w.Assignee.Id)
+      && (w.Handling == Handling.New || w.Handling == Handling.Owed || w.Handling == Handling.Answered
+          || w.Handling == Handling.WaitingOnOthers))
+    .GroupBy(w => new() { Person = w.Assignee.Id })
+    .Select(g => new LoadOf { Person = g.Key.Person, Count = g.Count() })
+    .ToList();
+  foreach (var l in counted) { loads[l.Person] = l.Count; }
+
+  var speakersOnly = item.Language != "" && now < item.ArrivedAt + queue.LanguageWait;
+  var want = PrimaryTag(item.Language);
+  var languageSkills = new List<Guid>();
+  if (speakersOnly) {
+    foreach (var s in RoutingSkill.Where(s => s.Kind == SkillKind.Language).ToList()) {
+      if (PrimaryTag(s.Code) == want) { languageSkills.Add(s.Id); }
+    }
+  }
+
+  QueueMember? best = null;
+  var bestScore = -1;
+  var bestLevels = -1;
+  var bestRatio = 0.0;
+  DateTime? lastGiven = null;
+  foreach (var m in members) {
+    var pid = m.Member.Id;
+    if (except != null && except.Value == pid) { continue; }
+    Availability? a = availability.ContainsKey(pid) ? availability[pid] : null;
+    if (away.Contains(pid) || !OnDutyBy(a, now)) { continue; }
+    var load = loads.ContainsKey(pid) ? loads[pid] : 0;
+    var cap = CapacityIn(queue, m, a);
+    if (load >= cap) { continue; }
+    var score = 0;
+    var levels = 0;
+    var missing = false;
+    foreach (var n in needs) {
+      var h = held.FirstOrDefault(x => x.Person.Id == pid && x.Skill.Id == n.Skill.Id);
+      if (h == null) { if (n.Required) { missing = true; } continue; }
+      if (!n.Required) { score = score + 1; levels = levels + h.Level; }
+    }
+    if (missing) { continue; }
+    if (speakersOnly && !held.Any(x => x.Person.Id == pid && languageSkills.Contains(x.Skill.Id))) { continue; }
+    var ratio = (double)load / (double)cap;
+    // More preferred skills first, then higher levels; then the distribution's own order.
+    var better = best == null || score > bestScore || (score == bestScore && levels > bestLevels);
+    if (!better && score == bestScore && levels == bestLevels) {
+      if (order == Distribution.LeastLoaded && ratio != bestRatio) { better = ratio < bestRatio; }
+      else { better = Earlier(m.LastGivenAt, lastGiven); }
+    }
+    if (better) { best = m; bestScore = score; bestLevels = levels; bestRatio = ratio; lastGiven = m.LastGivenAt; }
+  }
+  return best;
+}
+
+/// Put `item` on `member` — a queue's choice — and take their turn: stamp `LastGivenAt` strictly after every turn
+/// already given in that queue, so two hand-outs in one instant still rotate. Whoever held it before has room again.
+[SuppressWarning("cost-unbounded-read")]   // one queue's members
+void Give(WorkItem item, QueueMember member, AssignReason reason) {
+  var to = member.Member;
+  // SECURITY-INVARIANT(inbox-work-goes-only-to-who-may-hold-it) — the choice reads membership and skills in bulk; the
+  // write asks the one question every path asks, so routing can never give an item to somebody who may not hold it,
+  // whatever the choice got wrong.
+  if (!MayHold(to, item)) { return; }
+  var now = DurableClock.UtcNow;
+  var stamp = now;
+  foreach (var m in QueueMember.Where(m => m.Queue == member.Queue).ToList()) {
+    if (m.LastGivenAt != null && m.LastGivenAt.Value >= stamp) { stamp = m.LastGivenAt.Value.AddTicks(1); }
+  }
+  member.LastGivenAt = stamp;
+  var from = item.Assignee;
+  item.Assignee = to;
+  var given = new Assignment { Item = item, Step = NextStep(item), From = from, To = to, FromQueue = item.Queue, ToQueue = item.Queue,
+                               Reason = reason, At = now };
+  Raise(new HolderChanged { Item = item, Step = StepOf(given) });
+  if (from != null) { Refill(from, item); }
+}
+
+/// Is `a` before `b`, never-given first?
+bool Earlier(DateTime? a, DateTime? b) {
+  if (a == null) { return b != null; }
+  if (b == null) { return false; }
+  return a.Value < b.Value;
+}
+
+/// `person`'s load dropped, or they are back: pull the pooled items they may be given, oldest-due first — each is
+/// routed by its own run, which gives it to whoever is free (them, unless somebody was waiting longer). `except`: the
+/// item that just left them — it is routed by its own step, never straight back.
+/// `at`: the instant to judge "on duty" by — a run's own; app code (coming back) passes its `DateTime.UtcNow`.
+[SuppressWarning("cost-unbounded-read")]   // one person's queue memberships
+void Refill(Principal? person, WorkItem? except = null, DateTime? at = null) {
+  if (person == null) { return; }
+  var me = person!;
+  var now = at != null ? at.Value : DurableClock.UtcNow;
+  var a = Availability.FirstOrDefault(x => x.Person == me);
+  if (!OnDutyBy(a, now) || Absence.Any(x => x.Person == me && x.State == AbsenceState.Away)) { return; }
+  var free = 0;
+  foreach (var m in QueueMember.Where(m => m.Member == me && m.Active && m.Queue.Distribution != Distribution.Manual).Include(m => m.Queue).ToList()) {
+    var cap = CapacityIn(m.Queue, m, a);
+    if (cap > free) { free = cap; }
+  }
+  free = free - LoadOf(me);
+  if (free <= 0) { return; }
+  var pooled = WorkItem.Where(w => w.Assignee == null && w.OfferedTo == null && w.Queue != null
+      && w.Queue.Distribution != Distribution.Manual
+      && (w.Handling == Handling.New || w.Handling == Handling.Owed || w.Handling == Handling.Answered)
+      && QueueMember.Any(m => m.Queue == w.Queue && m.Member == me && m.Active))
+    .OrderByDescending(w => w.Sla).ThenBy(w => w.ArrivedAt).Take(free).ToList();
+  foreach (var w in pooled) {
+    if (except != null && w.Id == except.Id) { continue; }
+    WorkHandling.RaiseRoute(w);
+  }
+}
+
+/// The leads are told an item nobody has picked up — once, when the queue's pickup time has passed.
+void PickupDue(WorkItem item) {
+  if (item.Assignee != null || item.OfferedTo != null || item.Queue == null || item.Queue.PickupWithin == null) { return; }
+  var minutes = (int)item.Queue.PickupWithin.Value.TotalMinutes;
+  Raise(new PickupOverdue { Item = item, Queue = item.Queue.Name, Minutes = minutes });
+}
+
+/// When, from now, an unheld item's pickup time passes. Null: the queue has none, or it is already held.
+TimeSpan? PickupIn(WorkItem item) {
+  if (item.Queue == null || item.Queue.PickupWithin == null || item.Assignee != null) { return null; }
+  var left = item.ArrivedAt + item.Queue.PickupWithin.Value - DurableClock.UtcNow;
+  return left <= TimeSpan.Zero ? null : left;
+}
+
+/// When, from now, an item's language wait ends — after which anybody free may be given it. Null: no language, a
+/// queue that gives nothing out, already held, or the wait is over.
+TimeSpan? LanguageWaitIn(WorkItem item) {
+  if (item.Language == "" || item.Queue == null || item.Queue.Distribution == Distribution.Manual || item.Assignee != null) { return null; }
+  var left = item.ArrivedAt + item.Queue.LanguageWait - DurableClock.UtcNow;
+  return left <= TimeSpan.Zero ? null : left;
+}

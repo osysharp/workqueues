@@ -1,0 +1,140 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+
+/// What happens to the work a person holds when they go away.
+// ⚠ Appended, never inserted: an enum is stored by position.
+public enum AwayRule {
+  /// They keep it — it waits for them.
+  [Label("Keep it")] Keep,
+  /// Their cover takes it, when the cover may hold it; otherwise it goes back to the queue.
+  [Label("Give it to their cover")] ToCover,
+  /// It goes back to the queue, and is given out again.
+  [Label("Back to the queue")] ToQueue,
+}
+
+/// How a queue hands its work out.
+// ⚠ Appended, never inserted: an enum is stored by position.
+public enum Distribution {
+  /// Nobody is given anything: people pick from the pool.
+  [Label("Pick from the pool")] Manual,
+  /// Each free member in turn.
+  [Label("Round robin")] RoundRobin,
+  /// The free member with the least work for their capacity.
+  [Label("Least loaded")] LeastLoaded,
+}
+
+/// Where work waits — "Support", "Billing", "Finance approvals", "On duty". Rows an inbox admin keeps.
+[Unique(Name, "There is already a queue of that name.")]
+public entity Queue {
+  [Required("Name the queue."), MaxLength(80)] string Name;
+  [MaxLength(300)] string Description = "";
+  /// Only its members (and inbox admins) see its items — HR, security incidents, a VIP desk.
+  bool Restricted = false;
+  /// L1 = 1, L2 = 2, L3 = 3.
+  int Level = 1;
+  /// The next level up — where `EscalateWork` (or a policy's `Escalate` action) moves an item. None: the top.
+  Queue? EscalatesTo;
+  /// How it hands its work out: nobody (the pool), each free member in turn, or the least loaded.
+  Distribution Distribution = Distribution.Manual;
+  /// How much work a member may be given at once, unless their membership or their availability says less.
+  int DefaultCapacity = 8;
+  /// An item nobody holds this long after it arrived tells the queue's leads. None: never.
+  TimeSpan? PickupWithin;
+  /// How long after arrival only speakers of an item's language are given it. After that anybody free may be — the
+  /// conversation is translated, and dedicated never means stuck.
+  TimeSpan LanguageWait = TimeSpan.FromMinutes(10);
+  /// The hours its members work. None: around the clock. An account-routing offer's timer runs in them, so a dedicated
+  /// owner on a business-hours queue gets an overnight item first thing in the morning.
+  Osysharp.ServiceHours.ServiceHours? Hours;
+  /// A segment pod: the tier, or the segment key, whose work falls through to this queue when the account team cannot
+  /// take it (either may be empty).
+  OrganizationTier? ForTier;
+  [MaxLength(60)] string ForSegment = "";
+  /// How long an account-routing offer waits at each step (in the queue's hours) before it falls through.
+  TimeSpan OfferFor = TimeSpan.FromMinutes(15);
+  /// What happens to a member's work when they go away.
+  AwayRule OnAway = AwayRule.ToCover;
+  /// Follow-the-sun: halfway to the first-response target, an item whose holder is off their hours goes to the least
+  /// loaded member who is on them.
+  bool CoverOffHours = true;
+  int Position = 0;
+  bool Active = true;
+  [ForeignKey(Queue)] QueueMember[] Members;
+  security {
+    allow read when WorksInbox;
+    // SECURITY-INVARIANT(inbox-service-levels-are-the-admins): queues, SLA policies and their targets, routing rules,
+    // skills and shared views are changed by inbox admins only — never by an agent or a lead, whatever the app
+    // grants. Guarded by tests/security.test.osy `only_an_inbox_admin_changes_queues_policies_hours_and_rules`.
+    allow create, update, delete when AdministersInbox;
+  }
+}
+
+/// Who works a queue. Only a member may hold its items (`MayHold`), and only a member sees a restricted queue's.
+///
+/// `[ConcurrencyCheck]`: every item a queue hands a member stamps their `LastGivenAt`, so two items handed out in the
+/// same instant to the same person meet here — the later one is routed again, with the first one counted.
+[Unique(Queue, Member, "They are already in that queue.")]
+[ConcurrencyCheck]
+public entity QueueMember {
+  [Required] Queue Queue;
+  [Required] Principal Member;
+  /// Their ceiling in this queue; none: the queue's default.
+  int? Capacity;
+  /// Paused without losing the row: not given work, and not counted a member.
+  bool Active = true;
+  /// When the queue last gave them an item — whose turn it is in a round robin (the longest ago goes next), and the
+  /// tie-break of least loaded. Written by the run; strictly increasing within a queue, so two items given out in
+  /// one instant still take turns.
+  DateTime? LastGivenAt;
+  security {
+    allow read when WorksInbox;
+    allow create, update, delete when AdministersInbox || LeadsInbox;
+  }
+}
+
+/// May `p` hold `item`? They are an active member of the queue it waits in — or on the account team of the item's
+/// organisation, when its queue is not restricted (the one exception: the account's own people work its items wherever
+/// they wait) — and they hold every skill it REQUIRES. Every path that puts an item on a person — take, hand-on,
+/// routing, refill, offer, cover, escalation — asks this.
+policy MayHold(Principal p, WorkItem item) =>
+  (QueueMember.Any(m => m.Queue == item.Queue && m.Member == p && m.Active)
+   || (item.Organization != null && item.Queue != null && !item.Queue.Restricted
+       && AccountTeamMember.Any(t => t.Organization == item.Organization && t.Member == p)))
+  && !NeededSkill.Any(n => n.Item == item && n.Required && !HeldSkill.Any(h => h.Person == p && h.Skill == n.Skill));
+
+/// The queue named `name`, or null.
+public Queue? QueueNamed(string name) { return Queue.FirstOrDefault(q => q.Name == name); }
+
+/// Who leads `item`'s queue: its active members who satisfy `LeadsInbox` — the app's own word for a lead, asked of each
+/// person (`Security.Authorize`), so the kit never needs to know how the app decides it. When none of them does — or the
+/// item waits in no queue — everybody who leads in any queue, so an item in a queue nobody leads still reaches
+/// somebody. Each person once; an account that cannot sign in is nobody's lead. What the inbox's own events for a
+/// queue's leads (`PickupOverdue`, `PromiseToldToLeads`) are told to, and what an app hands a "tell the leads" step.
+public List<Principal> InboxLeads(WorkItem item) {
+  List<Principal> leads = [];
+  List<Guid> asked = [];
+  if (item.Queue != null) {
+    var queue = item.Queue!;
+    foreach (var m in QueueMember.Where(m => m.Queue == queue && m.Active).Include(m => m.Member).ToList()) {
+      if (!m.Member.IsActive || asked.Contains(m.Member.Id)) { continue; }
+      asked.Add(m.Member.Id);
+      if (Security.Authorize(m.Member, LeadsInbox)) { leads.Add(m.Member); }
+    }
+  }
+  if (leads.Count > 0) { return leads; }
+  foreach (var m in QueueMember.Where(m => m.Active).Include(m => m.Member).ToList()) {
+    if (!m.Member.IsActive || asked.Contains(m.Member.Id)) { continue; }
+    asked.Add(m.Member.Id);
+    if (Security.Authorize(m.Member, LeadsInbox)) { leads.Add(m.Member); }
+  }
+  return leads;
+}
+
+/// Is the caller an active member of `queue`?
+public bool InQueue(Queue queue) {
+  var me = Session.CurrentUser;
+  return QueueMember.Any(m => m.Queue == queue && m.Member == me && m.Active);
+}

@@ -1,0 +1,181 @@
+// ESCALATION — up a level, and what a promise does at its moments. A queue may name the queue it escalates to; an
+// escalated item moves there, its level rises, its promise is read again and its clocks retargeted, and its holder keeps
+// it only where they may hold it. A policy's `SlaEscalation` rows say what its clocks do when they go at risk or are
+// breached — tell the holder, tell the leads, raise the priority, escalate, move — each once per clock cycle. The desk is
+// in desk.test.osy; each test adds the second level it needs.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+using InboxKitTests;
+
+/// Tier 2 above Support: Lena works it. Its own promise (keyed by the queue) is tighter.
+void SecondLevel() {
+  var tier2 = new Queue { Name = "Tier 2", Level = 2 };
+  new QueueMember { Queue = tier2, Member = PersonNamed("Lena") };
+  var support = QueueOf("Support");
+  support.EscalatesTo = tier2;
+  var p = new SlaPolicy { Name = "Tier 2 promise", Queue = tier2, Position = 0 };
+  new SlaTarget { Policy = p, Metric = SlaMetric.FirstResponse, Within = TimeSpan.FromHours(2) };
+  new SlaTarget { Policy = p, Metric = SlaMetric.Resolution, Within = TimeSpan.FromHours(8) };
+  UnitOfWork.Commit();
+}
+
+/// `policy`'s clocks do `action` when `metric` reaches `moment`.
+void OnMoment(string policy, SlaMetric metric, SlaMoment moment, SlaAction action, string moveTo = "") {
+  var e = new SlaEscalation { Policy = SlaPolicy.Single(p => p.Name == policy), Metric = metric, When = moment, Action = action };
+  if (moveTo != "") { e.MoveTo = QueueOf(moveTo); }
+  UnitOfWork.Commit();
+}
+
+int ToldCount(WorkItem item, string kind) { return Told.Count(t => t.Item == item.Id && t.Kind == kind); }
+
+[Test(Desk)]
+void at_risk_fires_once_at_the_policys_fraction() {
+  TestClock.Set(new DateTime(2026, 6, 2, 0, 0, 0));                  // Tue 02:00 Stockholm; Enterprise runs 24/7
+  runas (Ines) {
+    var r = Ask("Orbit export broken", org: "Orbit Labs");           // first response 2h, resolution 12h, at risk at 0.75
+    Responded(r);                                                     // the first response is met: resolution remains
+    TestClock.Advance(TimeSpan.FromMinutes(539));                     // 8h59 of 12h
+    Workflow.Settle(r);
+    Assert.Null(ClockOf(r, SlaMetric.Resolution).AtRiskAt);
+    Assert.Equal(SlaState.OnTrack, Request.Single(x => x.Id == r.Id).Sla);
+    TestClock.Advance(TimeSpan.FromMinutes(2));                       // 9h01: three quarters of the RESOLUTION promise
+    Workflow.Settle(r);
+    Assert.NotNull(ClockOf(r, SlaMetric.Resolution).AtRiskAt);
+    Assert.Equal(SlaState.AtRisk, Request.Single(x => x.Id == r.Id).Sla);
+    Assert.Contains("Orbit export broken", Titles(Rows(BuiltInView.AtRisk)));
+    TestClock.Advance(TimeSpan.FromHours(1));
+    Workflow.Settle(r);
+    Assert.Equal(1, ToldCount(r, "inbox.promise-at-risk"));          // once
+  }
+  runas (Ines) {                                                      // …and waiting pauses it, as it pauses the deadline
+    TestClock.Set(new DateTime(2026, 6, 9, 0, 0, 0));
+    var w = Ask("Orbit report waits", org: "Orbit Labs");
+    Responded(w);
+    TestClock.Advance(TimeSpan.FromHours(8));
+    WaitOn(w, WaitFor.Requester);
+    Workflow.Settle(w);
+    TestClock.Advance(TimeSpan.FromDays(3));
+    Workflow.Settle(w);
+    Assert.Null(ClockOf(w, SlaMetric.Resolution).AtRiskAt);           // 8h accrued, however long it waited
+    RequesterWrote(w);
+    Workflow.Settle(w);
+    TestClock.Advance(TimeSpan.FromMinutes(61));                      // 9h01 accrued
+    Workflow.Settle(w);
+    Assert.NotNull(ClockOf(w, SlaMetric.Resolution).AtRiskAt);
+  }
+}
+
+[Test(Desk)]
+void a_breach_escalates_to_the_next_level_and_rereads_the_policy() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));                  // Tue 09:00 Stockholm
+  runas (Ada) {
+    SecondLevel();
+    OnMoment("Standard", SlaMetric.FirstResponse, SlaMoment.Breached, SlaAction.Escalate);
+  }
+  runas (Ines) {
+    var r = Ask("Export stuck");                                      // Standard: first response within 8 business hours
+    Assert.Equal("Standard", r.Policy!.Name);
+    TestClock.Advance(TimeSpan.FromHours(9));
+    Workflow.Settle(r);
+  }
+  runas (Lena) {
+    var r = Request.Single(x => x.Title == "Export stuck");
+    Assert.Equal("Tier 2", r.Queue!.Name);
+    Assert.Equal(2, r.EscalationLevel);
+    Assert.Equal("Tier 2 promise", r.Policy!.Name);                   // the promise is read again at the new level
+    Assert.Equal(TimeSpan.FromHours(8), r.ResolutionWithin);
+    var up = Escalation.Single(e => e.Item.Id == r.Id);
+    Assert.Equal(1, up.FromLevel);
+    Assert.Equal(2, up.ToLevel);
+    Assert.Equal(SlaMetric.FirstResponse, up.Metric);
+    Assert.Null(up.By);                                               // a promise did it
+    Assert.Equal(AssignReason.Escalated, TrailOf(r).Last().Reason);
+    Assert.Equal("Escalated to Tier 2 (L2) — First response was missed.", Said(TrailOf(r).Last()));
+  }
+  runas (Ines) {                                                      // escalated by hand, with a reason
+    var top = Ask("Already at the top", queue: "Billing");
+    Assert.Throws<ValidationException>(() => EscalateWork(top, "No next level"));
+  }
+}
+
+[Test(Desk)]
+void an_escalated_item_keeps_its_holder_only_when_they_are_in_the_new_queue() {
+  runas (Ada) { SecondLevel(); }
+  runas (Lena) {
+    var hers = Ask("Gateway timeouts");
+    TakeWork(hers);
+    EscalateWork(hers, "Needs a network engineer");
+    Workflow.Settle(hers);
+    Assert.Equal("Tier 2", Request.Single(x => x.Id == hers.Id).Queue!.Name);
+    Assert.Equal("Lena", HolderOf(hers));                             // she is in Tier 2: she keeps it
+    Assert.Equal("Lena", Escalation.Single(e => e.Item.Id == hers.Id).By!.DisplayName);
+  }
+  runas (Ines) {
+    var mine = Ask("Certificate expired");
+    TakeWork(mine);
+    EscalateWork(mine, "Beyond me");
+    Workflow.Settle(mine);
+  }
+  runas (Lena) {
+    var r = Request.Single(x => x.Title == "Certificate expired");
+    Assert.Equal("Tier 2", r.Queue!.Name);
+    Assert.Equal("Nobody", HolderOf(r));                              // Ines is not in Tier 2: it waits for Tier 2
+    Assert.Equal("Escalated to Tier 2 (L2) — Beyond me. Ines is not in Tier 2, so it is unheld.", Said(TrailOf(r).Last()));
+  }
+}
+
+[Test(Desk)]
+void escalation_actions_fire_once_per_clock_cycle() {
+  TestClock.Set(new DateTime(2026, 6, 2, 0, 0, 0));
+  runas (Ada) { OnMoment("Enterprise", SlaMetric.NextResponse, SlaMoment.AtRisk, SlaAction.TellHolder); }
+  runas (Ines) {
+    var r = Ask("Orbit sync drops rows", org: "Orbit Labs");          // next response within 4h, at risk at 3h
+    TakeWork(r);
+    Responded(r);
+    RequesterWrote(r);                                                // cycle 1
+    TestClock.Advance(TimeSpan.FromMinutes(181));
+    Workflow.Settle(r);
+    TestClock.Advance(TimeSpan.FromMinutes(30));
+    Workflow.Settle(r);
+    Assert.Equal(1, ToldCount(r, "notify:Ines"));                     // once in the cycle
+    Responded(r);
+    RequesterWrote(r);                                                // cycle 2
+    Workflow.Settle(r);
+    TestClock.Advance(TimeSpan.FromMinutes(181));
+    Workflow.Settle(r);
+    Assert.Equal(2, ToldCount(r, "notify:Ines"));                     // once more, for the new promise
+  }
+}
+
+[Test(Desk)]
+void the_escalation_actions_do_what_they_say() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));                  // Tue 09:00 Stockholm
+  runas (Ada) {
+    OnMoment("Standard", SlaMetric.FirstResponse, SlaMoment.AtRisk, SlaAction.TellLeads);
+    OnMoment("Standard", SlaMetric.FirstResponse, SlaMoment.AtRisk, SlaAction.RaisePriority);
+    OnMoment("Urgent", SlaMetric.Resolution, SlaMoment.Breached, SlaAction.MoveTo, moveTo: "Billing");
+  }
+  runas (Ines) {
+    var r = Ask("Invoice export blank");                              // Standard: first response 8h, at risk at 6h
+    TestClock.Advance(TimeSpan.FromMinutes(361));
+    Workflow.Settle(r);
+    Assert.True(WasTold(r, "notify:leads"));                          // the leads are told
+    var raised = Request.Single(x => x.Id == r.Id);
+    Assert.Equal(WorkPriority.High, raised.Priority);                 // one step up — and the promise read again
+    Assert.Equal("Standard", raised.Policy!.Name);                    // (no policy is keyed by High)
+    Responded(r);
+    Prioritise(r, WorkPriority.Urgent);                               // Urgent: resolution within 8 business hours
+    Workflow.Settle(r);
+    TestClock.Advance(TimeSpan.FromHours(30));                        // well past it, in business hours
+    Workflow.Settle(r);
+  }
+  runas (Lena) {
+    var moved = Request.Single(x => x.Title == "Invoice export blank");
+    Assert.Equal("Billing", moved.Queue!.Name);                       // the breach moved it
+    Assert.Equal(AssignReason.Moved, TrailOf(moved).Last().Reason);
+  }
+}

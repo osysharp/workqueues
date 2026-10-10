@@ -1,0 +1,192 @@
+// The test desk: agents, a lead, an admin and requesters; two kinds of work. Everything it writes about the inbox: who
+// works it (three policies), its own item kinds and their reads, and a recorder for what the kit tells it.
+namespace InboxKitTests;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+
+[Role] enum AppRole { Authenticator, Agent, Lead, Admin, Requester }
+
+// The kit's three questions, answered by the app.
+policy WorksInbox => RoleGrant.Any(g => g.Member == user && (g.Role == AppRole.Agent || g.Role == AppRole.Lead || g.Role == AppRole.Admin));
+policy LeadsInbox => RoleGrant.Any(g => g.Member == user && (g.Role == AppRole.Lead || g.Role == AppRole.Admin));
+policy AdministersInbox => RoleGrant.Any(g => g.Member == user && g.Role == AppRole.Admin);
+// Organizations' question: the inbox's admins look after the customer companies and their tiers.
+policy ManagesOrganizations => AdministersInbox;
+// Collaboration's question (the inbox shows who else is on an item): the people who work the inbox.
+policy CollaboratesOnRecords => WorksInbox;
+
+/// Everybody who signs in: the desk's people and the requesters.
+entity Person : Principal {
+  [MaxLength(200)] string CodeHash = "";
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+    deny read CodeHash when !IsAuthenticator;
+  }
+}
+
+/// A customer company — the kit reads its tier.
+entity Company : CustomerAccount {
+  security { allow read when WorksInbox; allow create, update when ManagesOrganizations; }
+}
+
+// The hours a policy's clocks run in are the app's rows: staff read them, admins keep them.
+partial entity ServiceHours { security { allow read when WorksInbox; allow create, update, delete when AdministersInbox; } }
+partial entity ServiceWindow { security { allow read when WorksInbox; allow create, update, delete when AdministersInbox; } }
+partial entity ServiceException { security { allow read when WorksInbox; allow create, update, delete when AdministersInbox; } }
+
+/// A support-shaped item: somebody asked, and waits on us.
+entity Request : WorkItem {
+  [MaxLength(2000)] string Body = "";
+  security {
+    allow read, create, update when WorksInbox;
+    // A requester opens their own request, and reads it.
+    allow read, create when IsAuthenticated where Requester == user;
+  }
+}
+
+enum ApprovalStep { Manager, Finance, Approved, Rejected }
+
+/// An approval-shaped item with its OWN lifecycle — the kit's run keeps the time beside it.
+entity Spend : WorkItem {
+  decimal Amount;
+  Principal? Approver;
+  ApprovalStep Step;                                   // no default — SpendApproval owns it
+  security {
+    allow read, create, update when WorksInbox;
+    allow read when IsAuthenticated where Requester == user || Approver == user;
+  }
+}
+
+/// The spend's own chain. It tells the inbox the facts as they happen, and keeps no clock of its own.
+workflow SpendApproval {
+  Tracks    = Spend.Step;
+  Autostart = true;
+  Initial   = Manager;
+  // The approver decides — or whoever covers for them while they are away, never on their own request (four eyes).
+  [Authorize(u => ActsFor(u, this.Item.Approver) && u != this.Item.Requester)] event Approve();
+  [Authorize(u => ActsFor(u, this.Item.Approver) && u != this.Item.Requester)] event Reject(string why);
+  state Manager {
+    on Approve { Responded(this.Item); goto Finance; }
+    on Reject(string why) { Responded(this.Item); goto Rejected; }
+  }
+  state Finance {
+    on Approve { goto Approved; }
+    on Reject(string why) { goto Rejected; }
+  }
+  terminal success Approved { enter { WorkDone(this.Item); } }
+  terminal success Rejected { enter { WorkDone(this.Item); } }
+}
+
+/// What the kit told the app — one row per event, so a test can read what happened, in order.
+entity Told {
+  Guid Item;
+  [Required("Say what happened."), MaxLength(80)] string Kind;
+  [MaxLength(300)] string Text = "";
+  /// Some of the facts it was told — who has it now, and why — so a test can say them again in another language.
+  [MaxLength(200)] string To = "";
+  AssignReason? Reason;
+  DateTime At = DateTime.UtcNow;
+  // Written by the run, and — for a link, which a person makes outside any run — by whoever works the inbox.
+  security { allow read, create when WorksInbox; }
+}
+
+/// The facts of the first step the app heard about `item` as `kind` (an event's wire name).
+InboxStep StepHeard(WorkItem item, string kind) {
+  var t = Told.Where(x => x.Item == item.Id && x.Kind == kind).OrderBy(x => x.At).First();
+  return new InboxStep { At = t.At, To = t.To, Reason = t.Reason };
+}
+
+/// A step of an item's trail as its reader reads it — said by the server from the step's facts (`TrailWords`).
+string Said(Assignment step) { return TrailWords(new List<Guid> { step.Id })[0].Text; }
+
+// What the inbox tells, heard as the app hears it: every one of its events, with the sentence the kit says for it — and,
+// for the ones that name somebody to tell, what that person reads (`InboxNotice`). An app with a bell uses
+// Osysharp.WorkQueues.Notifications for those instead; this app has none, so it writes them down.
+[On]
+void HeardFromTheInbox(Event e) {
+  var about = Events.About(e);
+  if (!IsInboxEvent(e) || about == null) { return; }
+  var step = StepIn(e);
+  new Told { Item = about!.Id, Kind = Events.Name(e), Text = e.Sentence(), At = InboxTime(e),
+             To = step != null ? step!.To : "", Reason = step != null ? step!.Reason : null };
+}
+
+/// The trail step an event carries, if it carries one.
+InboxStep? StepIn(Event e) {
+  if (e is ItemQueued q) { return q.Step; }
+  if (e is ItemRouted r) { return r.Step; }
+  if (e is HolderChanged h) { return h.Step; }
+  if (e is ItemMoved m) { return m.Step; }
+  if (e is ItemEscalated x) { return x.Step; }
+  if (e is ItemOffered o) { return o.Step; }
+  if (e is OfferFellThrough f) { return f.Step; }
+  if (e is RoutingSkipped s) { return s.Step; }
+  return null;
+}
+
+[On] void TellTheOffered(ItemOffered e) { Noticed(e.Item, e.To.DisplayName, e); }
+[On] void TellTheCover(HolderChanged e) { if (e.Told != null) { Noticed(e.Item, e.Told!.DisplayName, e); } }
+[On] void TellTheHolder(PromiseToldToHolder e) { Noticed(e.Item, e.Holder.DisplayName, e); }
+[On] void TellTheLeads(PickupOverdue e) { Noticed(e.Item, "leads", e); }
+[On] void TellTheLeadsOfAPromise(PromiseToldToLeads e) { Noticed(e.Item, "leads", e); }
+
+/// `who` was told about `item` — kept as what they read.
+void Noticed(WorkItem item, string who, Event e) {
+  new Told { Item = item.Id, Kind = "notify:" + who, Text = InboxNotice(e), At = InboxTime(e) };
+}
+
+/// The desk's own filter for a saved view — "says:<words>" keeps the requests whose body says them. The kit knows
+/// nothing about bodies; this is how an app's own field (a tag, a body) narrows a view.
+class DeskViews : InboxViews {
+  public override List<Guid> Narrow(string appFilter) {
+    if (!appFilter.StartsWith("says:")) { return new List<Guid>(); }
+    var words = appFilter.Substring(5);
+    return Request.Where(r => r.Body.Contains(words)).Select(r => r.Id).ToList();
+  }
+}
+
+/// The desk's own action for a routing rule — "flag:<word>" puts the word at the front of the request's body. The kit
+/// knows nothing about bodies; this is how an admin's rule does something in the app's own terms (a helpdesk tags).
+class DeskRouting : InboxRouting {
+  public override void Act(WorkItem item, string appAction, string rule) {
+    new Told { Item = item.Id, Kind = "act:" + appAction, Text = rule, At = DurableClock.UtcNow };
+    if (!appAction.StartsWith("flag:")) { return; }
+    if (item is Request r) { r.Body = "[" + appAction.Substring(5) + "] " + r.Body; }
+  }
+}
+
+/// The desk's kinds of link — one that reads the same both ways, two that point one way and allow one target, and one
+/// only the desk's own code makes.
+class DeskLinks : InboxLinks {
+  public override List<LinkKind> Kinds() {
+    return [
+      new LinkKind { Key = "related", Says = "Related to", Mutual = true },
+      new LinkKind { Key = "duplicate", Says = "Duplicate of", Back = "Duplicated by", One = true, Act = "Fold into" },
+      new LinkKind { Key = "incident", Says = "Incident of", Back = "Has incident", One = true },
+      new LinkKind { Key = "split", Says = "Split from", Back = "Split into", Offered = false },
+    ];
+  }
+}
+
+// Agents work their own items; moving work a colleague holds is a lead's (the stricter of the two settings).
+app.Inbox = new InboxSetup { Views = new InboxKitTests.DeskViews(),
+                             Routing = new InboxKitTests.DeskRouting(), Links = new InboxKitTests.DeskLinks(),
+                             DefaultQueue = "Support", AgentsHandOn = false };
+
+[AuthMethod]
+string SignInWithCode(string email, string code) {
+  var p = Person.FirstOrDefault(x => x.Email == NormalisedEmail(email));
+  if (p == null || !p.IsActive) { Security.VerifyPassword(code); return ""; }
+  if (!Security.VerifyPassword(code, p.CodeHash)) { return ""; }
+  return Security.IssueJwt(p.Id, p.Email);
+}
+
+app.AuthBootstrap = new AuthBootstrap { Role = AppRole.Authenticator, Login = SignInWithCode };
+app.Auth = new PasswordAuth { LoginField = Email, PasswordField = CodeHash };
+app.Audit = new AuditConfig { Redact = new AuditRedaction { Properties = [InboxKitTests.Person.CodeHash] } };

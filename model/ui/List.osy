@@ -1,0 +1,738 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.Workflow;
+
+// ── the list: dense rows a person scans hundreds of times a day, worked from the keyboard ───────────────────────────
+//
+// ⚑ LIVE, AND THE VIEWER'S OWN READ. The rows come from the board of the items' runs (`Workflow.WorkByItem<WorkItem>()`)
+//   as the viewer may read them, so a new item drops into place, a take moves a row, and a breach turns its countdown
+//   red without a reload — and a view can never show an item the viewer may not read (SECURITY-INVARIANT
+//   inbox-a-view-grants-nothing). Which view holds which row is ONE rule (`InView`), the same one `Rows(view)` reads.
+//
+// ⚑ A route names the view: "mine", "offered", "accounts", "unassigned", "open", "at-risk", "waiting", "done" — or a
+//   queue ("q-<id>") or a saved view ("v-<id>"). `InboxNav` builds the rail's links in the same words.
+
+/// How the list is ordered.
+// ⚠ Appended, never inserted: a remembered choice is stored by position.
+public enum WorkSort {
+  /// Whatever runs out first — the order a team works in.
+  [Label("Due first")] Due,
+  [Label("Newest")] Newest,
+  [Label("Priority")] Priority,
+  [Label("Oldest")] Oldest,
+}
+
+/// The route word for a built-in view.
+public string SlugOf(BuiltInView v) {
+  if (v == BuiltInView.Mine) { return "mine"; }
+  if (v == BuiltInView.Offered) { return "offered"; }
+  if (v == BuiltInView.MyAccounts) { return "accounts"; }
+  if (v == BuiltInView.Unassigned) { return "unassigned"; }
+  if (v == BuiltInView.AtRisk) { return "at-risk"; }
+  if (v == BuiltInView.Waiting) { return "waiting"; }
+  if (v == BuiltInView.Done) { return "done"; }
+  return "open";
+}
+
+/// The built-in view a route word names; "open" for anything else.
+public BuiltInView BuiltInNamed(string slug) {
+  foreach (var v in BuiltInView.Members) { if (SlugOf(v) == slug) { return v; } }
+  return BuiltInView.Open;
+}
+
+/// Does a built-in view hold this row? THE rule — `Rows(view)` reads the same one on the server.
+public bool InView(BuiltInView view, Handling h, bool mine, bool held, bool offeredToMe, SlaState sla, bool myAccount) {
+  var working = Working(h);
+  if (view == BuiltInView.Mine) { return mine && (working || Waiting(h)); }
+  if (view == BuiltInView.Offered) { return offeredToMe && working; }
+  if (view == BuiltInView.MyAccounts) { return myAccount && h != Handling.Done; }
+  if (view == BuiltInView.Unassigned) { return !held && working; }
+  if (view == BuiltInView.AtRisk) { return sla != SlaState.OnTrack && working; }
+  if (view == BuiltInView.Waiting) { return Waiting(h); }
+  if (view == BuiltInView.Done) { return h == Handling.Done; }
+  return working;
+}
+
+/// Does a saved view hold this row? Its own filters, over what the viewer may read; the app's own filter (`kept`) is
+/// asked on the server once when the view opens.
+public bool InSaved(InboxView v, WorkRow r, Guid me, List<Guid> kept) {
+  var phase = Working(r.Handling) || (v.IncludeWaiting && Waiting(r.Handling)) || (v.IncludeDone && r.Handling == Handling.Done);
+  return phase
+    && (v.Queue == null || r.QueueId == v.Queue.Id)
+    && (v.Holder != Holder.Me || r.HolderId == me)
+    && (v.Holder != Holder.Nobody || r.HolderId == null)
+    && (v.Organization == null || r.OrganizationId == v.Organization.Id)
+    && (v.Tier == null || r.Tier == v.Tier.Name)
+    && (!v.AtRiskOnly || r.Sla != SlaState.OnTrack)
+    && (v.AtLeast == null || (int)r.Priority >= (int)v.AtLeast.Value)
+    && (v.Language == "" || r.Language == v.Language)
+    && (v.Segment == "" || r.Segment == v.Segment)
+    && (v.Kind == "" || r.Kind == v.Kind)
+    && (v.AppFilter == "" || kept.Contains(r.Id));
+}
+
+/// Order a list's rows. A function over values the page holds, so re-sorting is instant.
+public List<WorkRow> Ordered(List<WorkRow> rows, WorkSort sort) {
+  if (sort == WorkSort.Newest) { return rows.OrderByDescending(r => r.ArrivedAt).ToList(); }
+  if (sort == WorkSort.Oldest) { return rows.OrderBy(r => r.ArrivedAt).ToList(); }
+  if (sort == WorkSort.Priority) {
+    return rows.OrderByDescending(r => (int)r.Priority).ThenBy(r => r.DueAt == null ? 1 : 0).ThenBy(r => r.DueAt).ToList();
+  }
+  // Due first: the promises the team owes — the ones already missed first (the longest missed at the top), then the
+  // soonest due; then everything else, oldest first.
+  return rows.OrderBy(r => DueRank(r)).ThenBy(r => r.BreachedAt ?? r.DueAt).ThenBy(r => r.ArrivedAt).ToList();
+}
+
+/// Where a row sorts in "Due first": a missed promise still owed (0) — whatever else still runs on it — then a running
+/// one (1), then nothing the team owes (2).
+public int DueRank(WorkRow r) {
+  if (!Owes(r.Handling)) { return 2; }
+  if (r.BreachedAt != null) { return 0; }
+  return r.DueAt != null ? 1 : 2;
+}
+
+/// The rows a filter keeps — words of the title, the reference, the requester or the organisation.
+public List<WorkRow> Searched(List<WorkRow> rows, string search) {
+  var q = search.Trim().ToLower();
+  if (q == "") { return rows; }
+  return rows.Where(r => r.Title.ToLower().Contains(q) || r.Reference.ToLower().Contains(q)
+    || r.Requester.ToLower().Contains(q) || r.Organization.ToLower().Contains(q)).ToList();
+}
+
+/// What an empty view says — why it is empty, which differs by view.
+public string EmptyLine(string view) {
+  if (view == "mine") { return "Nothing is yours right now. Unassigned holds what is waiting for somebody."; }
+  if (view == "offered") { return "Nothing is offered to you first right now."; }
+  if (view == "accounts") { return "Your accounts have nothing open."; }
+  if (view == "unassigned") { return "Everything being worked has somebody on it."; }
+  if (view == "at-risk") { return "No promise is at risk."; }
+  if (view == "waiting") { return "Nothing is waiting on anybody."; }
+  if (view == "done") { return "Nothing has been done yet."; }
+  return view.StartsWith("q-") ? "Nothing waits in this queue." : (view.StartsWith("v-") ? "Nothing matches this view." : "Nothing is being worked right now.");
+}
+
+/// How a line is marked: open beside the list, picked for a bulk change, under the keyboard's cursor, or none.
+public enum LineMark { Plain, Open, Picked, Cursor }
+
+/// ONE ITEM IN THE LIST — two lines: what it is and how long is left, then who it is for and who has it. Its lamp says
+/// its state before any word does.
+[Composable]
+public component WorkLine(WorkRow row, string href, LineMark mark, bool picked, DateTime now, Action<Guid> onPick,
+                          bool compact = false) {
+  variants {
+    base { Display = Display.Flex; Position = Position.Relative; Bg = Colors.Surface; BorderBW = 1; Border = Colors.Border;
+           Shrink = 0; Transition = Motion.Fast; Hover { Bg = Colors.Muted; } }
+    mark {
+      Open   { Bg = Colors.Primary.Subtle; Hover { Bg = Colors.Primary.Subtle; } }
+      Cursor { Bg = Colors.Muted; }
+      Picked { Bg = Colors.Muted; }
+      Plain  { }
+    }
+  }
+  render {
+    // The edge mark: the accent for the item open beside the list, ink for the keyboard's cursor.
+    Box(position: Position.Absolute, left: "0", top: "0", bottom: "0", w: "2px", decorative: true,
+        bg: mark == LineMark.Open ? Colors.Primary : (mark == LineMark.Cursor ? Colors.TextMuted : Colors.Transparent)) { }
+    Row(gap: 3, align: Align.Start, grow: 1, minW: "0", pl: 3, pr: 4, pt: compact ? "4px" : "8px", pb: compact ? "4px" : "8px",
+        role: UiRole.ListItem, selected: mark == LineMark.Open,
+        label: (row.Reference != "" ? row.Reference + " " : "") + row.Title) {
+      Box(pt: "2px", shrink: 0) {
+        PickMark(picked, () => onPick(row.Id), "Select " + (row.Reference != "" ? row.Reference : row.Title));
+      }
+      Link(href: href, grow: 1, minW: "0", color: Colors.OnSurface) {
+        Stack(gap: compact ? "0" : "2px", minW: "0") {
+          // The lamp leads the line it describes: state before text.
+          Row(gap: 2, align: Align.Center, minW: "0") {
+            WorkLamp(row.Handling, row.Sla);
+            Text(row.Title, fontSize: FontSize.Label,
+                 fontWeight: row.Handling == Handling.New ? FontWeight.Semibold : FontWeight.Medium,
+                 whiteSpace: WhiteSpace.Nowrap, overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis, minW: "0",
+                 grow: 1);
+            SlaChip(row, now);
+          }
+          Row(gap: 2, align: Align.Center, minW: "0", pl: "16px") {
+            if (row.Reference != "") {
+              Text(row.Reference, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted,
+                   whiteSpace: WhiteSpace.Nowrap);
+            }
+            Text(WhoFor(row), color: Colors.TextSecondary, fontSize: FontSize.Caption, whiteSpace: WhiteSpace.Nowrap,
+                 overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis, minW: "0", grow: 1);
+            if (row.Tier != "") {
+              Text(row.Tier, fontSize: FontSize.Caption, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap, px: "6px",
+                   rounded: Radius.Pill, borderW: 1, border: Colors.Border);
+            }
+            if (row.EscalationLevel > 1) {
+              Text("L" + row.EscalationLevel, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.Warning,
+                   label: "escalated to level " + row.EscalationLevel);
+            }
+            if (row.Priority == WorkPriority.Urgent || row.Priority == WorkPriority.High) {
+              Badge(row.Priority.Label, tone: PriorityTone(row.Priority));
+            }
+            HolderMark(row, now);
+          }
+        }
+      }
+    }
+  }
+}
+
+/// The id after `prefix` in a view's route word ("q-<id>"), or none.
+public Guid IdAfter(string view, string prefix) {
+  if (!view.StartsWith(prefix)) { return Guid.Empty; }
+  if (Guid.TryParse(view.Substring(prefix.Length), out var id)) { return id; }
+  return Guid.Empty;
+}
+
+/// How many rows a list reads at first, and how many more each "Show more" adds. A desk holds thousands of items; a
+/// person scans the top of a view — so the page reads what it shows, and the database counts the rest.
+public int WorkWindow() { return 50; }
+
+
+/// A view as the database asks it — the same rule as `InView`/`InSaved`, in columns, so a view of thousands is
+/// WINDOWED and COUNTED by the database instead of read whole and filtered here.
+public class ViewFilter {
+  /// The phases the view shows — never Closed or Cancelled: a finished item has left the inbox.
+  public List<Handling> Phases = new List<Handling>();
+  public Holder HeldBy = Holder.Anyone;
+  public bool OfferedToMe;
+  public bool AtRiskOnly;
+  public bool MyAccounts;
+  public Guid Queue = Guid.Empty;
+  public Guid Organization = Guid.Empty;
+  public string Tier = "";
+  /// The least priority it shows, as its number; -1: any.
+  public int AtLeast = -1;
+  public string Language = "";
+  public string Segment = "";
+  public string Kind = "";
+  /// Only what the app's own filter of a saved view keeps (`AppFilteredBy`).
+  public bool AppFilter;
+  /// A saved view that is not (yet) read shows nothing — never everything.
+  public bool Nothing;
+}
+
+/// The phases a view built from `working`, `waiting` and `done` shows.
+public List<Handling> PhasesOf(bool working, bool waiting, bool done) {
+  var phases = new List<Handling>();
+  if (working) { phases.Add(Handling.New); phases.Add(Handling.Owed); phases.Add(Handling.Answered); }
+  if (waiting) { phases.Add(Handling.WaitingOnRequester); phases.Add(Handling.WaitingOnOthers); phases.Add(Handling.Paused); }
+  if (done) { phases.Add(Handling.Done); }
+  return phases;
+}
+
+/// The filter `view` stands for — a queue ("q-…"), an organisation's work ("o-…"), a saved view ("v-…", `saved` its row,
+/// none while it is read) or a built-in view. The same rule as `InView` and `InSaved`.
+public ViewFilter FilterOf(string view, InboxView? saved) {
+  var queueId = IdAfter(view, "q-");
+  var orgId = IdAfter(view, "o-");
+  if (IdAfter(view, "v-") != Guid.Empty) {
+    if (saved == null) { return new ViewFilter { Nothing = true }; }
+    return new ViewFilter {
+      Phases = PhasesOf(true, saved.IncludeWaiting, saved.IncludeDone),
+      HeldBy = saved.Holder,
+      AtRiskOnly = saved.AtRiskOnly,
+      Queue = saved.Queue == null ? Guid.Empty : saved.Queue.Id,
+      Organization = saved.Organization == null ? Guid.Empty : saved.Organization.Id,
+      Tier = saved.Tier == null ? "" : saved.Tier.Name,
+      AtLeast = saved.AtLeast == null ? -1 : (int)saved.AtLeast.Value,
+      Language = saved.Language, Segment = saved.Segment, Kind = saved.Kind,
+      AppFilter = saved.AppFilter != "",
+    };
+  }
+  if (queueId != Guid.Empty) { return new ViewFilter { Phases = PhasesOf(true, true, false), Queue = queueId }; }
+  if (orgId != Guid.Empty) { return new ViewFilter { Phases = PhasesOf(true, true, false), Organization = orgId }; }
+  var v = BuiltInNamed(view);
+  if (v == BuiltInView.Mine) { return new ViewFilter { Phases = PhasesOf(true, true, false), HeldBy = Holder.Me }; }
+  if (v == BuiltInView.Offered) { return new ViewFilter { Phases = PhasesOf(true, false, false), OfferedToMe = true }; }
+  if (v == BuiltInView.MyAccounts) { return new ViewFilter { Phases = PhasesOf(true, true, false), MyAccounts = true }; }
+  if (v == BuiltInView.Unassigned) { return new ViewFilter { Phases = PhasesOf(true, false, false), HeldBy = Holder.Nobody }; }
+  if (v == BuiltInView.AtRisk) { return new ViewFilter { Phases = PhasesOf(true, false, false), AtRiskOnly = true }; }
+  if (v == BuiltInView.Waiting) { return new ViewFilter { Phases = PhasesOf(false, true, false) }; }
+  if (v == BuiltInView.Done) { return new ViewFilter { Phases = PhasesOf(false, false, true) }; }
+  return new ViewFilter { Phases = PhasesOf(true, false, false) };
+}
+
+/// The phases in which an item still owes its promise (`Owes`) — what "Due first" puts on top.
+public List<Handling> OwingPhases() { return [Handling.New, Handling.Owed, Handling.Answered, Handling.WaitingOnOthers]; }
+
+/// A promise in the kit's own words — for a screen reader, in the browser (the app's words are the server's).
+public string MetricWord(SlaMetric? m) { return m == null ? "" : m.Value.Label.ToLower(); }
+
+/// Did this item arrive in the last minute — is it new on the screen?
+public bool JustArrived(WorkRow r, DateTime now) { return (now - r.ArrivedAt).TotalSeconds < 60.0; }
+
+/// The one row a view's list is mounted under. It carries the view as its IDENTITY (`Id`), and a `foreach` keys a row
+/// by its item's identity — so a new view REPLACES the row, and its body mounts afresh.
+///
+/// ⛔ A PLAIN STRING ROW IS KEYED BY ITS PLACE, NOT ITS VALUE (a list of text is edited in place — `items[i]` bound to a
+///   box — so the walker must not remount a row whose text changes). Keyed by a plain `[view]`, ONE body would serve
+///   every view a list was ever shown: it would keep the first view's cursor, picks and filter, and its `on mount` —
+///   which asks the app's own filter of a saved view (`AppFilteredBy`) — would have run for whatever view the page
+///   opened on, so a saved view with an app filter would list NOTHING. Hence a `ViewKey` per view. Guarded by
+///   tests/views.test.osy `a_saved_view_with_the_apps_own_filter_lists_what_the_filter_keeps`.
+public class ViewKey { public string Id = ""; }
+
+/// A one-item list holding `key` — the row of a `foreach` that is replaced, whole, when `key` changes.
+public List<ViewKey> OneOf(string key) { return [new ViewKey { Id = key }]; }
+
+/// How a row is marked, from where it stands in the list.
+public LineMark MarkOf(Guid id, Guid open, Guid cursor, List<Guid> picked) {
+  if (id == open) { return LineMark.Open; }
+  if (picked.Contains(id)) { return LineMark.Picked; }
+  if (id == cursor) { return LineMark.Cursor; }
+  return LineMark.Plain;
+}
+
+/// One item as its list line reads it — from the item, ITS clocks (the governing one: the soonest still running and
+/// not yet missed; the missed one: the earliest still owed) and ITS live offer. `clocks` and `offers` are the window's.
+public WorkRow RowOf(WorkItem w, List<SlaClock> clocks, List<RoutingOffer> offers, Func<Guid, string>? whoFor) {
+  var mine = clocks.Where(c => c.Item.Id == w.Id).ToList();
+  var running = mine.Where(c => c.Outcome == ClockOutcome.Running && c.RunningSince != null && c.BreachedAt == null
+                                && c.DueAt != null).OrderBy(c => c.DueAt).ToList();
+  var missed = mine.Where(c => c.Outcome == ClockOutcome.Running && c.BreachedAt != null).OrderBy(c => c.BreachedAt).ToList();
+  SlaClock? governs = running.Count > 0 ? running[0] : null;
+  SlaClock? miss = missed.Count > 0 ? missed[0] : null;
+  return new WorkRow {
+    Id = w.Id, Title = w.Title, Reference = w.Reference,
+    QueueId = w.Queue == null ? null : w.Queue.Id, Queue = w.Queue == null ? "" : w.Queue.Name,
+    HolderId = w.Assignee == null ? null : w.Assignee.Id,
+    Holder = w.Assignee == null ? "" : w.Assignee.DisplayName,
+    Priority = w.Priority, Handling = w.Handling,
+    OrganizationId = w.Organization == null ? null : w.Organization.Id,
+    Organization = w.Organization == null ? "" : w.Organization.Name,
+    Tier = w.Organization == null || w.Organization.Tier == null ? "" : w.Organization.Tier.Name,
+    Requester = whoFor != null ? whoFor(w.Id) : (w.Requester == null ? "" : w.Requester.DisplayName),
+    Language = w.Language, Kind = w.Kind, Segment = w.Segment, EscalationLevel = w.EscalationLevel,
+    Sla = w.Sla,
+    DueAt = governs == null ? null : governs.DueAt,
+    Budget = governs == null ? null : governs.Target,
+    Metric = governs == null ? null : governs.Metric,
+    EverBreached = mine.Any(c => c.BreachedAt != null),
+    BreachedAt = miss == null ? null : miss.BreachedAt,
+    MissedWord = miss == null ? "" : MetricWord(miss.Metric),
+    DueWord = governs != null ? MetricWord(governs.Metric) : (miss == null ? "" : MetricWord(miss.Metric)),
+    ArrivedAt = w.ArrivedAt,
+    OfferedToId = w.OfferedTo == null ? null : w.OfferedTo.Id,
+    OfferedTo = w.OfferedTo == null ? "" : w.OfferedTo.DisplayName,
+    OfferEndsAt = w.OfferedTo == null ? null : offers.Where(o => o.Item.Id == w.Id).Select(o => o.EndsAt).FirstOrDefault(),
+  };
+}
+
+/// Who an item is for, in one line: "Hanna Lindqvist · Larkspur", or what is known of it.
+public string WhoFor(WorkRow r) {
+  if (r.Requester != "" && r.Organization != "") { return r.Requester + " · " + r.Organization; }
+  if (r.Requester != "") { return r.Requester; }
+  if (r.Organization != "") { return r.Organization; }
+  return r.Queue;
+}
+
+/// A row's pick box — a COMMAND, not a binding: whether it is ticked follows from the list's selection, and pressing
+/// it changes the selection. Drawn as a checkbox and announced as one.
+[Composable]
+public component PickMark(bool on, Action onToggle, string label) {
+  render {
+    Pressable(onClick: onToggle, label: label, role: UiRole.Checkbox, checked: on,
+              w: "16px", h: "16px", shrink: 0, rounded: Radius.Sm, borderW: 1,
+              border: on ? Colors.Primary : Colors.Border, bg: on ? Colors.Primary : Colors.Surface,
+              color: Colors.OnPrimary, transition: Motion.Fast) {
+      if (on) { Icon(Icons.Check, size: 12); }
+    }
+  }
+}
+
+/// An app's own change to many items at once, beside the kit's — a helpdesk's "Status": the button's word, and the
+/// choices its menu offers. What choosing one does is the list's `onMore`.
+public class BulkMenu {
+  public string Label = "";
+  public List<BulkChoice> Choices = new List<BulkChoice>();
+}
+
+/// One choice of a `BulkMenu` — "Pending", "Solved".
+public class BulkChoice {
+  public Guid Id;
+  public string Label = "";
+}
+
+/// THE INBOX'S LIST — one view of the work (a built-in view, a queue, or a saved view, named by `view`), live, ordered,
+/// filterable, and worked from the keyboard: J/K move, X picks, Enter opens, T takes; with a pick, the bulk bar hands,
+/// moves, re-prioritises and escalates them all, and says why for any it could not. `hrefOf` says where a row opens;
+/// `open` is the item open beside the list (its row is marked).
+///
+/// `whoFor`: who each item is for, by its id — for an app whose requesters have no account (a mail sender is a party,
+/// not a principal), so the kit cannot name them itself. None: the requester's own name, else the organisation.
+/// `onShown(ids, search)`: told which items the list shows (its window) and what it is filtered by, whenever either
+/// changes — so the app reads the names `whoFor` answers for THOSE rows only, never for the whole desk.
+/// `whoMatches`: the items the app finds by who they are for, for the current search — the list's filter keeps them
+/// beside its own matches on title, reference, organisation and requester.
+/// `more` + `onMore`: the app's own change to the picked items (or the row under the cursor), as one more menu on the
+/// bulk bar; `onMore(choice, ids)` — an action of the app's — does it and says how it went, in the app's own words.
+/// `titled`: false where the screen's own header already names the view (a phone, where the list IS the screen) — the
+/// list then says only how many items it holds, rather than its name twice.
+///
+/// ⚑ A WINDOW, NOT THE DESK. The database filters, orders, counts and pages the view (`FilterOf`, `WorkWindow`): a page
+///   open reads the rows it shows and the clocks and offers of those rows, whatever the desk holds. "Show more" widens
+///   the window.
+[Composable]
+public component WorkList(string view, Func<WorkRow, string> hrefOf, Guid open, string title = "",
+                          Func<Guid, string>? whoFor = null, BulkMenu? more = null,
+                          Action<Guid, List<Guid>>? onMore = null, bool titled = true,
+                          Action<List<Guid>, string>? onShown = null, List<Guid>? whoMatches = null) {
+  // ⚑ A CHANGE OF VIEW IS A FRESH LIST: its cursor, its picks and its filter belong to the view they were made in, so
+  //   the body is the row of a one-item `foreach` keyed by the view, and a new view mounts a new one.
+  render {
+    foreach (var v in OneOf(view)) {
+      WorkListView(v.Id, hrefOf, open, title, whoFor, more, onMore, titled, onShown, whoMatches);
+    }
+  }
+}
+
+/// One view's list — `WorkList`'s body, mounted afresh for each view.
+[Composable]
+public component WorkListView(string view, Func<WorkRow, string> hrefOf, Guid open, string title = "",
+                              Func<Guid, string>? whoFor = null, BulkMenu? more = null,
+                              Action<Guid, List<Guid>>? onMore = null, bool titled = true,
+                              Action<List<Guid>, string>? onShown = null, List<Guid>? whoMatches = null) {
+  // The reader's own order and density, kept in their browser — a compact desk stays compact.
+  [Remembered] WorkSort sort = WorkSort.Due;
+  [Remembered] bool compact = false;
+  string search = "";
+  Guid cursor = Guid.Empty;
+  List<Guid> picked = [];
+  string menu = "";
+  string said = "";
+  List<Guid> kept = [];
+  // How many rows the list reads — the window. "Show more" widens it.
+  int limit = WorkWindow();
+
+  live var me = Session.CurrentUser;
+  live var meId = me == null ? Guid.Empty : me.Id;
+  // A queue ("q-…") or a saved view ("v-…"), else a built-in view.
+  live var queueId = IdAfter(view, "q-");
+  live var savedId = IdAfter(view, "v-");
+  // …or one organisation's work ("o-…", what "My accounts" opens).
+  live var orgId = IdAfter(view, "o-");
+  live var builtIn = BuiltInNamed(view);
+  live var accounts = AccountTeamMember.Where(m => m.Member.Id == meId).Select(m => m.Organization.Id).ToList();
+  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Position).ThenBy(q => q.Name).ToList();
+  live var saved = InboxView.Where(v => v.Id == savedId).Include(v => v.Queue).Include(v => v.Tier)
+    .Include(v => v.Organization).ToList();
+  live var orgNamed = Organization.Where(o => o.Id == orgId).Select(o => o.Name).ToList();
+
+  // ── the view, asked of the database: which items, in what order, how many — and only the window is read ────────
+  live var f = FilterOf(view, saved.Count > 0 ? saved[0] : null);
+  live var phases = f.Phases;
+  live var heldBy = f.HeldBy;
+  live var offeredToMe = f.OfferedToMe;
+  live var atRiskOnly = f.AtRiskOnly;
+  live var myAccounts = f.MyAccounts;
+  live var inQueue = f.Queue;
+  live var forOrg = f.Organization;
+  live var tier = f.Tier;
+  live var atLeast = f.AtLeast;
+  live var language = f.Language;
+  live var segment = f.Segment;
+  live var kind = f.Kind;
+  live var appFilter = f.AppFilter;
+  live var nothing = f.Nothing;
+  live var q = search.Trim().ToLower();
+  live var also = whoMatches ?? new List<Guid>();
+  live var owing = OwingPhases();
+  // The count the header shows — the database counts; no row is read for it.
+  live var total = WorkItem.Count(w => !nothing && phases.Contains(w.Handling)
+      && (heldBy != Holder.Me || w.Assignee.Id == meId) && (heldBy != Holder.Nobody || w.Assignee == null)
+      && (!offeredToMe || w.OfferedTo.Id == meId) && (!atRiskOnly || w.Sla != SlaState.OnTrack)
+      && (!myAccounts || accounts.Contains(w.Organization.Id))
+      && (inQueue == Guid.Empty || w.Queue.Id == inQueue) && (forOrg == Guid.Empty || w.Organization.Id == forOrg)
+      && (tier == "" || w.Organization.Tier.Name == tier) && (atLeast < 0 || (int)w.Priority >= atLeast)
+      && (language == "" || w.Language == language) && (segment == "" || w.Segment == segment)
+      && (kind == "" || w.Kind == kind) && (!appFilter || kept.Contains(w.Id))
+      && (q == "" || w.Title.ToLower().Contains(q) || w.Reference.ToLower().Contains(q)
+          || w.Organization.Name.ToLower().Contains(q) || w.Requester.DisplayName.ToLower().Contains(q) || also.Contains(w.Id)));
+  // The window — the same rule, ordered as the reader chose, the first `limit` rows.
+  live var window = WorkItem.Where(w => !nothing && phases.Contains(w.Handling)
+      && (heldBy != Holder.Me || w.Assignee.Id == meId) && (heldBy != Holder.Nobody || w.Assignee == null)
+      && (!offeredToMe || w.OfferedTo.Id == meId) && (!atRiskOnly || w.Sla != SlaState.OnTrack)
+      && (!myAccounts || accounts.Contains(w.Organization.Id))
+      && (inQueue == Guid.Empty || w.Queue.Id == inQueue) && (forOrg == Guid.Empty || w.Organization.Id == forOrg)
+      && (tier == "" || w.Organization.Tier.Name == tier) && (atLeast < 0 || (int)w.Priority >= atLeast)
+      && (language == "" || w.Language == language) && (segment == "" || w.Segment == segment)
+      && (kind == "" || w.Kind == kind) && (!appFilter || kept.Contains(w.Id))
+      && (q == "" || w.Title.ToLower().Contains(q) || w.Reference.ToLower().Contains(q)
+          || w.Organization.Name.ToLower().Contains(q) || w.Requester.DisplayName.ToLower().Contains(q) || also.Contains(w.Id)))
+    // Due first: a missed promise still owed (the longest missed first), then the soonest due, then the rest, oldest
+    // first (`DueRank`). Priority: the most urgent, then the soonest due. Newest / oldest: by arrival.
+    .OrderBy(w => sort == WorkSort.Due
+        ? (owing.Contains(w.Handling) && w.MissedAt != null ? 0 : owing.Contains(w.Handling) && w.DueNext != null ? 1 : 2)
+        : sort == WorkSort.Priority ? 10 - (int)w.Priority : 0)
+    .ThenBy(w => sort == WorkSort.Priority && w.DueNext == null ? 1 : 0)
+    .ThenBy(w => sort == WorkSort.Due ? w.MissedAt ?? w.DueNext : sort == WorkSort.Priority ? w.DueNext : null)
+    .ThenByDescending(w => sort == WorkSort.Newest ? w.ArrivedAt : DateTime.MinValue)
+    .ThenBy(w => w.ArrivedAt)
+    .Take(limit)
+    .Include(w => w.Assignee).Include(w => w.Requester).Include(w => w.OfferedTo).Include(w => w.Organization)
+    .Include(w => w.Organization.Tier).Include(w => w.Queue)
+    .ToList();
+  live var ids = window.Select(w => w.Id).ToList();
+  // The window's own promises — what runs (the countdown), what was missed (the lateness), whether any ever was — and
+  // its live offers. Read for the rows shown, never for the desk.
+  live var clocks = SlaClock.Where(c => ids.Contains(c.Item.Id) && (c.Outcome == ClockOutcome.Running || c.BreachedAt != null)).ToList();
+  live var offers = RoutingOffer.Where(o => o.State == OfferState.Offered && ids.Contains(o.Item.Id)).ToList();
+
+  live var shown = window.Select(w => RowOf(w, clocks, offers, whoFor)).ToList();
+  live var heading = title != "" ? title
+    : savedId != Guid.Empty ? (saved.Count > 0 ? saved[0].Name : "Saved view")
+    : queueId != Guid.Empty ? queues.Where(q => q.Id == queueId).Select(q => q.Name).FirstOrDefault() ?? "Queue"
+    : orgId != Guid.Empty ? orgNamed.FirstOrDefault() ?? "Account"
+    : builtIn.Label;
+  // Who the selected can be handed to: everybody who works a queue (each hand-on still asks whether they may hold it).
+  live var people = Principal.Where(p => QueueMember.Any(m => m.Member == p && m.Active)).OrderBy(p => p.DisplayName).ToList();
+  live var hrefs = shown.Select(r => hrefOf(r)).ToList();
+
+  // ── the clock — one per list, coarse, so a row's countdown costs nothing per row ────────────────────────────────
+  DateTime now = DateTime.UtcNow;
+  on every (TimeSpan.FromSeconds(15)) { now = DateTime.UtcNow; }
+  // The app's own filter of a saved view is the app's code — asked on the server when the view opens (a change of
+  // view mounts a fresh list: see `WorkList`).
+  on mount { if (savedId != Guid.Empty) { kept = AppFilteredBy(savedId); } }
+  // The app hears which rows are shown and what the list is filtered by — it names those rows (`whoFor`) and finds
+  // items by who they are for (`whoMatches`).
+  on change { if (onShown != null) { onShown(ids, q); } }
+
+  // ── keyboard and selection ───────────────────────────────────────────────────────────────────────────────────
+  int CursorAt() {
+    for (var i = 0; i < shown.Count; i++) {
+      if (shown[i].Id == cursor || (cursor == Guid.Empty && shown[i].Id == open)) { return i; }
+    }
+    return -1;
+  }
+  action Move(int by) {
+    if (shown.Count == 0) { return; }
+    var at = CursorAt() + by;
+    if (at < 0) { at = 0; }
+    if (at >= shown.Count) { at = shown.Count - 1; }
+    cursor = shown[at].Id;
+    if (open != Guid.Empty) { Navigation.Go(hrefs[at]); }
+  }
+  action Down() { Move(1); }
+  action Up() { Move(-1); }
+  action OpenCursor() {
+    if (shown.Count == 0) { return; }
+    var at = CursorAt();
+    Navigation.Go(hrefs[at < 0 ? 0 : at]);
+  }
+  action Pick(Guid id) {
+    List<Guid> next = [];
+    var had = false;
+    foreach (var x in picked) { if (x == id) { had = true; } else { next.Add(x); } }
+    if (!had) { next.Add(id); }
+    picked = next;
+  }
+  action PickCursor() { var at = CursorAt(); if (at >= 0) { Pick(shown[at].Id); } }
+  action PickAll() {
+    if (picked.Count == shown.Count) { picked = []; return; }
+    List<Guid> all = [];
+    foreach (var r in shown) { all.Add(r.Id); }
+    picked = all;
+  }
+  action ClearPicked() { picked = []; menu = ""; }
+  action Toggle(string which) { menu = menu == which ? "" : which; }
+  action CloseMenu() { menu = ""; }
+  action SortBy(WorkSort s) { sort = s; menu = ""; }
+  action ToggleCompact() { compact = !compact; menu = ""; }
+  action ShowMore() { limit = limit + WorkWindow(); }
+
+  // ── what the keys and the bulk bar do ────────────────────────────────────────────────────────────────────────
+  /// The picked items — or, with nothing picked, the one under the cursor.
+  List<Guid> Targets() {
+    if (picked.Count > 0) { return picked; }
+    var at = CursorAt();
+    List<Guid> one = [];
+    if (at >= 0) { one.Add(shown[at].Id); }
+    return one;
+  }
+  action Take() {
+    said = "";
+    var ids = Targets();
+    if (ids.Count == 0) { return; }
+    try {
+      if (ids.Count == 1) {
+        var row = shown.First(r => r.Id == ids[0]);
+        TakeWork(WorkItem.Single(w => w.Id == row.Id), row.HolderId);
+        said = "Taken: " + row.Title + ".";
+      } else { said = BulkSentence(TakeAll(ids), "Taken"); }
+      picked = [];
+    } catch (Exception ex) { said = ex.Message; }
+  }
+  action HandTo(Guid person) {
+    said = ""; menu = "";
+    try { said = BulkSentence(HandAllTo(Targets(), person), "Handed on"); picked = []; }
+    catch (Exception ex) { said = ex.Message; }
+  }
+  action MoveTo(Guid queue) {
+    said = ""; menu = "";
+    try { said = BulkSentence(MoveAll(Targets(), queue), "Moved"); picked = []; }
+    catch (Exception ex) { said = ex.Message; }
+  }
+  action PriorityTo(WorkPriority p) {
+    said = ""; menu = "";
+    try { said = BulkSentence(PrioritiseAll(Targets(), p), "Priority set on"); picked = []; }
+    catch (Exception ex) { said = ex.Message; }
+  }
+  /// The app's own change (`onMore`, handed in from the menu) to the picked items: it says how it went; the pick is spent.
+  action MoreTo(Action<Guid, List<Guid>> apply, Guid choice) {
+    said = ""; menu = "";
+    apply(choice, Targets());
+    picked = [];
+  }
+  action OpenMore() { Toggle("more"); }
+  action EscalateThem() {
+    said = ""; menu = "";
+    try { said = BulkSentence(EscalateAll(Targets(), "Escalated from the list"), "Escalated"); picked = []; }
+    catch (Exception ex) { said = ex.Message; }
+  }
+  action OpenHand() { Toggle("hand"); }
+  action OpenMove() { Toggle("move"); }
+  action OpenPriority() { Toggle("priority"); }
+
+  render {
+    Stack(gap: 0, h: "100%", minH: "0", bg: Colors.Surface, role: UiRole.Region, label: "Work") {
+      // ── the head: which view, how many, how ordered ──────────────────────────────────────────────────────────
+      Stack(gap: 2, px: 4, pt: 3, pb: 2, borderBW: 1, border: Colors.Border) {
+        Row(gap: 2, align: Align.Center) {
+          if (shown.Count > 0) {
+            PickMark(picked.Count > 0 && picked.Count == shown.Count, PickAll,
+                     picked.Count > 0 && picked.Count == shown.Count ? "Select none" : "Select all");
+          }
+          if (titled) {
+            Text(heading, fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold, letterSpacing: "-0.01em",
+                 whiteSpace: WhiteSpace.Nowrap, overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis, minW: "0");
+            Text(total.ToString(), fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted,
+                 fontVariant: FontVariant.TabularNums, animation: KitNudge, animationKey: total, label: total + " items");
+          } else {
+            // The header above already names the view; the list says how much is in it.
+            Text(total == 1 ? "1 item" : total + " items", fontSize: FontSize.Label, color: Colors.TextSecondary,
+                 fontVariant: FontVariant.TabularNums, animation: KitNudge, animationKey: total);
+          }
+          Spacer();
+          Box(position: Position.Relative) {
+            Button(sort.Label, onPress: () => Toggle("sort"), tone: Tone.Ghost, size: Size.Sm);
+            if (menu == "sort") {
+              Backdrop(CloseMenu);
+              Menu(from: MenuFrom.BelowEnd, label: "Order by") {
+                foreach (var s in WorkSort.Members) { MenuItem(s.Label, () => SortBy(s), checked: sort == s); }
+                Divider();
+                MenuItem("Compact rows", ToggleCompact, toggled: compact);
+              }
+            }
+          }
+        }
+        Row(gap: 1, align: Align.Center) {
+          Box(grow: 1, minW: "0") {
+            Input(value: search, placeholder: "Filter this view", label: "Filter this view", w: "100%", h: "30px", px: 2,
+                  rounded: Radius.Md, borderW: 1, border: Colors.Border, bg: Colors.Bg, fontSize: FontSize.Label);
+          }
+          // The keyboard, as visible controls — a key is a button's own, so it can never do what the button does not.
+          // ⚠ Drawn at every width. `Layout.AtLeast` measures the CONTAINER, and a 440px list pane on a wide screen is
+          //   narrower than a tablet — gating these on it took the keyboard away on exactly the desk that has one.
+          IconButton("Previous", Up, size: Size.Sm, tone: Tone.Ghost, shortcut: "K") { Icon(Icons.ChevronUp); }
+          IconButton("Next", Down, size: Size.Sm, tone: Tone.Ghost, shortcut: "J") { Icon(Icons.ChevronDown); }
+          IconButton("Select", PickCursor, size: Size.Sm, tone: Tone.Ghost, shortcut: "X") { Icon(Icons.Check); }
+          IconButton("Open", OpenCursor, size: Size.Sm, tone: Tone.Ghost, shortcut: "Enter") { Icon(Icons.ChevronRight); }
+          IconButton("Take", Take, size: Size.Sm, tone: Tone.Ghost, shortcut: "T") { Icon(Icons.UserPlus); }
+        }
+      }
+
+      // ── many at once ─────────────────────────────────────────────────────────────────────────────────────────
+      if (picked.Count > 0) {
+        Row(gap: 1, align: Align.Center, px: 4, py: 2, bg: Colors.Primary.Subtle, borderBW: 1, border: Colors.Border,
+            role: UiRole.Toolbar, label: "Selected", animation: KitArrive, wrap: Wrapping.Wrap) {
+          Text(picked.Count == shown.Count ? "All " + shown.Count + " selected" : picked.Count + " selected",
+               fontSize: FontSize.Label, fontWeight: FontWeight.Medium, mr: 2);
+          Spacer();
+          Button("Take", onPress: Take, size: Size.Sm, tone: Tone.Ghost);
+          Box(position: Position.Relative) {
+            Button("Hand to…", onPress: OpenHand, size: Size.Sm, tone: Tone.Ghost, shortcut: "A");
+            if (menu == "hand") {
+              Backdrop(CloseMenu);
+              Menu(from: MenuFrom.BelowEnd, label: "Hand the selected to") {
+                foreach (var p in people) { MenuItem(p.DisplayName, () => HandTo(p.Id), icon: Icons.User); }
+              }
+            }
+          }
+          Box(position: Position.Relative) {
+            Button("Move to…", onPress: OpenMove, size: Size.Sm, tone: Tone.Ghost, shortcut: "M");
+            if (menu == "move") {
+              Backdrop(CloseMenu);
+              Menu(from: MenuFrom.BelowEnd, label: "Move the selected to") {
+                foreach (var q in queues) { MenuItem(q.Name, () => MoveTo(q.Id), icon: Icons.Inbox); }
+              }
+            }
+          }
+          Box(position: Position.Relative) {
+            Button("Priority", onPress: OpenPriority, size: Size.Sm, tone: Tone.Ghost, shortcut: "P");
+            if (menu == "priority") {
+              Backdrop(CloseMenu);
+              Menu(from: MenuFrom.BelowEnd, label: "Priority of the selected") {
+                foreach (var p in WorkPriority.Members) { MenuItem(p.Label, () => PriorityTo(p)); }
+              }
+            }
+          }
+          if (more != null && onMore != null) {
+            Box(position: Position.Relative) {
+              Button(more.Label, onPress: OpenMore, size: Size.Sm, tone: Tone.Ghost);
+              if (menu == "more") {
+                Backdrop(CloseMenu);
+                Menu(from: MenuFrom.BelowEnd, label: more.Label + " of the selected") {
+                  foreach (var c in more.Choices) { MenuItem(c.Label, () => MoreTo(onMore, c.Id)); }
+                }
+              }
+            }
+          }
+          Button("Escalate", onPress: EscalateThem, size: Size.Sm, tone: Tone.Ghost, shortcut: "E");
+          IconButton("Clear selection", ClearPicked, size: Size.Sm, tone: Tone.Ghost) { Icon(Icons.Close); }
+        }
+      }
+      if (said != "") {
+        Box(px: 4, py: 2, borderBW: 1, border: Colors.Border, animation: KitArrive) {
+          Text(said, fontSize: FontSize.Label, color: Colors.TextSecondary, role: UiRole.Status);
+        }
+      }
+
+      // ── the rows ─────────────────────────────────────────────────────────────────────────────────────────────
+      Box(grow: 1, minH: "0", overflowY: Overflow.Auto, role: UiRole.List, label: heading + " list") {
+        if (shown.Count == 0) {
+          Box(p: 6) { EmptyState(search != "" ? "Nothing matches" : "Nothing here", body: EmptyLine(view)); }
+        }
+        // ⚑ ONE CONTAINER PER VIEW: switching views REPLACES the rows' container (it is the row of a one-item
+        //   `foreach` keyed by the view), so the old rows go at once instead of each playing its exit — an exit means
+        //   "this item left the view", which a switch of view is not.
+        foreach (var v in OneOf(view)) {
+          Stack(gap: 0) {
+            foreach (var r in shown) {
+              // What just arrived drops into place; everything already there on load stays still. What leaves the
+              // view (taken by a colleague, moved, done) slides out and the rows below close the gap.
+              if (JustArrived(r, now)) {
+                Box(animation: KitArrive, exitAnimation: KitLeave) {
+                  WorkLine(r, hrefOf(r), MarkOf(r.Id, open, cursor, picked), picked.Contains(r.Id), now, Pick, compact);
+                }
+              } else {
+                Box(exitAnimation: KitLeave) {
+                  WorkLine(r, hrefOf(r), MarkOf(r.Id, open, cursor, picked), picked.Contains(r.Id), now, Pick, compact);
+                }
+              }
+            }
+          }
+        }
+        // The window ends before the view does: the next rows are read only when somebody asks for them.
+        if (total > shown.Count) {
+          Row(justify: Justify.Center, py: 3) {
+            Button("Show " + Math.Min(WorkWindow(), total - shown.Count) + " more", onPress: ShowMore, tone: Tone.Ghost, size: Size.Sm);
+          }
+        }
+      }
+    }
+  }
+}

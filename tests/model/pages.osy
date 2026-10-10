@@ -1,0 +1,130 @@
+// The test desk's screens — the inbox kit's components as an app places them: its rows in the app's shell, a list per
+// view, an item beside the list, the team's load, and the settings pages. Everything here is the APP's; every control
+// on it is the kit's. (ui.test.osy drives them; `osy test --pixels` photographs them.)
+namespace InboxKitTests;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+
+[Layout]
+component DeskFrame() {
+  live var me = Session.CurrentUser;
+  live var myName = me == null ? "" : me.DisplayName;
+  action SignOut() { Session.SignOut(); }
+  action Appearance() { Theme.Toggle(); }
+  render {
+    InboxShell(new AppChrome {
+      Product = "Test desk",
+      Tagline = "Inbox",
+      Mark = Icons.Inbox,
+      Home = "/inbox/mine",
+      Panes = true,
+      User = new ShellUser {
+        Name = myName, Initials = InitialsOf(myName == "" ? "?" : myName), Presence = ShellPresence.Online,
+        Menu = [
+          new MenuAction { Label = "Appearance", Icon = Icons.Eye, OnPress = Appearance },
+          new MenuAction { Label = "Sign out", Icon = Icons.Logout, OnPress = SignOut, Tone = Tone.Danger, Divided = true },
+        ],
+      },
+      Nav = [
+        new NavItem { Kind = NavKind.Section, Label = "Desk", Children = [
+          new NavItem { Label = "Settings", To = "/settings/queues", Icon = Icons.Gear },
+        ] },
+      ],
+    }) {
+      Outlet(retain: 4);
+      slot actions { MyStatus(); }
+    }
+  }
+}
+
+/// The front door: the reader's own work, and — with nothing open — what it holds.
+[Route("/")] [Layout(DeskFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Inbox")]
+component Home() {
+  render {
+    InboxPanes("mine", r => "/inbox/mine/i/" + r.Id, Guid.Empty) { InboxOverview("mine"); }
+  }
+}
+
+/// A view of the work: the list, and beside it on a wide screen what the view holds and the keys that work it.
+[Route("/inbox/{view}")] [Layout(DeskFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Inbox")]
+component InboxPage(string view) {
+  render {
+    InboxPanes(view, r => "/inbox/" + view + "/i/" + r.Id, Guid.Empty) { InboxOverview(view); }
+  }
+}
+
+/// A view with one item open beside it — on a phone, the item alone.
+[Route("/inbox/{view}/i/{id}")] [Layout(DeskFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Item")]
+component ItemPage(string view, Guid id) {
+  live var items = WorkItem.Where(w => w.Id == id).Include(w => w.Queue).Include(w => w.Assignee).ToList();
+  // A duplicate's step: folded into the item it repeats, it is cancelled saying where it went.
+  action Fold(WorkLink l) { CancelWork(l.From, "Folded into " + l.To.Reference + "."); }
+  render {
+    InboxPanes(view, r => "/inbox/" + view + "/i/" + r.Id, id) {
+      Stack(gap: 0, grow: 1, minW: "0", h: "100%", minH: "0", overflowY: Overflow.Auto) {
+        if (!Layout.AtLeast(Tablet)) {
+          Row(px: 4, pt: 3) { Link(href: "/inbox/" + view, label: "Back to the list") { Icon(Icons.ChevronLeft); } }
+        }
+        foreach (var item in items) {
+          WorkItemHead(item);
+          Stack(gap: 2, px: 5, py: 4) {
+            SectionLabel("Why this is here");
+            WhyHere(item);
+          }
+          Box(px: 5, pb: 4) { ItemLinks(item, other => "/inbox/" + view + "/i/" + other.Id, shortcut: "Shift+L", onAct: Fold); }
+        }
+      }
+    }
+  }
+}
+
+[Route("/inbox/team")] [Layout(DeskFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Team")]
+component TeamPage() {
+  render {
+    Stack(gap: 3, p: 5, maxW: "880px") {
+      PageTitle("Team load");
+      TeamLoad();
+    }
+  }
+}
+
+[Route("/inbox/my-accounts")] [Layout(DeskFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("My accounts")]
+component AccountsPage() {
+  render {
+    Stack(gap: 3, p: 5, maxW: "880px") {
+      PageTitle("My accounts");
+      MyAccountsPanel();
+    }
+  }
+}
+
+/// The settings area — the Ui kit's, taken over by name: every section is announced (the inbox's by
+/// `InboxSettingsSections`), and the six pages are the kit's own.
+[Layout]
+component SettingsFrame() {
+  render { SettingsArea() { Outlet; } }
+}
+
+/// THE LIST IN A LAYOUT, as a desk that keeps its list while items open beside it places it (the helpdesk template's
+/// `DeskFrame`):
+/// the view comes from the PATH, so moving to another view hands the SAME list a new `view` rather than mounting a new
+/// page. `/panes/<view>`.
+[Layout]
+component PanesFrame() {
+  live var path = Navigation.CurrentPath ?? "/";
+  live var view = path.StartsWith("/panes/") ? path.Substring(7) : "mine";
+  render {
+    InboxPanes(view, r => "/panes/" + view, Guid.Empty) { Outlet; }
+  }
+}
+
+[Route("/panes/{view}")] [Layout(PanesFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Panes")]
+component PanesPage(string view) {
+  live var saved = InboxView.Where(v => v.Active).OrderBy(v => v.Name).ToList();
+  render {
+    Stack(gap: 1, label: "Saved views") {
+      foreach (var v in saved) { Link(href: "/panes/v-" + v.Id) { Text(v.Name); } }
+    }
+  }
+}

@@ -1,0 +1,161 @@
+// PEOPLE — whether routing may give them work now, and what happens to their work when they go away. Routing reads what
+// a person SAID (their status, their working hours in their own zone, their absences), never a socket. Going away hands
+// each held item over by its queue's rule — to the cover when the cover may hold it, else back to the queue — and what
+// was offered to them falls through. The desk is in desk.test.osy.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+using InboxKitTests;
+
+[Test(Desk)]
+void going_away_hands_held_work_to_cover_and_withdraws_offers() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));
+  runas (Ada) { Team("Acme", "Rahul", "Lena", new List<string>()); }
+  var held = new List<Guid>();
+  var offered = Guid.Empty;
+  runas (Rahul) {
+    var one = Ask("Printer offline");
+    TakeWork(one);
+    var two = Ask("VPN drops");
+    TakeWork(two);
+    held.Add(one.Id);
+    held.Add(two.Id);
+    offered = Ask("Acme cannot sign in", org: "Acme").Id;
+    Assert.Equal("Rahul", OfferedOf(Request.Single(x => x.Id == offered)));
+    GoAway(until: new DateTime(2026, 6, 4, 7, 0, 0), cover: PersonNamed("Ines"));
+  }
+  runas (Lena) {
+    foreach (var id in held) {
+      var r = Request.Single(x => x.Id == id);
+      Assert.Equal("Ines", HolderOf(r));
+      var covered = TrailOf(r).Last();
+      Assert.Equal(AssignReason.Cover, covered.Reason);
+      Assert.Equal("Rahul is away until Thu 4 Jun 07:00 UTC — covered by Ines.", Said(covered));
+    }
+    var o = Request.Single(x => x.Id == offered);
+    Assert.Equal("Lena", OfferedOf(o));                               // his offer fell through to the backup at once
+    Assert.Equal(OfferState.Withdrawn, RoutingOffer.Where(x => x.Item.Id == offered).OrderBy(x => x.At).First().State);
+    Assert.True(WasTold(Request.Single(x => x.Id == held[0]), "notify:Ines"));   // the cover is told
+  }
+}
+
+[Test(Desk)]
+void a_planned_absence_hands_over_at_its_start_and_ends_by_itself() {
+  TestClock.Set(new DateTime(2026, 6, 1, 7, 0, 0));                  // Monday
+  var absence = Guid.Empty;
+  var mine = Guid.Empty;
+  runas (Ines) {
+    var r = Ask("Badge reader broken");
+    TakeWork(r);
+    mine = r.Id;
+    absence = new Absence { Person = PersonNamed("Ines"), From = new DateTime(2026, 6, 3, 0, 0, 0),
+                            Until = new DateTime(2026, 6, 5, 0, 0, 0), CoveredBy = PersonNamed("Rahul"), Reason = "Course" }.Id;
+    UnitOfWork.Commit();
+  }
+  runas (Lena) {
+    var a = Absence.Single(x => x.Id == absence);
+    Assert.Equal(AbsenceState.Planned, a.State);
+    Assert.Equal("Ines", HolderOf(Request.Single(x => x.Id == mine)));   // not yet
+    TestClock.Set(new DateTime(2026, 6, 3, 0, 1, 0));                 // Wednesday: it starts
+    Workflow.Settle(a);
+    Assert.Equal(AbsenceState.Away, Absence.Single(x => x.Id == absence).State);
+    Assert.Equal("Rahul", HolderOf(Request.Single(x => x.Id == mine)));
+    Assert.False(OnDuty(PersonNamed("Ines"), new DateTime(2026, 6, 3, 9, 0, 0)));
+    Assert.Equal("Mateo, Rahul", string.Join(", ", new List<string> {   // the rota passes her by while she is away
+      HolderOf(Ask("Rota one", queue: "Rota")), HolderOf(Ask("Rota two", queue: "Rota")) }));
+    TestClock.Set(new DateTime(2026, 6, 5, 0, 1, 0));                 // Friday: it ends by itself
+    Workflow.Settle(a);
+    Assert.Equal(AbsenceState.Over, Absence.Single(x => x.Id == absence).State);
+    Assert.True(OnDuty(PersonNamed("Ines"), new DateTime(2026, 6, 5, 9, 0, 0)));
+    Assert.Equal("Rahul", HolderOf(Request.Single(x => x.Id == mine)));   // what cover took stays with the cover
+    Assert.Equal("Ines", HolderOf(Ask("Rota three", queue: "Rota")));     // and she is given work again
+  }
+}
+
+[Test(Desk)]
+void cover_that_may_not_hold_an_item_sends_it_back_to_the_queue() {
+  var billing = Guid.Empty;
+  var support = Guid.Empty;
+  runas (Rahul) {
+    var b = Ask("Card declined", queue: "Billing");
+    TakeWork(b);
+    billing = b.Id;
+    var s = Ask("Screen flickers");
+    TakeWork(s);
+    support = s.Id;
+    GoAway(cover: PersonNamed("Ines"));                               // Ines is in Support, not in Billing
+  }
+  runas (Lena) {
+    Assert.Equal("Ines", HolderOf(Request.Single(x => x.Id == support)));
+    var b = Request.Single(x => x.Id == billing);
+    Assert.Equal("Nobody", HolderOf(b));
+    Assert.Equal("Billing", b.Queue!.Name);
+    Assert.Equal(AssignReason.Released, TrailOf(b).Last().Reason);
+    Assert.Contains("— back to Billing.", Said(TrailOf(b).Last()));
+  }
+  runas (Rahul) {                                                     // back: what cover took stays with the cover
+    ComeBack();
+    Assert.True(OnDuty(PersonNamed("Rahul"), DateTime.UtcNow));
+    Assert.Equal("Ines", HolderOf(Request.Single(x => x.Id == support)));
+  }
+}
+
+[Test(Desk)]
+void off_hours_cover_at_half_the_first_response_target() {
+  TestClock.Set(new DateTime(2026, 6, 2, 14, 0, 0));                 // Tue 16:00 Stockholm
+  runas (Ada) {
+    var early = new ServiceHours { Name = "Early shift", Zone = Zone.Of("Europe/Stockholm") };
+    var late = new ServiceHours { Name = "Late shift", Zone = Zone.Of("Europe/Stockholm") };
+    foreach (var d in new List<DayOfWeek> { DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday, DayOfWeek.Friday }) {
+      new ServiceWindow { ServiceHours = early, Day = d, Start = TimeSpan.FromHours(8), End = TimeSpan.FromHours(16.5) };
+      new ServiceWindow { ServiceHours = late, Day = d, Start = TimeSpan.FromHours(12), End = TimeSpan.FromHours(20) };
+    }
+    UnitOfWork.Commit();
+  }
+  runas (Ines) { new Availability { Person = PersonNamed("Ines"), Hours = ServiceHours.Single(h => h.Name == "Early shift") }; UnitOfWork.Commit(); }
+  runas (Rahul) { new Availability { Person = PersonNamed("Rahul"), Hours = ServiceHours.Single(h => h.Name == "Late shift") }; UnitOfWork.Commit(); }
+  runas (Lena) { new Availability { Person = PersonNamed("Lena"), Status = Presence.Offline }; UnitOfWork.Commit(); }
+  var id = Guid.Empty;
+  runas (Ines) {
+    var r = Ask("Orbit export broken", org: "Orbit Labs");           // Enterprise: first response within 2h, around the clock
+    TakeWork(r);
+    id = r.Id;
+    TestClock.Advance(TimeSpan.FromMinutes(55));                     // 16:55 — she left at 16:30, but it is not yet halfway
+    Workflow.Settle(r);
+    Assert.Equal("Ines", HolderOf(r));
+    TestClock.Advance(TimeSpan.FromMinutes(10));                     // 17:05 — past halfway, and she is off shift
+    Workflow.Settle(r);
+    Assert.Equal("Rahul", HolderOf(r));                              // on until 20:00
+    var covered = TrailOf(r).Last();
+    Assert.Equal(AssignReason.OffHoursCover, covered.Reason);
+    Assert.Equal("Ines is off shift — Rahul is on, and has it now.", Said(covered));
+  }
+}
+
+[Test(Desk)]
+void on_shift_is_read_from_working_hours_in_their_zone() {
+  runas (Ada) {
+    var chicago = new ServiceHours { Name = "Chicago office", Zone = Zone.Of("America/Chicago") };
+    foreach (var d in new List<DayOfWeek> { DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday, DayOfWeek.Friday }) {
+      new ServiceWindow { ServiceHours = chicago, Day = d, Start = TimeSpan.FromHours(9), End = TimeSpan.FromHours(17) };
+    }
+    UnitOfWork.Commit();
+  }
+  runas (Mateo) {
+    new Availability { Person = PersonNamed("Mateo"), Hours = ServiceHours.Single(h => h.Name == "Chicago office") };
+    UnitOfWork.Commit();
+    Assert.False(OnDuty(PersonNamed("Mateo"), new DateTime(2026, 6, 2, 13, 30, 0)));   // 08:30 in Chicago
+    Assert.True(OnDuty(PersonNamed("Mateo"), new DateTime(2026, 6, 2, 14, 30, 0)));   // 09:30
+  }
+  TestClock.Set(new DateTime(2026, 6, 2, 13, 30, 0));
+  runas (Lena) {
+    Assert.Equal("Ines, Rahul, Ines", string.Join(", ", new List<string> {             // before his day starts, the rota
+      HolderOf(Ask("Early one", queue: "Rota")), HolderOf(Ask("Early two", queue: "Rota")),   // passes him by
+      HolderOf(Ask("Early three", queue: "Rota")) }));
+  }
+  TestClock.Set(new DateTime(2026, 6, 2, 14, 30, 0));
+  runas (Lena) { Assert.Equal("Mateo", HolderOf(Ask("After nine", queue: "Rota"))); }   // his turn, now he is on
+}

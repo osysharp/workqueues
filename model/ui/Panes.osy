@@ -1,0 +1,193 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+
+// ── the list and what is open beside it ─────────────────────────────────────────────────────────────────────────────
+//
+// ⚑ ONE LAYOUT, EVERY APP. On a wide screen the list stands on the left with the open item beside it; on anything
+//   narrower each is a screen of its own and the route says which. The pane beside the list is never a void: with
+//   nothing open it holds `InboxOverview` — what the view holds, how much of it is late, and the keys that work it —
+//   never an empty void, in light or dark, and never a phone list whose divider runs down the screen's edge.
+
+/// THE LIST, AND WHAT IS OPEN BESIDE IT — `view`'s `WorkList` and, beside it on a wide screen, the slot: the open item,
+/// or `InboxOverview` when nothing is open. Narrower than a tablet, the list and the item are one screen each — the
+/// list while nothing is `open`, the item once something is. `hrefOf` says where a row opens; `whoFor` (optional) names
+/// who each item is for, by its id, when the app's requesters have no account (a mail sender) — with `onShown` (which
+/// items the list shows, and its filter) and `whoMatches` (the items the app finds by who they are for) — see `WorkList`.
+/// The divider is the list's own right edge, drawn only while something stands beside it. `headerNamesView`: the
+/// app's page header already names the view — then on a phone, where the list is the whole screen, the list says only
+/// how many items it holds instead of its name a second time.
+[Composable]
+public component InboxPanes(string view, Func<WorkRow, string> hrefOf, Guid open, string title = "",
+                            Func<Guid, string>? whoFor = null, BulkMenu? more = null,
+                            Action<Guid, List<Guid>>? onMore = null, string listW = "440px",
+                            bool headerNamesView = false, Action<List<Guid>, string>? onShown = null,
+                            List<Guid>? whoMatches = null, bool pageOpen = false, bool pageWide = false) {
+  // Something is open beside the list — an item, or (`pageOpen`) one of the app's own pages in the pane: a form, a
+  // search. On a phone that is the screen, and the list is one press back.
+  live var showing = open != Guid.Empty || pageOpen || pageWide;
+  // `pageWide`: the app's page wants the whole width — a report, a dashboard — so the list steps aside entirely (the
+  // rail still holds every view, one press away).
+  render {
+    Row(gap: 0, align: Align.Stretch, h: "100%", minH: "0", minW: "0") {
+      if (!pageWide && (!showing || Layout.AtLeast(Tablet))) {
+        Box(w: Layout.AtLeast(Tablet) ? listW : "100%", shrink: 0, h: "100%", minH: "0", minW: "0",
+            borderRW: Layout.AtLeast(Tablet) ? 1 : 0, border: Colors.Border) {
+          // On a phone the list is the whole screen; when the header above already names the view, it is not said twice.
+          WorkList(view, hrefOf, open, title: title, whoFor: whoFor, more: more, onMore: onMore,
+                   titled: !headerNamesView || Layout.AtLeast(Tablet), onShown: onShown, whoMatches: whoMatches);
+        }
+      }
+      Stack(gap: 0, grow: 1, minW: "0", minH: "0", h: "100%", bg: Colors.Bg,
+            display: showing || Layout.AtLeast(Tablet) ? Display.Flex : Display.None) {
+        Slot;
+      }
+    }
+  }
+}
+
+// ── nothing open: what the view holds, and how to work it ───────────────────────────────────────────────────────────
+
+/// What a view holds, summed from the rail's own grouped read — so the pane beside the list and the rail can never
+/// disagree about a count.
+public class ViewSummary {
+  /// False for a view the tallies cannot sum (a saved view, one organisation's work, "my accounts"): the overview then
+  /// shows its keys alone.
+  public bool Counted = false;
+  public int Items = 0;
+  public int Late = 0;
+  public int AtRisk = 0;
+  public int Unheld = 0;
+  public int Waiting = 0;
+}
+
+/// Sum `tallies` (the rail's grouped read) into what `view` holds. A built-in view or a queue; anything else is not
+/// counted here.
+public ViewSummary SummaryOf(string view, List<Tally> tallies) {
+  var queueId = IdAfter(view, "q-");
+  if (view.StartsWith("v-") || view.StartsWith("o-") || view == "accounts") { return new ViewSummary(); }
+  var builtIn = BuiltInNamed(view);
+  var kept = queueId != Guid.Empty
+    ? tallies.Where(t => t.Queue == queueId && t.Handling != Handling.Done).ToList()
+    : tallies.Where(t => InView(builtIn, t.Handling, t.Mine, t.Held, t.Offered, t.Sla, false)).ToList();
+  return new ViewSummary {
+    Counted = true,
+    Items = kept.Sum(t => t.Count),
+    Late = kept.Where(t => t.Sla == SlaState.Breached && Owes(t.Handling)).Sum(t => t.Count),
+    AtRisk = kept.Where(t => t.Sla == SlaState.AtRisk && Owes(t.Handling)).Sum(t => t.Count),
+    Unheld = kept.Where(t => !t.Held && Working(t.Handling)).Sum(t => t.Count),
+    Waiting = kept.Where(t => Waiting(t.Handling)).Sum(t => t.Count),
+  };
+}
+
+/// The view's state in one sentence — what a person would say walking up to the desk.
+public string SummaryLine(ViewSummary s) {
+  if (s.Items == 0) { return ""; }
+  var trouble = new List<string>();
+  if (s.Late > 0) { trouble.Add(s.Late + " late"); }
+  if (s.AtRisk > 0) { trouble.Add(s.AtRisk + " at risk"); }
+  var head = s.Items == 1 ? "1 item" : s.Items + " items";
+  if (trouble.Count == 0) { return head + ", every promise on time."; }
+  return head + " — " + string.Join(" and ", trouble) + ". Due first puts them at the top.";
+}
+
+/// NO ITEM SELECTED — the pane beside the list when no item is open: the view's name, what it holds (late, at risk,
+/// nobody on it, waiting — from the rail's own grouped read, live), and the keys that work the list. An app adds its
+/// own key lines as the slot (`InboxOverview(view) { KeyLine("Mod+K", "commands"); }`). An empty view says it is clear,
+/// and why it is empty, rather than counting zeros. `noun` is the app's word for one item ("ticket"): the pane says
+/// none is SELECTED — "nothing open" above "All open — 149 items" read as a contradiction.
+[Composable]
+public component InboxOverview(string view, string title = "", string noun = "item") {
+  live var me = Session.CurrentUser;
+  live var meId = me == null ? Guid.Empty : me.Id;
+  live var tallies = WorkItem.Where(w => w.Handling != Handling.Closed && w.Handling != Handling.Cancelled)
+    .GroupBy(w => new() { Queue = w.Queue.Id, Handling = w.Handling, Mine = w.Assignee.Id == meId, Held = w.Assignee != null,
+                          Offered = w.OfferedTo.Id == meId, Sla = w.Sla })
+    .Select(g => new Tally { Queue = g.Key.Queue, Handling = g.Key.Handling, Mine = g.Key.Mine, Held = g.Key.Held,
+                             Offered = g.Key.Offered, Sla = g.Key.Sla, Count = g.Count() })
+    .ToList();
+  live var queueId = IdAfter(view, "q-");
+  live var queues = Queue.Where(q => q.Id == queueId).ToList();
+  live var summary = SummaryOf(view, tallies);
+  live var heading = title != "" ? title
+    : queueId != Guid.Empty ? (queues.Count > 0 ? queues[0].Name : "Queue")
+    : view.StartsWith("v-") ? "Saved view"
+    : view.StartsWith("o-") ? "Account"
+    : BuiltInNamed(view).Label;
+  render {
+    Stack(gap: 0, align: Align.Center, justify: Justify.Center, grow: 1, h: "100%", minH: "0", p: 6, bg: Colors.Bg,
+          overflowY: Overflow.Auto, role: UiRole.Region, label: "No " + noun + " selected") {
+      Stack(gap: 5, w: "100%", maxW: "440px") {
+        Stack(gap: 1) {
+          Text("No " + noun + " selected", fontSize: FontSize.Caption, fontWeight: FontWeight.Semibold, color: Colors.TextMuted,
+               letterSpacing: "0.06em", textTransform: TextTransform.Uppercase);
+          Text(heading, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em");
+          if (summary.Counted && summary.Items > 0) {
+            Text(SummaryLine(summary), fontSize: FontSize.Label, color: Colors.TextSecondary);
+          }
+        }
+        if (summary.Counted && summary.Items == 0) {
+          Row(gap: 3, align: Align.Center, p: 4, rounded: Radius.Lg, bg: Colors.Surface, borderW: 1, border: Colors.Border) {
+            Box(animation: KitDraw, display: Display.InlineFlex, decorative: true, color: Colors.Success) { Icon(Icons.CheckCircle, size: 20); }
+            Stack(gap: 0, minW: "0") {
+              Text("All clear", fontWeight: FontWeight.Semibold);
+              Text(EmptyLine(view), fontSize: FontSize.Label, color: Colors.TextSecondary);
+            }
+          }
+        }
+        if (summary.Counted && summary.Items > 0) {
+          Row(gap: 0, rounded: Radius.Lg, bg: Colors.Surface, borderW: 1, border: Colors.Border, overflow: Overflow.Hidden,
+              role: UiRole.List, label: "What " + heading + " holds") {
+            OverviewFigure(summary.Late, "late", Tone.Danger);
+            OverviewFigure(summary.AtRisk, "at risk", Tone.Warning);
+            OverviewFigure(summary.Unheld, "nobody on it", Tone.Primary);
+            OverviewFigure(summary.Waiting, "waiting", Tone.Ghost, last: true);
+          }
+        }
+        Stack(gap: 2) {
+          Text("Pick one from the list, or work it from the keyboard:", fontSize: FontSize.Label, color: Colors.TextMuted);
+          Stack(gap: 2, w: "100%") {
+            KeyLine("J", "next and previous item", also: "K");
+            KeyLine("Enter", "open it");
+            KeyLine("X", "select it, for a change to many");
+            KeyLine("T", "take it");
+            Slot;
+            KeyLine("?", "every key on the page");
+          }
+        }
+      }
+    }
+  }
+}
+
+/// One figure of the overview — a count in mono, and its word under it. Coloured only while it is not zero: a desk
+/// with nothing late shows a quiet 0, not a red one.
+[Composable]
+public component OverviewFigure(int n, string word, Tone tone, bool last = false) {
+  render {
+    Stack(gap: "2px", grow: 1, basis: "0", minW: "0", px: 3, py: 3, borderRW: last ? 0 : 1, border: Colors.Border,
+          role: UiRole.ListItem, label: n + " " + word) {
+      Text(n.ToString(), fontFamily: Font.Mono, fontSize: FontSize.Heading, fontVariant: FontVariant.TabularNums,
+           fontWeight: FontWeight.Medium, animation: KitNudge, animationKey: n,
+           color: n == 0 ? Colors.TextMuted
+             : tone == Tone.Danger ? Colors.Danger : (tone == Tone.Warning ? Colors.Warning
+             : (tone == Tone.Primary ? Colors.Primary : Colors.Waiting)));
+      Text(word, fontSize: FontSize.Caption, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap);
+    }
+  }
+}
+
+/// One line of a keyboard lesson — the key, spelled by the platform for the reader's keyboard (⌘ on a Mac), and what it
+/// does. `also`: a second key that does the opposite ("J", also "K").
+[Composable]
+public component KeyLine(string keys, string what, string also = "") {
+  render {
+    Row(gap: 3, align: Align.Center) {
+      Row(gap: 1, w: "84px", shrink: 0, align: Align.Center) {
+        KeyHint(keys);
+        if (also != "") { KeyHint(also); }
+      }
+      Text(what, fontSize: FontSize.Label, color: Colors.TextSecondary);
+    }
+  }
+}

@@ -1,0 +1,182 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+
+// ── the marks an item is read by at a glance, on the Switchboard floor ───────────────────────────────────────────────
+//
+// ⚑ STATE BEFORE TEXT, AND ONE JOB PER COLOUR. A row starts with its LAMP, which says what the item WAITS ON:
+//     breathing accent  new — nobody has responded yet
+//     lit accent        owed — the requester wrote and waits on us
+//     ink               answered — in hand, nothing owed
+//     violet ring       waiting on the requester, on somebody else, or held
+//     red               a promise to the requester is already broken
+//   TIME is the countdown's job — amber when its last quarter is running, red once it is past — so the lamp and the
+//   countdown say two different things, and a screen of items due soon is not one colour from edge to edge. The accent
+//   is spent only on what is live and needs the reader; everything else is ink in three steps.
+
+/// How a lamp is lit.
+public class LampLook {
+  public bool Lit = true;
+  public bool Live = false;
+  public Tone Tone = Tone.Default;
+  public bool Waiting = false;
+}
+
+/// Is a promise to the requester running that is the TEAM's to keep — is the item being worked, or waiting on somebody
+/// other than the requester?
+public bool Owes(Handling h) {
+  return h == Handling.New || h == Handling.Owed || h == Handling.Answered || h == Handling.WaitingOnOthers;
+}
+
+/// Is the item paused on the requester, or held — every clock stopped?
+public bool Paused(Handling h) { return h == Handling.WaitingOnRequester || h == Handling.Paused; }
+
+/// The lamp an item is drawn with — see the head of this file.
+public LampLook LampFor(Handling h, SlaState sla) {
+  if (sla == SlaState.Breached && Owes(h)) { return new LampLook { Lit = true, Tone = Tone.Danger }; }
+  if (h == Handling.New) { return new LampLook { Lit = true, Live = true, Tone = Tone.Primary }; }
+  if (h == Handling.Owed) { return new LampLook { Lit = true, Tone = Tone.Primary }; }
+  if (h == Handling.Answered) { return new LampLook { Lit = true, Tone = Tone.Default }; }
+  if (h == Handling.WaitingOnRequester || h == Handling.WaitingOnOthers || h == Handling.Paused) {
+    return new LampLook { Lit = false, Waiting = true };
+  }
+  return new LampLook { Lit = false };
+}
+
+/// The band a countdown is in: past (red), in its last quarter or at risk (amber), or fine (ink) — and no colour at
+/// all for a clock the team does not owe. A promise already broken with nothing left running is red.
+///
+/// ⚑ THE COLOUR IS THE CLOCK SHOWN, never the item's history. Once a first response is missed the row counts down the
+///   resolution still running — and colouring THAT red would make "10d" read as ten days late. The broken promise is the row's LAMP, and the countdown's spoken label.
+public Tone DueTone(Handling h, SlaState sla, DateTime? due, TimeSpan? budget, DateTime now) {
+  if (!Owes(h)) { return Tone.Ghost; }
+  if (due == null) { return sla == SlaState.Breached ? Tone.Danger : Tone.Ghost; }
+  var left = due.Value - now;
+  if (left.TotalSeconds < 0.0) { return Tone.Danger; }
+  if (sla == SlaState.AtRisk) { return Tone.Warning; }
+  if (budget != null && budget.Value.TotalSeconds > 0.0 && left.TotalSeconds < budget.Value.TotalSeconds * 0.25) { return Tone.Warning; }
+  return Tone.Default;
+}
+
+/// A countdown read at a glance: "0:42", "3h", "2d" — "−0:05" once it is past.
+public string Countdown(DateTime due, DateTime now) {
+  var left = due - now;
+  var neg = left.TotalSeconds < 0.0;
+  var secs = Convert.ToInt(Math.Abs(Math.Truncate(left.TotalSeconds)));
+  var text = "";
+  if (secs >= 86400 * 2) { text = (secs / 86400) + "d"; }
+  else if (secs >= 3600 * 10) { text = (secs / 3600) + "h"; }
+  else {
+    var m = secs / 60;
+    var h = m / 60;
+    var mm = m % 60;
+    text = h + ":" + (mm < 10 ? "0" + mm : "" + mm);
+  }
+  return neg ? "−" + text : text;
+}
+
+/// The same span in words, for a screen reader: "42 minutes", "3 hours", "2 days".
+public string Spoken(TimeSpan span) {
+  var secs = Math.Abs(span.TotalSeconds);
+  if (secs >= 86400.0 * 2.0) { return Convert.ToInt(Math.Floor(secs / 86400.0)) + " days"; }
+  if (secs >= 3600.0 * 2.0) { return Convert.ToInt(Math.Floor(secs / 3600.0)) + " hours"; }
+  var m = Convert.ToInt(Math.Floor(secs / 60.0));
+  return m == 1 ? "1 minute" : m + " minutes";
+}
+
+/// How long ago, in the coarsest unit that is still true — "now", "12m", "4h", "3d".
+public string Ago(DateTime? at, DateTime now) {
+  if (at == null) { return ""; }
+  var since = now - at.Value;
+  if (since.TotalDays >= 1.0) { return Convert.ToInt(Math.Floor(since.TotalDays)) + "d"; }
+  if (since.TotalHours >= 1.0) { return Convert.ToInt(Math.Floor(since.TotalHours)) + "h"; }
+  if (since.TotalMinutes >= 1.0) { return Convert.ToInt(Math.Floor(since.TotalMinutes)) + "m"; }
+  return "now";
+}
+
+/// The tone a priority is drawn in — colour only for the two that need attention.
+public Tone PriorityTone(WorkPriority p) {
+  if (p == WorkPriority.Urgent) { return Tone.Danger; }
+  if (p == WorkPriority.High) { return Tone.Warning; }
+  return Tone.Ghost;
+}
+
+/// "Ines Moreau" → "IM".
+public string InitialsOf(string name) {
+  var parts = name.Trim().Split(" ").Where(p => p != "").ToList();
+  if (parts.Count == 0) { return "?"; }
+  if (parts.Count == 1) { return parts[0].Substring(0, 1).ToUpper(); }
+  return (parts[0].Substring(0, 1) + parts[parts.Count - 1].Substring(0, 1)).ToUpper();
+}
+
+/// An item's lamp. Carries no words: the row beside it says what the item is.
+[Composable]
+public component WorkLamp(Handling handling, SlaState sla) {
+  live var look = LampFor(handling, sla);
+  render { Lamp(lit: look.Lit, live: look.Live, tone: look.Tone, waiting: look.Waiting); }
+}
+
+/// THE COUNTDOWN ON A ROW — what is left of the promise the team owes, in tabular mono: ink while there is time, amber
+/// in its last quarter, red once it is past. A paused item says what it is waiting on instead; an item with no running
+/// promise shows how long ago it arrived. A screen reader hears the promise in the app's words: "first response due in
+/// 42 minutes".
+[Composable]
+public component SlaChip(WorkRow row, DateTime now) {
+  live var tone = DueTone(row.Handling, row.Sla, row.DueAt, row.Budget, now);
+  render {
+    if (Paused(row.Handling)) {
+      Row(gap: 1, align: Align.Center, label: row.Handling.Label) {
+        Icon(Icons.Pause, size: 12, color: Colors.Waiting);
+        Text(row.Handling == Handling.Paused ? "held" : "waiting", fontFamily: Font.Mono, fontSize: FontSize.Caption,
+             color: Colors.Waiting, whiteSpace: WhiteSpace.Nowrap);
+      }
+    } else if (row.DueAt == null && row.BreachedAt != null && Owes(row.Handling)) {
+      // The engine retired the missed clock: how LATE it is, counted from the miss.
+      Text(Countdown(row.BreachedAt.Value, now), fontFamily: Font.Mono, fontSize: FontSize.Caption,
+           fontVariant: FontVariant.TabularNums, whiteSpace: WhiteSpace.Nowrap, color: Colors.Danger,
+           label: (row.DueWord != "" ? row.DueWord : "promise") + " missed " + Spoken(now - row.BreachedAt.Value) + " ago");
+    } else if (row.DueAt != null && Owes(row.Handling)) {
+      // What still runs — and, once a promise was missed (a first response), that one too: the row is red for it, and a
+      // screen reader hears both.
+      Text(Countdown(row.DueAt.Value, now), fontFamily: Font.Mono, fontSize: FontSize.Caption,
+           fontVariant: FontVariant.TabularNums, whiteSpace: WhiteSpace.Nowrap,
+           color: tone == Tone.Danger ? Colors.Danger : (tone == Tone.Warning ? Colors.Warning : Colors.TextMuted),
+           label: (row.DueWord != "" ? row.DueWord : "promise") + (row.DueAt.Value < now
+             ? " missed " + Spoken(now - row.DueAt.Value) + " ago" : " due in " + Spoken(row.DueAt.Value - now))
+             + (row.BreachedAt != null && row.BreachedAt.Value <= now
+               ? "; " + (row.MissedWord != "" ? row.MissedWord : "a promise") + " missed " + Spoken(now - row.BreachedAt.Value) + " ago"
+               : ""));
+    } else {
+      Text(Ago(row.ArrivedAt, now), fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted,
+           fontVariant: FontVariant.TabularNums, whiteSpace: WhiteSpace.Nowrap, label: "arrived " + Ago(row.ArrivedAt, now) + " ago");
+    }
+  }
+}
+
+/// WHO HAS IT, at the end of a row: their initials — or, while it is offered to somebody first, "→ Ines · 12:00", the
+/// offer counting down to when it falls through. Nothing while nobody holds it: Unassigned is a view, not a mark.
+[Composable]
+public component HolderMark(WorkRow row, DateTime now) {
+  render {
+    if (row.OfferedTo != "" && row.Holder == "") {
+      Row(gap: 1, align: Align.Center, shrink: 0, px: 2, py: "1px", rounded: Radius.Pill, bg: Colors.Primary.Subtle,
+          label: "offered to " + row.OfferedTo + (row.OfferEndsAt != null ? ", falls through in " + Spoken(row.OfferEndsAt.Value - now) : "")) {
+        Icon(Icons.ArrowRight, size: 12, color: Colors.Primary);
+        Text(FirstName(row.OfferedTo), fontSize: FontSize.Caption, fontWeight: FontWeight.Medium, color: Colors.Primary,
+             whiteSpace: WhiteSpace.Nowrap);
+        if (row.OfferEndsAt != null) {
+          Text(Countdown(row.OfferEndsAt.Value, now), fontFamily: Font.Mono, fontSize: FontSize.Caption,
+               fontVariant: FontVariant.TabularNums, color: Colors.Primary, whiteSpace: WhiteSpace.Nowrap);
+        }
+      }
+    } else if (row.Holder != "") {
+      Box(label: row.Holder, shrink: 0) { Avatar(InitialsOf(row.Holder), size: Size.Sm); }
+    }
+  }
+}
+
+/// "Ines Moreau" → "Ines".
+public string FirstName(string name) {
+  var t = name.Trim();
+  return t.Contains(" ") ? t.Substring(0, t.IndexOf(" ")) : t;
+}

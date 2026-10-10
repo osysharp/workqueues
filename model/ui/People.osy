@@ -1,0 +1,231 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+
+// ── people: how I stand, how the team stands, and my accounts ────────────────────────────────────────────────────────
+
+/// The lamp a standing is drawn with: available green, busy amber, away violet, offline dark.
+public LampLook StandingLamp(Presence status, bool away, bool onHours) {
+  if (away || status == Presence.Away) { return new LampLook { Lit = false, Waiting = true }; }
+  if (status == Presence.Offline || !onHours) { return new LampLook { Lit = false }; }
+  if (status == Presence.Busy) { return new LampLook { Lit = true, Tone = Tone.Warning }; }
+  return new LampLook { Lit = true, Tone = Tone.Success };
+}
+
+/// A standing in words — "Available", "Busy", "Off shift", "Away until Fri 12 Oct".
+public string StandingWord(Presence status, bool away, DateTime? until, bool onHours) {
+  if (away || status == Presence.Away) { return until != null ? "Away until " + $"{until.Value:ddd d MMM}" : "Away"; }
+  if (status == Presence.Offline) { return "Offline"; }
+  if (status == Presence.Busy) { return "Busy"; }
+  return onHours ? "Available" : "Off shift";
+}
+
+/// MY STATUS — the switch in the shell's corner: Available (give me work), Busy (nothing new), Offline, or Away until a
+/// time with a colleague covering. Routing reads what you say here, never whether a tab is open. Mod+Shift+A opens it.
+[Composable]
+public component MyStatus() {
+  bool open = false;
+  bool choosingCover = false;
+  MyStanding s = new MyStanding();
+  string problem = "";
+  DateTime until = DateTime.UtcNow;
+
+  live var meId = Session.CurrentUser?.Id ?? Guid.Empty;
+  live var look = StandingLamp(s.Status, s.Away, s.OnHours);
+  // Who could cover: everybody else who works a queue.
+  live var colleagues = Principal.Where(p => p.Id != meId && QueueMember.Any(m => m.Member == p && m.Active))
+    .OrderBy(p => p.DisplayName).ToList();
+
+  on mount { s = MyPresence(); }
+
+  action Toggle() { open = !open; choosingCover = false; problem = ""; if (open) { s = MyPresence(); } }
+  action Close() { open = false; choosingCover = false; }
+  action Set(Presence p) {
+    problem = "";
+    try {
+      if (s.Away) { ComeBack(); }
+      SetMyPresence(p);
+      s = MyPresence();
+      open = false;
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action AwayFor(int hours) { until = DateTime.UtcNow.AddHours(hours); choosingCover = true; }
+  action AwayTomorrow() { until = DateTime.UtcNow.Date.AddDays(1).AddHours(8); choosingCover = true; }
+  action GoAwayWith(Guid? cover) {
+    problem = "";
+    try {
+      Principal? who = cover == null ? null : Principal.Single(p => p.Id == cover.Value);
+      GoAway(until, who);
+      s = MyPresence();
+      open = false;
+      choosingCover = false;
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action Back() {
+    problem = "";
+    try { ComeBack(); s = MyPresence(); open = false; } catch (Exception ex) { problem = ex.Message; }
+  }
+
+  render {
+    Box(position: Position.Relative) {
+      Pressable(onClick: Toggle, label: "My status: " + StandingWord(s.Status, s.Away, s.AwayUntil, s.OnHours), expanded: open,
+                shortcut: "Mod+Shift+A", px: 2, py: 1, rounded: Radius.Pill, borderW: 1, border: Colors.Border,
+                bg: Colors.Surface, transition: Motion.Fast) {
+        Row(gap: 2, align: Align.Center) {
+          Lamp(lit: look.Lit, tone: look.Tone, waiting: look.Waiting);
+          Text(StandingWord(s.Status, s.Away, s.AwayUntil, s.OnHours), fontSize: FontSize.Label, fontWeight: FontWeight.Medium,
+               whiteSpace: WhiteSpace.Nowrap);
+          if (s.Cover != "" && s.Away) {
+            Text("· " + s.Cover + " covers", fontSize: FontSize.Caption, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap);
+          }
+          Icon(Icons.ChevronDown, size: 12, color: Colors.TextMuted);
+        }
+      }
+      if (open) {
+        Backdrop(Close);
+        Menu(from: MenuFrom.BelowEnd, label: "My status") {
+          if (!choosingCover) {
+            MenuItem("Available — give me work", () => Set(Presence.Available), checked: !s.Away && s.Status == Presence.Available);
+            MenuItem("Busy — nothing new", () => Set(Presence.Busy), checked: !s.Away && s.Status == Presence.Busy);
+            MenuItem("Offline", () => Set(Presence.Offline), checked: !s.Away && s.Status == Presence.Offline);
+            Divider();
+            if (s.Away) { MenuItem("I'm back", Back, icon: Icons.Refresh); }
+            MenuItem("Away for an hour…", () => AwayFor(1), icon: Icons.Clock);
+            MenuItem("Away until tomorrow…", AwayTomorrow, icon: Icons.Calendar);
+          } else {
+            Box(px: 3, pt: 2, pb: 1) { SectionLabel("Who covers your work?"); }
+            MenuItem("Nobody — back to the queue", () => GoAwayWith(null));
+            foreach (var c in colleagues) { MenuItem(c.DisplayName, () => GoAwayWith(c.Id), icon: Icons.User); }
+          }
+        }
+      }
+      if (problem != "") { Box(pt: 2) { Alert(problem, tone: Tone.Warning); } }
+    }
+  }
+}
+
+/// THE TEAM'S LOAD, for a lead — each person's work against their capacity, what of it is at risk, whether they are
+/// on, away and who covers; the busiest first. A lead marks a person away (their work goes to cover or back to the
+/// queue) or brings them back from here.
+[Composable]
+public component TeamLoad() {
+  List<TeamRow> rows = [];
+  bool loaded = false;
+  string menu = "";
+  string problem = "";
+  live var lead = LeadsInbox;
+  on mount { rows = TeamRows(); loaded = true; }
+
+  action Toggle(Guid person) { menu = menu == person.ToString() ? "" : person.ToString(); }
+  action Close() { menu = ""; }
+  action Away(Guid person) {
+    problem = ""; menu = "";
+    try { MarkAway(Principal.Single(p => p.Id == person), DateTime.UtcNow.Date.AddDays(1).AddHours(8)); rows = TeamRows(); }
+    catch (Exception ex) { problem = ex.Message; }
+  }
+  action Back(Guid person) {
+    problem = ""; menu = "";
+    try { MarkBack(Principal.Single(p => p.Id == person)); rows = TeamRows(); }
+    catch (Exception ex) { problem = ex.Message; }
+  }
+
+  render {
+    Stack(gap: 0, role: UiRole.List, label: "Team load") {
+      if (problem != "") { Box(pb: 2) { Alert(problem, tone: Tone.Warning); } }
+      // While the team is read: the shape of the rows to come, never an empty screen that then jumps.
+      if (!loaded) { Stack(gap: 3, p: 3) { Skeleton(shape: SkeletonShape.Line); Skeleton(shape: SkeletonShape.Line); Skeleton(shape: SkeletonShape.HalfLine); } }
+      if (loaded && rows.Count == 0) { EmptyState("Nobody works a queue yet", body: "Add members to a queue to see their load here."); }
+      foreach (var r in rows) {
+        Row(gap: 3, align: Align.Center, px: 3, py: 2, borderBW: 1, border: Colors.Border, role: UiRole.ListItem,
+            label: r.Name + ", " + r.Load + " of " + r.Capacity + (r.AtRisk > 0 ? ", " + r.AtRisk + " at risk" : "")) {
+          StandingMark(r.Status, r.Away, r.OnHours);
+          Stack(gap: "2px", grow: 1, minW: "0") {
+            Text(r.Name, fontSize: FontSize.Label, fontWeight: FontWeight.Medium, whiteSpace: WhiteSpace.Nowrap,
+                 overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis, minW: "0");
+            Text(StandingWord(r.Status, r.Away, r.AwayUntil, r.OnHours) + (r.Away && r.Cover != "" ? " · " + r.Cover + " covers" : "")
+                 + (r.Queues != "" ? " · " + r.Queues : ""),
+                 fontSize: FontSize.Caption, color: r.Away ? Colors.Waiting : Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap,
+                 overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis, minW: "0");
+          }
+          if (r.AtRisk > 0) {
+            Text(r.AtRisk + " at risk", fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.Warning,
+                 whiteSpace: WhiteSpace.Nowrap);
+          }
+          Stack(gap: "3px", align: Align.End, shrink: 0, w: "64px") {
+            Text(r.Load + "/" + r.Capacity, fontFamily: Font.Mono, fontSize: FontSize.Caption, fontVariant: FontVariant.TabularNums,
+                 color: r.Load >= r.Capacity ? Colors.Warning : Colors.TextSecondary);
+            LoadMeter(r.Capacity <= 0 ? 100 : Math.Min(100, r.Load * 100 / r.Capacity), r.Load >= r.Capacity);
+          }
+          if (lead) {
+            Box(position: Position.Relative) {
+              IconButton("More for " + r.Name, () => Toggle(r.Person), size: Size.Sm, tone: Tone.Ghost) { Icon(Icons.Dots); }
+              if (menu == r.Person.ToString()) {
+                Backdrop(Close);
+                Menu(from: MenuFrom.BelowEnd, label: r.Name) {
+                  if (r.Away) { MenuItem("Bring back", () => Back(r.Person), icon: Icons.Refresh); }
+                  else { MenuItem("Mark away until tomorrow", () => Away(r.Person), icon: Icons.Calendar); }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// A person's standing as a lamp.
+[Composable]
+public component StandingMark(Presence status, bool away, bool onHours) {
+  live var look = StandingLamp(status, away, onHours);
+  render { Lamp(lit: look.Lit, tone: look.Tone, waiting: look.Waiting); }
+}
+
+/// MY ACCOUNTS — the organisations whose account team the viewer is on: tier, open, at risk, offered to them first,
+/// waiting; the busiest first. Each opens its own list (`prefix/o-<id>`).
+[Composable]
+public component MyAccountsPanel(string prefix = "/inbox") {
+  List<AccountRow> rows = [];
+  bool loaded = false;
+  on mount { rows = MyAccounts(); loaded = true; }
+  render {
+    Stack(gap: 0, role: UiRole.List, label: "Accounts I look after") {
+      if (!loaded) { Stack(gap: 3, p: 3) { Skeleton(shape: SkeletonShape.Line); Skeleton(shape: SkeletonShape.HalfLine); } }
+      if (loaded && rows.Count == 0) { EmptyState("No accounts", body: "You are on no organisation's account team."); }
+      foreach (var a in rows) {
+        Link(href: prefix + "/o-" + a.Organization, color: Colors.OnSurface) {
+          Row(gap: 3, align: Align.Center, px: 3, py: 2, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: a.Name) {
+            if (a.Offered > 0) { Lamp(live: true); } else { Lamp(lit: a.Open > 0, tone: Tone.Default); }
+            Text(a.Name, fontSize: FontSize.Label, fontWeight: FontWeight.Medium, grow: 1, minW: "0", whiteSpace: WhiteSpace.Nowrap,
+                 overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis);
+            if (a.Tier != "") {
+              Text(a.Tier, fontSize: FontSize.Caption, color: Colors.TextMuted, px: "6px", rounded: Radius.Pill, borderW: 1,
+                   border: Colors.Border, whiteSpace: WhiteSpace.Nowrap);
+            }
+            AccountFigure(a.Open, "open", Tone.Default);
+            if (a.AtRisk > 0) { AccountFigure(a.AtRisk, "at risk", Tone.Warning); }
+            if (a.Offered > 0) { AccountFigure(a.Offered, "offered", Tone.Primary); }
+            if (a.Waiting > 0) { AccountFigure(a.Waiting, "waiting", Tone.Ghost); }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// A count and its word, in mono — "3 open".
+[Composable]
+public component AccountFigure(int n, string word, Tone tone) {
+  variants {
+    base { FontFamily = Font.Mono; FontSize = FontSize.Caption; WhiteSpace = WhiteSpace.Nowrap; }
+    tone {
+      Default { Color = Colors.TextSecondary; }
+      Primary { Color = Colors.Primary; }
+      Warning { Color = Colors.Warning; }
+      Danger  { Color = Colors.Danger; }
+      Success { Color = Colors.Success; }
+      Ghost   { Color = Colors.Waiting; }
+    }
+  }
+  render { Text(n + " " + word, fontVariant: FontVariant.TabularNums); }
+}

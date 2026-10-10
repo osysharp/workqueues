@@ -1,0 +1,259 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.ServiceHours;
+using Osysharp.Workflow;
+
+// ── people: whether routing may give them work now ──────────────────────────────────────────────────────────────────
+//
+// ⚑ ROUTING READS WHAT A PERSON SAID, NEVER A SOCKET. Online is not available: a held socket is not activity, and an
+//   open tab is not consent to receive work. A person is given work when they are Available, inside their working
+//   hours (in their own zone), not away, and below their capacity.
+
+/// What a person told the inbox about themselves — what ROUTING reads.
+// ⚠ Appended, never inserted: an enum is stored by position.
+public enum Presence {
+  /// Give me work.
+  [Label("Available")] Available,
+  /// Working, but give me nothing new.
+  [Label("Busy")] Busy,
+  /// Away — my work goes to my cover, or back to the queue.
+  [Label("Away")] Away,
+  /// Not working.
+  [Label("Offline")] Offline,
+}
+
+/// A person's routing status, cover, ceiling and working hours. No row: available, around the clock, the queues'
+/// capacity.
+[Unique(Person, "They already have an availability.")]
+public entity Availability {
+  [Required] Principal Person;
+  Presence Status = Presence.Available;
+  /// When they are back, while away. None: until they say so.
+  DateTime? AwayUntil;
+  /// Who takes their work while they are away.
+  Principal? CoveredBy;
+  /// Their ceiling across every queue; none: each queue's.
+  int? Capacity;
+  /// Their working hours, in their zone — "on shift" is `ServiceHours.IsOpen(Hours, now)`. None: around the clock.
+  Osysharp.ServiceHours.ServiceHours? Hours;
+  security {
+    allow read when WorksInbox;
+    // SECURITY-INVARIANT(inbox-only-you-or-a-lead-set-your-availability): a person's status, cover, ceiling and hours
+    // are set by that person or by a lead — never by a colleague, so nobody marks somebody else away and collects their
+    // work. Guarded by tests/security.test.osy `nobody_but_you_or_a_lead_marks_you_away_or_names_your_cover`.
+    // One rule per kind of caller (`when` is who, `where` is which rows) — the floor an app may only tighten is derived
+    // per kind of caller, exactly.
+    allow create, update when WorksInbox || LeadsInbox where Person == user;
+    allow create, update when LeadsInbox;
+    allow delete when LeadsInbox;
+  }
+}
+
+/// How a person stands for routing at `now`: available, on their hours, not away.
+public bool OnDuty(Principal person, DateTime now) {
+  var a = Availability.FirstOrDefault(x => x.Person == person);
+  return OnDutyBy(a, now) && !Absence.Any(x => x.Person == person && x.State == AbsenceState.Away);
+}
+
+/// `OnDuty`, from an availability row already read (null: none — available around the clock).
+bool OnDutyBy(Availability? a, DateTime now) {
+  if (a == null) { return true; }
+  if (a.Status != Presence.Available) { return false; }
+  return ServiceHours.IsOpen(a.Hours, now);
+}
+
+// ── time away: absences, cover, and delegation ──────────────────────────────────────────────────────────────────────
+//
+// An `Absence` is time away — planned (a holiday, a course) or now (`GoAway`). Its `AbsenceFlow` reaches `From` and
+// hands the person's work over by each queue's `OnAway` rule — to their cover when the cover may hold it, otherwise
+// back to the queue — and withdraws what is offered to them; at `Until` (or `ComeBack`) they are back and are given
+// work again. Work handed to cover is NOT handed back: it has moved on, and the trail says who took it and why.
+//
+// ⚑ COVER GRANTS NO ACCESS. Cover moves an item only to somebody who may hold it, and `ActsFor` — "may this person act
+//   for that one while they are away" — is a question the app ASKS, always beside its own rule (an approver's delegate
+//   never approves their own request: `ActsFor(u, this.Item.Approver) && u != this.Item.Requester`).
+
+/// Where an absence stands — `AbsenceFlow`'s.
+// ⚠ Appended, never inserted: an enum is stored by position.
+public enum AbsenceState {
+  [Label("Planned")] Planned,
+  [Label("Away")] Away,
+  [Label("Over")] Over,
+  [Label("Cancelled")] Cancelled,
+}
+
+/// Time away. Its `AbsenceFlow` hands the person's work over at `From` and brings them back at `Until`.
+public entity Absence {
+  [Required] Principal Person;
+  DateTime From;
+  DateTime Until;
+  /// Who takes their work while they are away; none: their availability's cover, else the queue.
+  Principal? CoveredBy;
+  [MaxLength(120)] string Reason = "";
+  AbsenceState State;                                  // no default — AbsenceFlow owns it
+  security {
+    allow read when WorksInbox;
+    // SECURITY-INVARIANT(inbox-only-you-or-a-lead-set-your-availability) — time away, and who covers it, is yours or a
+    // lead's to say. Guarded by tests/security.test.osy `nobody_but_you_or_a_lead_marks_you_away_or_names_your_cover`.
+    allow create, update when WorksInbox || LeadsInbox where Person == user;
+    allow create, update when LeadsInbox;
+    allow delete when LeadsInbox;
+  }
+}
+
+/// One absence's life: it waits for `From`, hands the work over, waits for `Until`, and brings the person back.
+public workflow AbsenceFlow {
+  Tracks    = Absence.State;
+  Autostart = true;
+  Initial   = Planned;
+
+  /// Back early — or, before it starts, called off. The person's own, or a lead's.
+  [Authorize(u => u == this.Item.Person || LeadsInbox)]
+  event End();
+
+  state Planned {
+    // Starting now: away at once, in the same step that recorded it.
+    enter { if (this.Item.From <= DurableClock.UtcNow) { goto Away; } }
+    Expire { Within = TillStart(this.Item); Accrues = false; }
+    on Expire { goto Away; }
+    on End { goto Cancelled; }
+  }
+  state Away {
+    enter { HandOver(this.Item); }
+    Expire { Within = TillEnd(this.Item); Accrues = false; }
+    on Expire { goto Over; }
+    on End { goto Over; }
+  }
+  terminal success Over { enter { BackFrom(this.Item); } }
+  terminal cancel Cancelled { }
+}
+
+TimeSpan TillStart(Absence a) {
+  var left = a.From - DurableClock.UtcNow;
+  return left < TimeSpan.Zero ? TimeSpan.Zero : left;
+}
+
+TimeSpan TillEnd(Absence a) {
+  var left = a.Until - DurableClock.UtcNow;
+  return left < TimeSpan.Zero ? TimeSpan.Zero : left;
+}
+
+/// Go away now — until `until` (none: until you come back), with `cover` taking your work. Answers the absence.
+public Absence GoAway(DateTime? until = null, Principal? cover = null, string reason = "") {
+  return Away(Session.CurrentUser, until, cover, reason);
+}
+
+/// A lead marks `person` away now. (The absence's own rule refuses anybody else.)
+public Absence MarkAway(Principal person, DateTime? until = null, Principal? cover = null, string reason = "") {
+  return Away(person, until, cover, reason);
+}
+
+Absence Away(Principal person, DateTime? until, Principal? cover, string reason) {
+  var now = DateTime.UtcNow;
+  var a = new Absence { Person = person, From = now, Until = until != null ? until.Value : now.AddYears(1), CoveredBy = cover,
+                        Reason = reason };
+  UnitOfWork.Commit();
+  return a;
+}
+
+/// You are back: every live absence of yours ends, an availability marked away is available again, and you are given
+/// work again.
+public void ComeBack() { Back(Session.CurrentUser); }
+
+/// A lead brings `person` back.
+public void MarkBack(Principal person) { Back(person); }
+
+[SuppressWarning("cost-unbounded-read")]   // one person's absences
+void Back(Principal person) {
+  var now = DateTime.UtcNow;
+  var availability = Availability.FirstOrDefault(a => a.Person == person);
+  if (availability != null && availability.Status == Presence.Away) {
+    availability.Status = Presence.Available;
+    availability.AwayUntil = null;
+  }
+  UnitOfWork.Commit();
+  foreach (var a in Absence.Where(a => a.Person == person && (a.State == AbsenceState.Away
+      || (a.State == AbsenceState.Planned && a.From <= now))).ToList()) {
+    AbsenceFlow.RaiseEnd(a);
+  }
+  Refill(person, null, now);
+}
+
+/// The absence began: each held item goes by its queue's `OnAway` rule — kept, to the cover (when the cover may hold
+/// it), or back to the queue — and what is offered to the person falls through.
+[SuppressWarning("cost-unbounded-read")]   // one person's held and offered work, which their capacity bounds
+void HandOver(Absence absence) {
+  var person = absence.Person;
+  var cover = absence.CoveredBy != null ? absence.CoveredBy : CoverOfAvailability(person);
+  foreach (var item in WorkItem.Where(w => w.Assignee == person && w.Handling != Handling.Done
+      && w.Handling != Handling.Closed && w.Handling != Handling.Cancelled).Include(w => w.Queue).ToList()) {
+    if (item.Queue == null || item.Queue.OnAway == AwayRule.Keep) { continue; }
+    // SECURITY-INVARIANT(inbox-cover-grants-no-access): work goes to cover ONLY when the cover may hold it — a
+    // restricted item, or one needing a skill the cover lacks, goes back to its queue instead; cover is never a way
+    // into work somebody may not hold. Guarded by tests/security.test.osy `cover_hands_work_only_to_someone_who_may_hold_it`.
+    if (item.Queue.OnAway == AwayRule.ToCover && cover != null && MayHold(cover!, item)) {
+      Hand(item, cover!, AssignReason.Cover, absence.Until);
+    } else {
+      item.Assignee = null;
+      // Released by nobody, with the date they are back: "Ines is away until … — back to Billing."
+      var back = new Assignment { Item = item, Step = NextStep(item), From = person, FromQueue = item.Queue, ToQueue = item.Queue,
+                                  Reason = AssignReason.Released, Until = absence.Until, At = DurableClock.UtcNow };
+      Raise(new HolderChanged { Item = item, Step = StepOf(back) });
+      Distribute(item, null, person.Id);
+    }
+  }
+  foreach (var item in WorkItem.Where(w => w.OfferedTo == person).ToList()) {
+    Withdraw(item, Unavailability.Away, absence.Until);
+  }
+}
+
+/// The absence is over: the person is given work again. What cover took stays with the cover.
+void BackFrom(Absence absence) { Refill(absence.Person); }
+
+/// The cover named on `person`'s availability, or null.
+Principal? CoverOfAvailability(Principal person) {
+  var a = Availability.FirstOrDefault(x => x.Person == person);
+  return a == null ? null : a.CoveredBy;
+}
+
+/// Put `item` on `to` — the inbox's own move (cover), recorded with `reason` and, for an absence, until when its holder
+/// is away. Refused for anybody who may not hold it. The cover is told, in the words the trail says it in.
+void Hand(WorkItem item, Principal to, AssignReason reason, DateTime? until) {
+  // SECURITY-INVARIANT(inbox-work-goes-only-to-who-may-hold-it) — the inbox's own moves ask too.
+  if (!MayHold(to, item)) { return; }
+  var from = item.Assignee;
+  item.Assignee = to;
+  var step = new Assignment { Item = item, Step = NextStep(item), From = from, To = to, FromQueue = item.Queue, ToQueue = item.Queue,
+                              Reason = reason, Until = until, At = DurableClock.UtcNow };
+  Raise(new HolderChanged { Item = item, Step = StepOf(step), Told = to });
+}
+
+/// Does `u` act for `p` — is it `p`, or is `u` covering for `p` while `p` is away? What delegation reads, ALWAYS beside
+/// the app's own rule: `Candidates = u => ActsFor(u, this.Item.Approver) && u != this.Item.Requester`.
+policy ActsFor(Principal u, Principal? p) =>
+  p != null && (u == p
+    || Absence.Any(a => a.Person == p && a.CoveredBy == u && a.State == AbsenceState.Away)
+    || Availability.Any(a => a.Person == p && a.Status == Presence.Away && a.CoveredBy == u));
+
+// ── follow-the-sun ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Halfway to the first-response target: an item whose holder is off their hours (or away) goes to the least loaded
+/// member of its queue who is on theirs — so a promise made at 17:55 is not kept waiting for tomorrow's shift.
+void CoverIfOffHours(WorkItem item) {
+  if (item.Assignee == null || item.Queue == null || !item.Queue.CoverOffHours) { return; }
+  var holder = item.Assignee!;
+  if (OnDuty(holder, DurableClock.UtcNow)) { return; }
+  var cover = Choose(item, item.Queue, Distribution.LeastLoaded, holder.Id);
+  if (cover == null) { return; }
+  Give(item, cover, AssignReason.OffHoursCover);
+}
+
+/// When, from now, half of what is left of the first-response promise has passed — the follow-the-sun check. Null: no
+/// promise, nobody holds it, or the queue does not cover off hours.
+TimeSpan? OffHoursCheckIn(WorkItem item) {
+  if (item.Queue == null || !item.Queue.CoverOffHours) { return null; }
+  var left = Left(item, SlaMetric.FirstResponse);
+  if (left == null) { return null; }
+  return TimeSpan.FromTicks(left.Value.Ticks / 2);
+}

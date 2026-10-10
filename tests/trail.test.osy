@@ -1,0 +1,47 @@
+// WHY IS THIS HERE, IN THE READER'S LANGUAGE — a step of an item's trail is a row of FACTS (who had it, who
+// has it, which queue, why), and what the inbox tells the app is the same facts; both are said when they are READ, so
+// one trail reads in English to one reader and in Swedish to the next.
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using InboxKitTests;
+
+[Test(Desk)]
+void the_trail_keeps_facts_and_is_said_in_the_readers_language() {
+  runas (Lena) {
+    var r = Ask("Refund question");
+    HandWorkTo(r, PersonNamed("Ines"));
+    MoveWork(r, QueueOf("Billing"));                                 // Ines is not in Billing: it is unheld there
+    Workflow.Settle(r);
+    var moved = TrailOf(r)[2];
+    // The step is facts — from whom, to nobody, by whom, into which queue — and no sentence at all.
+    Assert.Equal(AssignReason.Moved, moved.Reason);
+    Assert.Equal("Ines", moved.From!.DisplayName);
+    Assert.Null(moved.To);
+    Assert.Equal("Lena", moved.By!.DisplayName);
+    Assert.Equal("Billing", moved.ToQueue!.Name);
+    Assert.Equal("Moved to Billing by Lena. Ines is not in Billing, so it is unheld.", Said(moved));
+    // The same row, read by a Swedish reader.
+    Session.SetLanguage("sv");
+    Assert.Equal("Flyttat till Billing av Lena. Ines är inte med i Billing, så ingen har det nu.", Said(moved));
+    Assert.Equal("Flyttat till Billing av Lena. Ines är inte med i Billing, så ingen har det nu.", TrailLines(r)[2].Text);
+    Session.SetLanguage("en");
+  }
+}
+
+/// What the inbox tells the app is an event of facts too — who and where — which the app keeps and has the inbox say
+/// when it is read (`InboxStepWords`): a Swedish reader reads the app's copy in Swedish.
+[Test(Desk)]
+[runas(Ines)]
+void what_the_app_is_told_is_facts_it_can_say_in_any_language() {
+  var r = Ask("Printer offline");
+  TakeWork(r);
+  Workflow.Settle(r);
+  var told = StepHeard(r, "inbox.holder-changed");
+  Assert.Equal("Ines", told.To);
+  Assert.Equal(AssignReason.Claimed, told.Reason);
+  Assert.Equal("Ines took it.", InboxStepWords(told));
+  Session.SetLanguage("sv");
+  Assert.Equal("Ines tog ärendet.", InboxStepWords(told));
+  Session.SetLanguage("en");
+}

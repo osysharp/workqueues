@@ -1,0 +1,164 @@
+// THE TEST DESK — who works it, the hours it keeps, the tiers its customers are on, and the promises it makes.
+//
+//   Ines, Rahul, Mateo  agents (Mateo speaks Spanish; Rahul knows Databases)    Lena  lead    Ada  inbox admin
+//   Olivia       requester at Larkspur (Standard tier)        Dev  requester at Orbit Labs (Enterprise tier)
+//
+// Promises (the most specific match wins):
+//   Standard            any item                        business hours  first 8h · next 8h · resolution 24h
+//   Urgent              Urgent                          business hours  first 1h · next 2h · resolution 8h
+//   Enterprise          Enterprise tier                 around the clock first 2h · next 4h · resolution 12h
+//   Enterprise urgent   Urgent + Enterprise tier        around the clock first 30m · next 1h · resolution 4h
+//   Vendor work         kind "vendor" — waiting on others pauses resolution    around the clock, resolution 12h
+//   Spend               kind "spend" — "decide by"       business hours  first 8h · resolution 16h
+//
+// Business hours: Mon–Fri 09:00–17:00 Europe/Stockholm, closed on Midsummer Eve (Fri 19 June 2026).
+//
+// Queues: Support (the default, the pool) — Ines, Rahul, Lena · Billing — Rahul, Lena · Security (restricted) — Lena ·
+//         Rota (round robin) — Ines, Mateo, Rahul · Floor (least loaded) — Ines, Mateo, Rahul.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+using InboxKitTests;
+
+[TestFixture]
+void Desk() {
+  var ines = new Person { Email = "ines@desk.test", DisplayName = "Ines", CodeHash = Security.HashPassword("1111") };
+  new RoleGrant { Member = ines, Role = AppRole.Agent };
+  var rahul = new Person { Email = "rahul@desk.test", DisplayName = "Rahul", CodeHash = Security.HashPassword("2222") };
+  new RoleGrant { Member = rahul, Role = AppRole.Agent };
+  var lena = new Person { Email = "lena@desk.test", DisplayName = "Lena", CodeHash = Security.HashPassword("3333") };
+  new RoleGrant { Member = lena, Role = AppRole.Lead };
+  var ada = new Person { Email = "ada@desk.test", DisplayName = "Ada", CodeHash = Security.HashPassword("4444") };
+  new RoleGrant { Member = ada, Role = AppRole.Admin };
+  var mateo = new Person { Email = "mateo@desk.test", DisplayName = "Mateo", CodeHash = Security.HashPassword("7777") };
+  new RoleGrant { Member = mateo, Role = AppRole.Agent };
+  var olivia = new Person { Email = "olivia@larkspur.test", DisplayName = "Olivia", CodeHash = Security.HashPassword("5555") };
+  new RoleGrant { Member = olivia, Role = AppRole.Requester };
+  var dev = new Person { Email = "dev@orbit.test", DisplayName = "Dev", CodeHash = Security.HashPassword("6666") };
+  new RoleGrant { Member = dev, Role = AppRole.Requester };
+
+  var standard = new OrganizationTier { Name = "Standard", Rank = 1, IsDefault = true };
+  var enterprise = new OrganizationTier { Name = "Enterprise", Rank = 3 };
+  var larkspur = new Company { Name = "Larkspur", Tier = standard };
+  var orbit = new Company { Name = "Orbit Labs", Tier = enterprise };
+  new Company { Name = "Acme", Tier = enterprise };                 // its account team is each test's own
+  new Membership { Organization = larkspur, Member = olivia };
+  new Membership { Organization = orbit, Member = dev };
+
+  var business = new ServiceHours { Name = "Business hours", Zone = Zone.Of("Europe/Stockholm") };
+  foreach (var d in new List<DayOfWeek> { DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday, DayOfWeek.Friday }) {
+    new ServiceWindow { ServiceHours = business, Day = d, Start = TimeSpan.FromHours(9), End = TimeSpan.FromHours(17) };
+  }
+  new ServiceException { ServiceHours = business, From = new DateTime(2026, 6, 19), To = new DateTime(2026, 6, 20),
+                         IsClosed = true, Reason = "Midsummer Eve" };
+
+  // Queues: Support (the default) — Ines, Rahul, Lena; Billing — Rahul, Lena; Security (restricted) — Lena. Ada, the
+  // inbox admin, is in none: she sees every queue, and may hold nothing until somebody adds her.
+  var support = new Queue { Name = "Support", Position = 1 };
+  var billing = new Queue { Name = "Billing", Position = 2 };
+  var security = new Queue { Name = "Security", Position = 3, Restricted = true };
+  new QueueMember { Queue = support, Member = ines };
+  new QueueMember { Queue = support, Member = rahul };
+  new QueueMember { Queue = support, Member = lena };
+  new QueueMember { Queue = billing, Member = rahul };
+  new QueueMember { Queue = billing, Member = lena };
+  new QueueMember { Queue = security, Member = lena };
+  var rota = new Queue { Name = "Rota", Position = 4, Distribution = Distribution.RoundRobin };
+  var floor = new Queue { Name = "Floor", Position = 5, Distribution = Distribution.LeastLoaded };
+  foreach (var p in new List<Person> { ines, mateo, rahul }) {
+    new QueueMember { Queue = rota, Member = p };
+    new QueueMember { Queue = floor, Member = p };
+  }
+
+  var spanish = new RoutingSkill { Name = "Spanish", Kind = SkillKind.Language, Code = "es" };
+  var databases = new RoutingSkill { Name = "Databases" };
+  new HeldSkill { Person = mateo, Skill = spanish, Level = 3 };
+  new HeldSkill { Person = rahul, Skill = databases };
+
+  Promise("Standard", null, null, "", business, false, TimeSpan.FromHours(8), TimeSpan.FromHours(8), TimeSpan.FromHours(24), 10);
+  Promise("Urgent", WorkPriority.Urgent, null, "", business, false, TimeSpan.FromHours(1), TimeSpan.FromHours(2), TimeSpan.FromHours(8), 5);
+  Promise("Enterprise", null, enterprise, "", null, false, TimeSpan.FromHours(2), TimeSpan.FromHours(4), TimeSpan.FromHours(12), 4);
+  Promise("Enterprise urgent", WorkPriority.Urgent, enterprise, "", null, false, TimeSpan.FromMinutes(30), TimeSpan.FromHours(1), TimeSpan.FromHours(4), 1);
+  Promise("Vendor work", null, null, "vendor", null, true, null, null, TimeSpan.FromHours(12), 3);
+  Promise("Spend", null, null, "spend", business, false, TimeSpan.FromHours(8), null, TimeSpan.FromHours(16), 2);
+}
+
+void Promise(string name, WorkPriority? priority, OrganizationTier? tier, string kind, ServiceHours? hours,
+             bool pauseOnOthers, TimeSpan? first, TimeSpan? next, TimeSpan? resolution, int position) {
+  var p = new SlaPolicy { Name = name, Priority = priority, Tier = tier, Kind = kind, Hours = hours,
+                          PauseWhileWaitingOnOthers = pauseOnOthers, Position = position };
+  if (first != null) { new SlaTarget { Policy = p, Metric = SlaMetric.FirstResponse, Within = first.Value }; }
+  if (next != null) { new SlaTarget { Policy = p, Metric = SlaMetric.NextResponse, Within = next.Value }; }
+  if (resolution != null) { new SlaTarget { Policy = p, Metric = SlaMetric.Resolution, Within = resolution.Value }; }
+}
+
+principal Ines => Person.Single(p => p.Email == "ines@desk.test");
+principal Rahul => Person.Single(p => p.Email == "rahul@desk.test");
+principal Lena => Person.Single(p => p.Email == "lena@desk.test");
+principal Ada => Person.Single(p => p.Email == "ada@desk.test");
+principal Mateo => Person.Single(p => p.Email == "mateo@desk.test");
+principal Olivia => Person.Single(p => p.Email == "olivia@larkspur.test");
+principal Dev => Person.Single(p => p.Email == "dev@orbit.test");
+
+Person PersonNamed(string name) { return Person.Single(p => p.DisplayName == name); }
+Company CompanyNamed(string name) { return Company.Single(c => c.Name == name); }
+
+/// `org`'s account team: its owner, its backup (or "" for none), and its pod. An admin's to say (`ManagesOrganizations`).
+void Team(string org, string owner, string backup, List<string> pod) {
+  var company = CompanyNamed(org);
+  new AccountTeamMember { Organization = company, Member = PersonNamed(owner), Role = AccountTeamRole.Owner };
+  if (backup != "") { new AccountTeamMember { Organization = company, Member = PersonNamed(backup), Role = AccountTeamRole.Backup }; }
+  foreach (var name in pod) { new AccountTeamMember { Organization = company, Member = PersonNamed(name), Role = AccountTeamRole.Member }; }
+  UnitOfWork.Commit();
+}
+
+/// The newest offer made on `item`.
+RoutingOffer OfferOf(WorkItem item) {
+  return RoutingOffer.Where(o => o.Item.Id == item.Id).OrderByDescending(o => o.At).First();
+}
+
+/// Who `item` is offered to now — "Nobody" when it is not offered.
+string OfferedOf(WorkItem item) {
+  var w = WorkItem.Single(x => x.Id == item.Id);
+  return w.OfferedTo == null ? "Nobody" : w.OfferedTo.DisplayName;
+}
+
+/// A request from Olivia (Larkspur) or, with `org: "Orbit Labs"`, from Dev — and the inbox's run started on it.
+Request Ask(string title, string org = "Larkspur", WorkPriority priority = WorkPriority.Normal, string kind = "",
+            string queue = "", string body = "", string language = "") {
+  var company = CompanyNamed(org);
+  var requester = org == "Larkspur" ? PersonNamed("Olivia") : PersonNamed("Dev");
+  var r = new Request { Title = title, Organization = company, Requester = requester, Priority = priority, Kind = kind,
+                        Body = body, Language = language };
+  if (queue != "") { r.Queue = QueueOf(queue); }
+  Workflow.Settle(r);
+  return r;
+}
+
+Queue QueueOf(string name) { return Queue.Single(q => q.Name == name); }
+
+/// The titles of a list, sorted — what a view holds, as a test compares it.
+string Titles(List<WorkRow> rows) { return string.Join(", ", rows.Select(r => r.Title).OrderBy(t => t).ToList()); }
+
+/// The reasons on an item's trail, in order.
+string Trail(WorkItem item) { return string.Join(" → ", TrailOf(item).Select(a => a.Reason.ToString()).ToList()); }
+
+/// The `cycle`th clock of `metric` on `item`.
+SlaClock ClockOf(WorkItem item, SlaMetric metric, int cycle = 1) {
+  return SlaClock.Single(c => c.Item.Id == item.Id && c.Metric == metric && c.Cycle == cycle);
+}
+
+/// Two spans of time within half a minute of each other — a test's clock runs on while a test runs.
+bool About(TimeSpan a, TimeSpan b) { return a - b < TimeSpan.FromSeconds(30) && b - a < TimeSpan.FromSeconds(30); }
+
+/// Who holds `item` now — "Nobody" when nobody does.
+string HolderOf(WorkItem item) {
+  var w = WorkItem.Single(x => x.Id == item.Id);
+  return w.Assignee == null ? "Nobody" : w.Assignee.DisplayName;
+}
+
+/// What the kit told the app about `item`, by kind.
+bool WasTold(WorkItem item, string kind) { return Told.Any(t => t.Item == item.Id && t.Kind == kind); }

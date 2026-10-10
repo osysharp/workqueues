@@ -1,0 +1,689 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.ServiceHours;
+
+// ── the inbox's settings, on the floor's settings area ───────────────────────────────────────────────────────────────
+//
+// Each is a whole settings PAGE, and the kit serves each at its route in the app's `SettingsFrame` (announced by
+// `InboxSettingsSections`, below); an app may still place one in a page of its own. Sections on the left of their controls, nothing saved until Save (the `SaveBar`), undo back to the last change. The
+// rows are the inbox admins' (SECURITY-INVARIANT inbox-service-levels-are-the-admins) — anybody else sees the page
+// locked, with the reason, and the server refuses the write whatever the page shows.
+
+/// The inbox's part of the app's settings area: its six sections, announced — discovered by
+/// `SettingsArea()`, never wired. Leads see what they change (who works a queue, who has a skill); admins see all six.
+/// Each page below is gated on its own; an app takes one over by declaring a component of the same name with its own
+/// `[Route]` (a helpdesk's `RoutingSettings` naming its own rule action).
+public class InboxSettingsSections : ISettingsProvider {
+  public SettingsLink[] Sections() {
+    return [
+      new SettingsLink { Label = "Queues", To = "/settings/queues", Group = "Inbox", Icon = Icons.Inbox, Order = 20,
+                         Shown = AdministersInbox || LeadsInbox, Hint = "Where work waits, who works each queue, and how it is handed out." },
+      new SettingsLink { Label = "Routing", To = "/settings/routing", Group = "Inbox", Icon = Icons.Merge, Order = 21,
+                         Shown = AdministersInbox, Hint = "Where new work goes, how urgent it is, and what it is tagged." },
+      new SettingsLink { Label = "Skills", To = "/settings/skills", Group = "Inbox", Icon = Icons.Star, Order = 22,
+                         Shown = AdministersInbox || LeadsInbox, Hint = "What work can need — a product, a language — and who has it." },
+      new SettingsLink { Label = "Shared views", To = "/settings/views", Group = "Inbox", Icon = Icons.Filter, Order = 23,
+                         Shown = AdministersInbox, Hint = "Views the whole team sees in the rail." },
+      new SettingsLink { Label = "SLA policies", To = "/settings/sla", Group = "Service", Icon = Icons.Timer, Order = 30,
+                         Shown = AdministersInbox, Hint = "How fast each priority and tier is answered." },
+      new SettingsLink { Label = "Business hours", To = "/settings/hours", Group = "Service", Icon = Icons.Clock, Order = 31,
+                         Shown = AdministersInbox, Hint = "When the promises' clocks run, and the holidays they stop for." },
+    ];
+  }
+}
+
+[Route("/settings/queues")] [Layout(SettingsFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Queues")]
+public component QueuesSettings() { render { QueueSettings(); } }
+
+[Route("/settings/routing")] [Layout(SettingsFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Routing")]
+public component RoutingSettings() { render { RoutingRuleSettings(); } }
+
+[Route("/settings/skills")] [Layout(SettingsFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Skills")]
+public component SkillsSettings() { render { SkillSettings(); } }
+
+[Route("/settings/views")] [Layout(SettingsFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Shared views")]
+public component ViewSettings() { render { SharedViewSettings(); } }
+
+[Route("/settings/sla")] [Layout(SettingsFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("SLA policies")]
+public component SlaSettings() { render { SlaPolicySettings(); } }
+
+[Route("/settings/hours")] [Layout(SettingsFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Business hours")]
+public component HoursSettings() { render { BusinessHoursSettings(); } }
+
+/// Minutes, as a person types them, from a budget.
+public int MinutesOf(TimeSpan t) { return Convert.ToInt(Math.Round(t.TotalMinutes)); }
+
+/// A budget in hours, to two places — what a policy's times are edited in.
+public decimal HoursOf(TimeSpan? t) { return t == null ? 0 : Convert.ToDecimal(Math.Round(t.Value.TotalMinutes / 60.0 * 100.0) / 100.0); }
+
+/// QUEUES — where work waits: each queue's name, whether it is restricted, its level and the level above it, how it hands
+/// work out, its timers and hours, what happens to a member's work when they go away — and who works it.
+[Composable]
+public component QueueSettings() {
+  live var admin = AdministersInbox;
+  live var lead = LeadsInbox;
+  live var queues = Queue.Include(q => q.EscalatesTo).Include(q => q.Hours).OrderBy(q => q.Level).ThenBy(q => q.Position)
+    .ThenBy(q => q.Name).ToList();
+  live var members = QueueMember.Include(m => m.Member).Include(m => m.Queue).OrderBy(m => m.Member.DisplayName).ToList();
+  live var calendars = Osysharp.ServiceHours.ServiceHours.OrderBy(h => h.Name).ToList();
+  // Who could be added: everybody who already works a queue. Somebody new is added by their address.
+  live var workers = Principal.Where(p => QueueMember.Any(m => m.Member == p)).OrderBy(p => p.DisplayName).ToList();
+  Queue? timing = null;
+  int pickup = 0;
+  int language = 10;
+  int offer = 15;
+  string adding = "";
+  string problem = "";
+  Principal? picked = null;
+  // ONE queue open at a time: the page reads as the queues and who works them, and opens to the one being changed.
+  Guid opened = Guid.Empty;
+  action Open(Queue q) { opened = opened == q.Id ? Guid.Empty : q.Id; picked = null; adding = ""; }
+
+  action AddQueue() { UnitOfWork.Mark("Add a queue"); new Queue { Name = "New queue", Position = queues.Count }; }
+  action Timers(Queue q) {
+    timing = q;
+    pickup = q.PickupWithin == null ? 0 : MinutesOf(q.PickupWithin.Value);
+    language = MinutesOf(q.LanguageWait);
+    offer = MinutesOf(q.OfferFor);
+  }
+  action ApplyTimers() {
+    if (timing == null) { return; }
+    UnitOfWork.Mark("Change the timers of " + timing.Name);
+    timing.PickupWithin = pickup <= 0 ? null : TimeSpan.FromMinutes(pickup);
+    timing.LanguageWait = TimeSpan.FromMinutes(Math.Max(0, language));
+    timing.OfferFor = TimeSpan.FromMinutes(Math.Max(1, offer));
+    timing = null;
+  }
+  action CloseTimers() { timing = null; }
+  action AddPicked(Queue q) {
+    problem = "";
+    if (picked == null) { problem = "Choose somebody to add."; return; }
+    if (members.Any(m => m.Queue.Id == q.Id && m.Member.Id == picked.Id)) { problem = picked.DisplayName + " already works " + q.Name + "."; return; }
+    UnitOfWork.Mark("Add " + picked.DisplayName + " to " + q.Name);
+    new QueueMember { Queue = q, Member = picked };
+    picked = null;
+  }
+  action AddByAddress(Queue q) {
+    problem = "";
+    var email = adding.Trim().ToLower();
+    var p = Principal.FirstOrDefault(x => x.Email == email);
+    if (p == null) { problem = "Nobody signs in as " + adding.Trim() + " — invite them first."; return; }
+    UnitOfWork.Mark("Add " + p.DisplayName + " to " + q.Name);
+    new QueueMember { Queue = q, Member = p };
+    adding = "";
+  }
+  action RemoveMember(QueueMember m) { UnitOfWork.Mark("Remove " + m.Member.DisplayName); m.Delete(); }
+
+  render {
+    SettingsPage("Queues", description: "Where work waits, and who works it. An item lands in the queue a rule or the app names; a queue gives it out by its distribution, within each member's capacity.") {
+      foreach (var q in queues) {
+        SettingsSection(q.Name, description: q.Restricted ? "Restricted — only its members and inbox admins see its work." : "Level " + q.Level,
+                        locked: !admin && !lead, lockedBecause: "Only inbox admins change queues; leads change who works them.") {
+          // At a glance: how it hands work out, its hours, and who works it.
+          Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap) {
+            Text(q.Distribution.Label + " · " + (q.Hours == null ? "around the clock" : q.Hours.Name)
+                 + (q.EscalatesTo == null ? "" : " · escalates to " + q.EscalatesTo.Name),
+                 fontSize: FontSize.Caption, color: Colors.TextSecondary, grow: 1);
+            Row(gap: "-6px", align: Align.Center, label: "Who works " + q.Name) {
+              foreach (var m in members.Where(x => x.Queue.Id == q.Id && x.Active).Take(6)) {
+                Box(label: m.Member.DisplayName) { Avatar(InitialsOf(m.Member.DisplayName), size: Size.Sm); }
+              }
+            }
+            Text(members.Count(x => x.Queue.Id == q.Id && x.Active) + " working it", fontFamily: Font.Mono,
+                 fontSize: FontSize.Caption, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap);
+            Button(opened == q.Id ? "Close" : "Change", onPress: () => Open(q), tone: Tone.Ghost, size: Size.Sm,
+                   announceAs: (opened == q.Id ? "Close " : "Change ") + q.Name);
+          }
+          if (opened == q.Id) {
+          Stack(gap: 3, animation: KitArrive) {
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(grow: 1, minW: "180px") { Field("Name", value: q.Name, disabled: !admin); }
+            Stack(w: "96px") { NumberField("Level", value: q.Level, min: 1, max: 9, disabled: !admin); }
+            Stack(minW: "180px") {
+              Dropdown("Escalates to", value: q.EscalatesTo, options: queues.Where(x => x.Id != q.Id).ToArray(),
+                       placeholder: "Nowhere — the top", disabled: !admin) { x => Text(x.Name); }
+            }
+          }
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(minW: "200px") { Dropdown("Hands work out", value: q.Distribution, disabled: !admin); }
+            Stack(w: "140px") { NumberField("Capacity each", value: q.DefaultCapacity, min: 1, max: 999, disabled: !admin); }
+            Stack(minW: "200px") { Dropdown("When a member goes away", value: q.OnAway, disabled: !admin); }
+          }
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(minW: "200px") {
+              Dropdown("Working hours", value: q.Hours, options: calendars.ToArray(), placeholder: "Around the clock",
+                       disabled: !admin) { h => Text(h.Name); }
+            }
+            Switch("Restricted", value: q.Restricted, disabled: !admin);
+            Switch("Follow the sun", value: q.CoverOffHours, disabled: !admin);
+          }
+          Row(gap: 2, align: Align.Center) {
+            Text("Pickup " + (q.PickupWithin == null ? "never chased" : BudgetWords(q.PickupWithin.Value)) + " · language wait "
+                 + BudgetWords(q.LanguageWait) + " · offers " + BudgetWords(q.OfferFor),
+                 fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted, grow: 1);
+            Button("Timers", onPress: () => Timers(q), tone: Tone.Ghost, size: Size.Sm, disabled: !admin,
+                   announceAs: "Timers of " + q.Name);
+          }
+          Text("Who works it", fontWeight: FontWeight.Medium, pt: 2);
+          Stack(gap: 0, role: UiRole.List, label: "Members of " + q.Name) {
+            if (members.Count(m => m.Queue.Id == q.Id) == 0) {
+              Text("Nobody yet — its work waits in the pool.", fontSize: FontSize.Caption, color: Colors.TextMuted);
+            }
+            foreach (var m in members.Where(x => x.Queue.Id == q.Id)) {
+              Row(gap: 3, align: Align.Center, py: 1, borderBW: 1, border: Colors.Border, role: UiRole.ListItem,
+                  label: m.Member.DisplayName) {
+                Avatar(InitialsOf(m.Member.DisplayName), size: Size.Sm);
+                Text(m.Member.DisplayName, grow: 1, minW: "0");
+                Switch("Active", value: m.Active);
+                IconButton("Remove " + m.Member.DisplayName + " from " + q.Name, () => RemoveMember(m), tone: Tone.Ghost,
+                           size: Size.Sm) { Icon(Icons.Close); }
+              }
+            }
+          }
+          Row(gap: 2, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(minW: "220px") {
+              Dropdown("Add a member", value: picked, options: workers.Where(p => !members.Any(m => m.Queue.Id == q.Id
+                         && m.Member.Id == p.Id)).ToArray(), placeholder: "Somebody on the team") { p => Text(p.DisplayName); }
+            }
+            Button("Add", onPress: () => AddPicked(q), tone: Tone.Ghost, size: Size.Sm, announceAs: "Add the chosen person to " + q.Name);
+            Stack(grow: 1, minW: "200px") { Field("…or by address", value: adding, placeholder: "name@company.com"); }
+            Button("Add by address", onPress: () => AddByAddress(q), tone: Tone.Ghost, size: Size.Sm, announceAs: "Add to " + q.Name + " by address");
+          }
+          }
+          }
+        }
+      }
+      if (problem != "") { Alert(problem, tone: Tone.Warning); }
+      if (admin) { Row { Button("Add a queue", onPress: AddQueue, tone: Tone.Ghost, size: Size.Sm); } }
+      SaveBar(saved: "Queues saved.");
+    }
+    if (timing != null) {
+      Dialog("Timers of " + timing.Name, onDismiss: CloseTimers, subtitle: "In minutes.") {
+        NumberField("Tell the leads when nobody has picked it up after", value: pickup, min: 0, unit: "min", hint: "0: never.");
+        NumberField("Only speakers of its language for", value: language, min: 0, unit: "min");
+        NumberField("An account offer waits, in the queue's hours", value: offer, min: 1, unit: "min");
+        Row(gap: 2, justify: Justify.End) {
+          Button("Cancel", onPress: CloseTimers, tone: Tone.Ghost);
+          Button("Use these timers", onPress: ApplyTimers, tone: Tone.Primary);
+        }
+      }
+    }
+  }
+}
+
+/// A policy's conditions in words — "Urgent · Enterprise · Billing" — or "every item" for the catch-all.
+public string ConditionsOf(SlaPolicy p) {
+  var parts = new List<string>();
+  if (p.Priority != null) { parts.Add(p.Priority.Value.Label); }
+  if (p.Tier != null) { parts.Add(p.Tier.Name); }
+  if (p.Queue != null) { parts.Add(p.Queue.Name); }
+  if (p.Channel != "") { parts.Add("via " + p.Channel); }
+  if (p.Segment != "") { parts.Add(p.Segment); }
+  if (p.Kind != "") { parts.Add(p.Kind); }
+  if (p.ForVip) { parts.Add("VIPs"); }
+  return parts.Count == 0 ? "every item" : string.Join(" · ", parts);
+}
+
+/// SLA POLICIES — what an item is promised: each policy's conditions (the most specific match wins), its three targets,
+/// the hours they count in, when a clock goes at risk, and what each clock does when it is at risk or breached. A tester
+/// answers "which policy applies to an item like this?" before anything is saved.
+[Composable]
+public component SlaPolicySettings() {
+  live var admin = AdministersInbox;
+  live var policies = SlaPolicy.Include(p => p.Tier).Include(p => p.Queue).Include(p => p.Hours)
+    .OrderBy(p => p.Position).ThenBy(p => p.Name).ToList();
+  live var targets = SlaTarget.Include(t => t.Policy).ToList();
+  live var tiers = OrganizationTier.OrderBy(t => t.Rank).ToList();
+  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Name).ToList();
+  live var calendars = Osysharp.ServiceHours.ServiceHours.OrderBy(h => h.Name).ToList();
+  SlaPolicy? editing = null;
+  // ONE policy open at a time: the page reads as the list of promises, and opens to the fields of the one being changed.
+  Guid opened = Guid.Empty;
+  action Open(SlaPolicy p) { opened = opened == p.Id ? Guid.Empty : p.Id; }
+  // The steps are drawn only under the policy that is open, so only its steps are read — none while every policy is
+  // closed, and never every step in the table.
+  live var escalations = SlaEscalation.Where(e => e.Policy.Id == opened).Include(e => e.MoveTo).ToList();
+  decimal first = 0;
+  decimal next = 0;
+  decimal resolve = 0;
+  // The tester.
+  WorkPriority tryPriority = WorkPriority.Normal;
+  OrganizationTier? tryTier = null;
+  Queue? tryQueue = null;
+  string tryChannel = "";
+  bool tryVip = false;
+  string answer = "";
+
+  action Edit(SlaPolicy p) {
+    editing = p;
+    first = HoursOf(targets.Where(t => t.Policy.Id == p.Id && t.Metric == SlaMetric.FirstResponse).Select(t => t.Within).FirstOrDefault());
+    next = HoursOf(targets.Where(t => t.Policy.Id == p.Id && t.Metric == SlaMetric.NextResponse).Select(t => t.Within).FirstOrDefault());
+    resolve = HoursOf(targets.Where(t => t.Policy.Id == p.Id && t.Metric == SlaMetric.Resolution).Select(t => t.Within).FirstOrDefault());
+  }
+  action Apply() {
+    if (editing == null) { return; }
+    UnitOfWork.Mark("Change the times of " + editing.Name);
+    SetTarget(editing, SlaMetric.FirstResponse, first);
+    SetTarget(editing, SlaMetric.NextResponse, next);
+    SetTarget(editing, SlaMetric.Resolution, resolve);
+    editing = null;
+  }
+  void SetTarget(SlaPolicy p, SlaMetric metric, decimal hours) {
+    var t = targets.FirstOrDefault(x => x.Policy.Id == p.Id && x.Metric == metric);
+    if (hours <= 0) { if (t != null) { t.Delete(); } return; }
+    var within = TimeSpan.FromMinutes(Convert.ToDouble(hours) * 60.0);
+    if (t == null) { new SlaTarget { Policy = p, Metric = metric, Within = within }; } else { t.Within = within; }
+  }
+  action Cancel() { editing = null; }
+  action AddPolicy() {
+    UnitOfWork.Mark("Add a policy");
+    new SlaPolicy { Name = "New policy", Position = policies.Count };
+  }
+  action AddEscalation(SlaPolicy p) {
+    UnitOfWork.Mark("Add a step to " + p.Name);
+    new SlaEscalation { Policy = p, Metric = SlaMetric.FirstResponse, When = SlaMoment.Breached, Action = SlaAction.TellLeads };
+  }
+  action RemoveEscalation(SlaEscalation e) { UnitOfWork.Mark("Remove a step"); e.Delete(); }
+  action Try() {
+    answer = WhichPolicy(tryPriority, tryTier == null ? null : tryTier.Id, tryQueue == null ? null : tryQueue.Id, tryChannel, "", tryVip);
+  }
+
+  render {
+    SettingsPage("SLA policies", description: "What an item is promised: a first response, every next response, and resolution — counted in business hours, paused while it waits on the requester. The most specific policy that matches wins.") {
+      SettingsSection("Which policy applies?", description: "Describe an item; see the promise it would get.") {
+        Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+          Stack(minW: "140px") { Dropdown("Priority", value: tryPriority); }
+          Stack(minW: "160px") { Dropdown("Tier", value: tryTier, options: tiers.ToArray(), placeholder: "The default tier") { t => Text(t.Name); } }
+          Stack(minW: "160px") { Dropdown("Queue", value: tryQueue, options: queues.ToArray(), placeholder: "Any queue") { q => Text(q.Name); } }
+          Stack(w: "120px") { Field("Channel", value: tryChannel, placeholder: "email"); }
+          Switch("A VIP", value: tryVip);
+          Button("Which policy?", onPress: Try, tone: Tone.Primary, size: Size.Sm);
+        }
+        if (answer != "") {
+          Row(gap: 2, align: Align.Start, p: 3, rounded: Radius.Md, bg: Colors.Primary.Subtle, animation: KitArrive,
+              role: UiRole.Status) {
+            Icon(Icons.Timer, size: 16, color: Colors.Primary);
+            Text(answer, fontSize: FontSize.Label);
+          }
+        }
+      }
+      foreach (var p in policies) {
+        SettingsSection(p.Name, description: "For " + ConditionsOf(p) + (p.Active ? "" : " — switched off"),
+                        locked: !admin, lockedBecause: "Only inbox admins change what is promised.") {
+          // What it promises, at a glance — and the hours it counts in.
+          Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+            Lamp(lit: p.Active, tone: Tone.Primary);
+            Text(string.Join(" · ", targets.Where(t => t.Policy.Id == p.Id).OrderBy(t => t.Metric)
+                   .Select(t => t.Metric.Label + " " + BudgetWords(t.Within)).ToList()),
+                 fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.OnSurface, grow: 1);
+            Text(p.Hours == null ? "around the clock" : "in " + p.Hours.Name, fontSize: FontSize.Caption, color: Colors.TextMuted);
+            Button(opened == p.Id ? "Close" : "Change", onPress: () => Open(p), tone: Tone.Ghost, size: Size.Sm,
+                   announceAs: (opened == p.Id ? "Close " : "Change ") + p.Name);
+          }
+          if (opened == p.Id) {
+          Stack(gap: 3, animation: KitArrive) {
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(grow: 1, minW: "180px") { Field("Name", value: p.Name); }
+            Switch("In use", value: p.Active);
+          }
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(minW: "130px") { Dropdown("Priority", value: p.Priority, placeholder: "Any") ; }
+            Stack(minW: "150px") { Dropdown("Tier", value: p.Tier, options: tiers.ToArray(), placeholder: "Any tier") { t => Text(t.Name); } }
+            Stack(minW: "150px") { Dropdown("Queue", value: p.Queue, options: queues.ToArray(), placeholder: "Any queue") { q => Text(q.Name); } }
+            Stack(w: "110px") { Field("Channel", value: p.Channel, placeholder: "any"); }
+            Stack(w: "120px") { Field("Kind", value: p.Kind, placeholder: "any"); }
+            Switch("VIPs only", value: p.ForVip);
+          }
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(minW: "200px") {
+              Dropdown("Counted in", value: p.Hours, options: calendars.ToArray(), placeholder: "Around the clock") { h => Text(h.Name); }
+            }
+            Switch("Waiting on others pauses resolution", value: p.PauseWhileWaitingOnOthers);
+          }
+          Row(gap: 2, align: Align.Center) {
+            Text(string.Join(" · ", targets.Where(t => t.Policy.Id == p.Id).OrderBy(t => t.Metric)
+                   .Select(t => t.Metric.Label + " " + BudgetWords(t.Within)).ToList()),
+                 fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextSecondary, grow: 1);
+            Button("Times", onPress: () => Edit(p), tone: Tone.Ghost, size: Size.Sm, announceAs: "Times of " + p.Name);
+          }
+          Text("When a clock is at risk or breached", fontWeight: FontWeight.Medium, pt: 2);
+          Stack(gap: 0, role: UiRole.List, label: "Steps of " + p.Name) {
+            foreach (var e in escalations) {
+              Row(gap: 2, align: Align.End, wrap: Wrapping.Wrap, py: 1, borderBW: 1, border: Colors.Border, role: UiRole.ListItem,
+                  label: e.Metric.Label + " " + e.When.Label + ": " + e.Action.Label) {
+                Stack(minW: "150px") { Dropdown("Promise", value: e.Metric); }
+                Stack(minW: "120px") { Dropdown("When", value: e.When); }
+                Stack(minW: "170px") { Dropdown("Then", value: e.Action); }
+                if (e.Action == SlaAction.MoveTo) {
+                  Stack(minW: "150px") { Dropdown("To", value: e.MoveTo, options: queues.ToArray(), placeholder: "A queue") { q => Text(q.Name); } }
+                }
+                IconButton("Remove this step", () => RemoveEscalation(e), tone: Tone.Ghost, size: Size.Sm) { Icon(Icons.Close); }
+              }
+            }
+          }
+          Row { Button("Add a step", onPress: () => AddEscalation(p), tone: Tone.Ghost, size: Size.Sm, announceAs: "Add a step to " + p.Name); }
+          }
+          }
+        }
+      }
+      if (admin) { Row { Button("Add a policy", onPress: AddPolicy, tone: Tone.Ghost, size: Size.Sm); } }
+      SaveBar(saved: "SLA policies saved.");
+    }
+    if (editing != null) {
+      Dialog("Times of " + editing.Name, onDismiss: Cancel, subtitle: "In hours of the policy's hours. 0: not promised.") {
+        DecimalField("First response", value: first, unit: "h", min: 0);
+        DecimalField("Every next response", value: next, unit: "h", min: 0);
+        DecimalField("Resolution", value: resolve, unit: "h", min: 0);
+        Row(gap: 2, justify: Justify.End) {
+          Button("Cancel", onPress: Cancel, tone: Tone.Ghost);
+          Button("Use these times", onPress: Apply, tone: Tone.Primary);
+        }
+      }
+    }
+  }
+}
+
+/// "08:30" → 8h30m; null for anything else.
+public TimeSpan? ClockFrom(string text) {
+  var t = text.Trim();
+  if (!t.Contains(":")) { return null; }
+  var h = t.Substring(0, t.IndexOf(":"));
+  var m = t.Substring(t.IndexOf(":") + 1);
+  if (int.TryParse(h, out var hours) && int.TryParse(m, out var minutes) && hours >= 0 && hours <= 24 && minutes >= 0 && minutes < 60) {
+    return TimeSpan.FromMinutes(Convert.ToInt(hours) * 60 + Convert.ToInt(minutes));
+  }
+  return null;
+}
+
+/// 8h30m → "08:30".
+public string ClockText(TimeSpan t) {
+  var h = Convert.ToInt(Math.Floor(t.TotalHours));
+  var m = t.Minutes;
+  return (h < 10 ? "0" + h : "" + h) + ":" + (m < 10 ? "0" + m : "" + m);
+}
+
+/// BUSINESS HOURS — the calendars promises count in: each one's zone and weekly hours, and the holidays its clocks stop
+/// for. A calendar with no hours runs around the clock.
+[Composable]
+public component BusinessHoursSettings() {
+  live var admin = AdministersInbox;
+  live var calendars = Osysharp.ServiceHours.ServiceHours.OrderBy(h => h.Name).ToList();
+  live var windows = ServiceWindow.Include(w => w.ServiceHours).OrderBy(w => w.Day).ThenBy(w => w.Start).ToList();
+  // The holidays still to come: one that is over stops no clock again, so the list does not grow with every year the
+  // desk has been open. Its row is kept — the page simply does not read it.
+  live var holidays = ServiceException.Where(e => e.To >= DateTime.UtcNow.Date).Include(e => e.ServiceHours)
+    .OrderBy(e => e.From).ToList();
+  string problem = "";
+  string opens = "08:00";
+  string closes = "17:00";
+  DayOfWeek day = DayOfWeek.Monday;
+  DateOnly? holidayFrom = null;
+  DateOnly? holidayTo = null;
+  string holidayName = "";
+
+  action AddCalendar() { UnitOfWork.Mark("Add hours"); new Osysharp.ServiceHours.ServiceHours { Name = "New hours", Zone = "UTC" }; }
+  action AddWindow(Osysharp.ServiceHours.ServiceHours h) {
+    problem = "";
+    var a = ClockFrom(opens);
+    var b = ClockFrom(closes);
+    if (a == null || b == null || b.Value <= a.Value) { problem = "Write the hours like 08:00 and 17:00, the second after the first."; return; }
+    UnitOfWork.Mark("Add hours on " + day);
+    new ServiceWindow { ServiceHours = h, Day = day, Start = a.Value, End = b.Value };
+  }
+  action RemoveWindow(ServiceWindow w) { UnitOfWork.Mark("Remove hours"); w.Delete(); }
+  action AddHoliday(Osysharp.ServiceHours.ServiceHours h) {
+    problem = "";
+    if (holidayFrom == null || holidayName.Trim() == "") { problem = "A holiday needs a first day and a name."; return; }
+    UnitOfWork.Mark("Add " + holidayName.Trim());
+    var from = holidayFrom.Value.ToDateTime(TimeOnly.MinValue);
+    var to = (holidayTo ?? holidayFrom).Value.ToDateTime(TimeOnly.MinValue);
+    new ServiceException { ServiceHours = h, From = from, To = to, IsClosed = true, Reason = holidayName.Trim() };
+    holidayName = "";
+  }
+  action RemoveHoliday(ServiceException e) { UnitOfWork.Mark("Remove " + e.Reason); e.Delete(); }
+
+  render {
+    SettingsPage("Business hours", description: "The calendars promises count in. A calendar with no hours runs around the clock; a holiday stops its clocks for the days it covers.") {
+      foreach (var h in calendars) {
+        SettingsSection(h.Name, description: "Hours in " + h.Zone + ".", locked: !admin,
+                        lockedBecause: "Only inbox admins change business hours.") {
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(grow: 1, minW: "180px") { Field("Name", value: h.Name); }
+            Text("Time zone " + h.Zone, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted);
+          }
+          Stack(gap: 0, role: UiRole.List, label: h.Name + " hours") {
+            if (windows.Count(w => w.ServiceHours.Id == h.Id) == 0) {
+              Text("Around the clock — no hours set.", color: Colors.TextMuted, fontSize: FontSize.Caption);
+            }
+            foreach (var w in windows.Where(x => x.ServiceHours.Id == h.Id)) {
+              Row(gap: 3, align: Align.Center, py: 1, role: UiRole.ListItem, label: w.Day + " " + ClockText(w.Start)) {
+                Text(w.Day.ToString(), w: "120px");
+                Text(ClockText(w.Start) + "–" + ClockText(w.End), fontFamily: Font.Mono, grow: 1);
+                IconButton("Remove " + w.Day + " " + ClockText(w.Start), () => RemoveWindow(w), tone: Tone.Ghost, size: Size.Sm) {
+                  Icon(Icons.Close);
+                }
+              }
+            }
+          }
+          Row(gap: 2, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(minW: "150px") { Dropdown("Day", value: day); }
+            Stack(w: "96px") { Field("Opens", value: opens, placeholder: "08:00"); }
+            Stack(w: "96px") { Field("Closes", value: closes, placeholder: "17:00"); }
+            Button("Add hours", onPress: () => AddWindow(h), tone: Tone.Ghost, size: Size.Sm, announceAs: "Add hours to " + h.Name);
+          }
+          Text("Holidays", fontWeight: FontWeight.Medium, pt: 2);
+          foreach (var e in holidays.Where(x => x.ServiceHours.Id == h.Id)) {
+            Row(gap: 3, align: Align.Center, label: e.Reason) {
+              Text(e.Reason, grow: 1);
+              Text(e.From.ToString("d MMM yyyy") + (e.To > e.From ? " – " + e.To.ToString("d MMM") : ""), fontFamily: Font.Mono,
+                   fontSize: FontSize.Caption);
+              IconButton("Remove " + e.Reason, () => RemoveHoliday(e), tone: Tone.Ghost, size: Size.Sm) { Icon(Icons.Close); }
+            }
+          }
+          Row(gap: 2, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(minW: "160px") { DatePicker("First day", value: holidayFrom); }
+            Stack(minW: "160px") { DatePicker("Last day", value: holidayTo, clearable: true, placeholder: "Same day"); }
+            Stack(grow: 1, minW: "160px") { Field("Holiday", value: holidayName, placeholder: "New Year's Day"); }
+            Button("Add holiday", onPress: () => AddHoliday(h), tone: Tone.Ghost, size: Size.Sm, announceAs: "Add a holiday to " + h.Name);
+          }
+        }
+      }
+      if (problem != "") { Alert(problem, tone: Tone.Danger); }
+      if (admin) { Row { Button("Add business hours", onPress: AddCalendar, tone: Tone.Ghost, size: Size.Sm); } }
+      SaveBar(saved: "Business hours saved.");
+    }
+  }
+}
+
+/// A rule's conditions in words — "words “invoice|refund” · via email · Enterprise" — or "every item".
+public string RuleWhen(RoutingRule r) {
+  var parts = new List<string>();
+  if (r.TitleContains != "") { parts.Add("says “" + r.TitleContains + "”"); }
+  if (r.Channel != "") { parts.Add("via " + r.Channel); }
+  if (r.Organization != null) { parts.Add(r.Organization.Name); }
+  if (r.Tier != null) { parts.Add(r.Tier.Name); }
+  if (r.ForVip) { parts.Add("a VIP"); }
+  if (r.Language != "") { parts.Add("in " + r.Language); }
+  if (r.Segment != "") { parts.Add(r.Segment); }
+  if (r.Kind != "") { parts.Add(r.Kind); }
+  return parts.Count == 0 ? "every item" : string.Join(" · ", parts);
+}
+
+/// ROUTING RULES — in order, where an arriving item goes and what it needs: conditions (words in the title, channel,
+/// organisation, tier, VIP, language, segment, kind) and a closed set of actions (a queue, a priority, a skill, a
+/// person), plus the app's own action in the app's own words — `appAction: "Tag it", appActionHint: "refund"` for a
+/// helpdesk whose `InboxRouting.Act` tags. The first match stops, unless it says to carry on.
+[Composable]
+public component RoutingRuleSettings(string appAction = "The app's action", string appActionHint = "tag:refund") {
+  live var admin = AdministersInbox;
+  live var rules = RoutingRule.Include(r => r.ToQueue).Include(r => r.Tier).Include(r => r.Organization)
+    .Include(r => r.NeedSkill).Include(r => r.AssignTo).OrderBy(r => r.Position).ThenBy(r => r.Name).ToList();
+  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Name).ToList();
+  live var tiers = OrganizationTier.OrderBy(t => t.Rank).ToList();
+  live var skills = RoutingSkill.OrderBy(s => s.Kind).ThenBy(s => s.Name).ToList();
+  live var workers = Principal.Where(p => QueueMember.Any(m => m.Member == p)).OrderBy(p => p.DisplayName).ToList();
+
+  action AddRule() { UnitOfWork.Mark("Add a rule"); new RoutingRule { Name = "New rule", Position = rules.Count }; }
+  action Up(RoutingRule r) {
+    var above = rules.Where(x => x.Position < r.Position).OrderByDescending(x => x.Position).FirstOrDefault();
+    if (above == null) { return; }
+    UnitOfWork.Mark("Move " + r.Name + " up");
+    var p = above.Position;
+    above.Position = r.Position;
+    r.Position = p;
+  }
+  action Remove(RoutingRule r) { UnitOfWork.Mark("Remove " + r.Name); r.Delete(); }
+
+  render {
+    SettingsPage("Routing rules", description: "Where a new item goes and what it needs, in order. The first rule that matches decides, unless it says to carry on; an item no rule names goes to the default queue.") {
+      foreach (var r in rules) {
+        SettingsSection((r.Position + 1) + ". " + r.Name, description: "When " + RuleWhen(r) + (r.Active ? "" : " — switched off"),
+                        locked: !admin, lockedBecause: "Only inbox admins change routing.") {
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(grow: 1, minW: "180px") { Field("Name", value: r.Name); }
+            Switch("In use", value: r.Active);
+            Switch("Carry on to the next rule", value: r.ContinueAfter);
+          }
+          Text("When", fontWeight: FontWeight.Medium);
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(grow: 1, minW: "200px") { Field("Words in the title", value: r.TitleContains, placeholder: "invoice|refund"); }
+            Stack(w: "110px") { Field("Channel", value: r.Channel, placeholder: "any"); }
+            Stack(minW: "150px") { Dropdown("Tier", value: r.Tier, options: tiers.ToArray(), placeholder: "Any tier") { t => Text(t.Name); } }
+            Stack(w: "100px") { Field("Language", value: r.Language, placeholder: "es"); }
+            Stack(w: "120px") { Field("Kind", value: r.Kind, placeholder: "any"); }
+            Switch("VIPs", value: r.ForVip);
+          }
+          Text("Then", fontWeight: FontWeight.Medium);
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(minW: "160px") { Dropdown("Queue", value: r.ToQueue, options: queues.ToArray(), placeholder: "Leave it") { q => Text(q.Name); } }
+            Stack(minW: "130px") { Dropdown("Priority", value: r.SetPriority, placeholder: "Leave it"); }
+            Stack(minW: "160px") { Dropdown("Needs", value: r.NeedSkill, options: skills.ToArray(), placeholder: "No skill") { s => Text(s.Name); } }
+            Switch("Required", value: r.SkillRequired);
+            Stack(minW: "170px") { Dropdown("Give it to", value: r.AssignTo, options: workers.ToArray(), placeholder: "Nobody") { p => Text(p.DisplayName); } }
+            Stack(minW: "160px") { Field(appAction, value: r.AppAction, placeholder: appActionHint); }
+          }
+          Row(gap: 2) {
+            if (r.Position > 0) { Button("Move up", onPress: () => Up(r), tone: Tone.Ghost, size: Size.Sm, announceAs: "Move " + r.Name + " up"); }
+            Button("Remove", onPress: () => Remove(r), tone: Tone.Ghost, size: Size.Sm, announceAs: "Remove " + r.Name);
+          }
+        }
+      }
+      if (rules.Count == 0) { Text("No rules — every item lands in the default queue.", color: Colors.TextMuted); }
+      if (admin) { Row { Button("Add a rule", onPress: AddRule, tone: Tone.Ghost, size: Size.Sm); } }
+      SaveBar(saved: "Routing saved.");
+    }
+  }
+}
+
+/// SKILLS AND LANGUAGES — what work can need, and who holds it (with a level). A required skill limits who may hold an
+/// item; a preferred one, and the item's language, rank who is given it first.
+[Composable]
+public component SkillSettings() {
+  live var admin = AdministersInbox;
+  live var lead = LeadsInbox;
+  live var skills = RoutingSkill.OrderBy(s => s.Kind).ThenBy(s => s.Name).ToList();
+  live var held = HeldSkill.Include(h => h.Person).Include(h => h.Skill).OrderBy(h => h.Person.DisplayName).ToList();
+  live var workers = Principal.Where(p => QueueMember.Any(m => m.Member == p)).OrderBy(p => p.DisplayName).ToList();
+
+  action AddSkill() { UnitOfWork.Mark("Add a skill"); new RoutingSkill { Name = "New skill" }; }
+  action AddLanguage() { UnitOfWork.Mark("Add a language"); new RoutingSkill { Name = "New language", Kind = SkillKind.Language }; }
+  Principal? picked = null;
+  string problem = "";
+  action Give(RoutingSkill s) {
+    problem = "";
+    if (picked == null) { problem = "Choose somebody to give it to."; return; }
+    if (held.Any(h => h.Skill.Id == s.Id && h.Person.Id == picked.Id)) { problem = picked.DisplayName + " already has " + s.Name + "."; return; }
+    UnitOfWork.Mark("Give " + s.Name + " to " + picked.DisplayName);
+    new HeldSkill { Skill = s, Person = picked };
+    picked = null;
+  }
+  action Take(HeldSkill h) { UnitOfWork.Mark("Take " + h.Skill.Name + " from " + h.Person.DisplayName); h.Delete(); }
+
+  render {
+    SettingsPage("Skills and languages", description: "What work can need, and who has it. A rule or the app says what an item needs; the inbox gives it to somebody who has it.") {
+      foreach (var s in skills) {
+        SettingsSection(s.Name, description: s.Kind == SkillKind.Language ? "A language" + (s.Code != "" ? " — " + s.Code : "") : "A skill",
+                        locked: !admin && !lead, lockedBecause: "Only inbox admins change skills; leads change who holds them.") {
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(grow: 1, minW: "180px") { Field("Name", value: s.Name, disabled: !admin); }
+            if (s.Kind == SkillKind.Language) { Stack(w: "120px") { Field("Code", value: s.Code, placeholder: "es", disabled: !admin); } }
+          }
+          Stack(gap: 0, role: UiRole.List, label: "Who has " + s.Name) {
+            foreach (var h in held.Where(x => x.Skill.Id == s.Id)) {
+              Row(gap: 3, align: Align.Center, py: 1, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: h.Person.DisplayName) {
+                Avatar(InitialsOf(h.Person.DisplayName), size: Size.Sm);
+                Text(h.Person.DisplayName, grow: 1);
+                Stack(w: "96px") { NumberField("Level", value: h.Level, min: 1, max: 5); }
+                IconButton("Take " + s.Name + " from " + h.Person.DisplayName, () => Take(h), tone: Tone.Ghost, size: Size.Sm) { Icon(Icons.Close); }
+              }
+            }
+          }
+          Row(gap: 2, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(minW: "220px") {
+              Dropdown("Give it to", value: picked, options: workers.Where(p => !held.Any(h => h.Skill.Id == s.Id && h.Person.Id == p.Id)).ToArray(),
+                       placeholder: "Somebody on the team") { p => Text(p.DisplayName); }
+            }
+            Button("Give", onPress: () => Give(s), tone: Tone.Ghost, size: Size.Sm, announceAs: "Give " + s.Name + " to the chosen person");
+          }
+        }
+      }
+      if (problem != "") { Alert(problem, tone: Tone.Warning); }
+      if (admin) {
+        Row(gap: 2) {
+          Button("Add a skill", onPress: AddSkill, tone: Tone.Ghost, size: Size.Sm);
+          Button("Add a language", onPress: AddLanguage, tone: Tone.Ghost, size: Size.Sm);
+        }
+      }
+      SaveBar(saved: "Skills saved.");
+    }
+  }
+}
+
+/// SHARED VIEWS — views the whole team sees in the rail: a name and what it keeps (queue, holder, priority floor, tier,
+/// at risk, waiting, done, language, kind, and the app's own filter in the app's own words — `appFilter: "Tagged"`).
+/// A view only filters — each reader still sees only what they may read.
+[Composable]
+public component SharedViewSettings(string appFilter = "The app's filter", string appFilterHint = "tag:refund") {
+  live var admin = AdministersInbox;
+  live var views = InboxView.Where(v => v.Owner == null).Include(v => v.Queue).Include(v => v.Tier)
+    .OrderBy(v => v.Position).ThenBy(v => v.Name).ToList();
+  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Name).ToList();
+  live var tiers = OrganizationTier.OrderBy(t => t.Rank).ToList();
+
+  action AddView() { UnitOfWork.Mark("Add a view"); new InboxView { Name = "New view", Position = views.Count }; }
+  action Remove(InboxView v) { UnitOfWork.Mark("Remove " + v.Name); v.Delete(); }
+
+  render {
+    SettingsPage("Shared views", description: "Views everybody on the inbox sees in the rail. A view only filters: each reader sees in it only what they may read.") {
+      foreach (var v in views) {
+        SettingsSection(v.Name, locked: !admin, lockedBecause: "Only inbox admins change shared views.") {
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(grow: 1, minW: "180px") { Field("Name", value: v.Name); }
+            Switch("In use", value: v.Active);
+          }
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Stack(minW: "150px") { Dropdown("Queue", value: v.Queue, options: queues.ToArray(), placeholder: "Every queue") { q => Text(q.Name); } }
+            Stack(minW: "130px") { Dropdown("Held by", value: v.Holder); }
+            Stack(minW: "130px") { Dropdown("At least", value: v.AtLeast, placeholder: "Any priority"); }
+            Stack(minW: "150px") { Dropdown("Tier", value: v.Tier, options: tiers.ToArray(), placeholder: "Any tier") { t => Text(t.Name); } }
+          }
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Switch("At risk only", value: v.AtRiskOnly);
+            Switch("Include waiting", value: v.IncludeWaiting);
+            Switch("Include done", value: v.IncludeDone);
+            Stack(w: "100px") { Field("Language", value: v.Language, placeholder: "any"); }
+            Stack(w: "120px") { Field("Kind", value: v.Kind, placeholder: "any"); }
+            Stack(minW: "160px") { Field(appFilter, value: v.AppFilter, placeholder: appFilterHint); }
+          }
+          Row { Button("Remove", onPress: () => Remove(v), tone: Tone.Ghost, size: Size.Sm, announceAs: "Remove " + v.Name); }
+        }
+      }
+      if (views.Count == 0) { Text("No shared views yet.", color: Colors.TextMuted); }
+      if (admin) { Row { Button("Add a view", onPress: AddView, tone: Tone.Ghost, size: Size.Sm); } }
+      SaveBar(saved: "Shared views saved.");
+    }
+  }
+}

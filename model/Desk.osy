@@ -1,0 +1,318 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.ServiceHours;
+
+// ── what the screens read ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// Each answer is the VIEWER's own read through every rule, and a fixed handful of statements however many people and
+// items there are: the rows are read once per kind, joined here.
+
+/// One person an item may be handed to, as the assign menu shows them — only somebody who MAY hold it is ever listed.
+public class Candidate {
+  public Guid Person;
+  public string Name = "";
+  public bool IsMe = false;
+  /// They hold it now.
+  public bool Holds = false;
+  /// Work that needs them now (not waiting on the requester, not done), and the most the inbox gives them.
+  public int Load = 0;
+  public int Capacity = 0;
+  public Presence Status = Presence.Available;
+  /// Inside their own working hours now.
+  public bool OnHours = true;
+  /// Away — a live absence, or their status — and until when (none: until they say so).
+  public bool Away = false;
+  public DateTime? AwayUntil;
+  /// The languages they work in — "es · en".
+  public string Languages = "";
+  /// Free to be given it now: available, on their hours, not away, below capacity.
+  public bool Free = false;
+}
+
+/// A person and their ceiling in a queue — read as ids, so the names are one read after.
+public class MemberCap {
+  public Guid Person;
+  public int? Capacity;
+}
+
+/// One group of a per-person load read.
+public class PersonTally {
+  public Guid Person;
+  public SlaState Sla;
+  public int Count;
+}
+
+/// The people who may hold `item` — its queue's active members, and its organisation's account team where the queue is
+/// not restricted — less anybody missing a skill it REQUIRES; each with their load, capacity, status, hours and
+/// languages. Ordered the way a person picks: whoever holds it, then the free (least loaded first), then the rest.
+[SuppressWarning("cost-unbounded-read")]   // one item's queue and account team; every other read here is keyed by those people
+public List<Candidate> Eligible(WorkItem item) {
+  var result = new List<Candidate>();
+  if (item.Queue == null) { return result; }
+  var queue = item.Queue!;
+  var me = Session.CurrentUser;
+  var now = DateTime.UtcNow;
+  var names = new Dictionary<Guid, string>();
+  var caps = new Dictionary<Guid, int>();
+  var ids = new List<Guid>();
+  // The people as ids first (the members, then the account team), and their names in ONE read after.
+  foreach (var m in QueueMember.Where(m => m.Queue == queue && m.Active)
+      .Select(m => new MemberCap { Person = m.Member.Id, Capacity = m.Capacity }).ToList()) {
+    if (ids.Contains(m.Person)) { continue; }
+    ids.Add(m.Person);
+    caps[m.Person] = m.Capacity != null ? m.Capacity.Value : queue.DefaultCapacity;
+  }
+  if (item.Organization != null && !queue.Restricted) {
+    foreach (var t in AccountTeamMember.Where(t => t.Organization == item.Organization)
+        .Select(t => new MemberCap { Person = t.Member.Id }).ToList()) {
+      if (ids.Contains(t.Person)) { continue; }
+      ids.Add(t.Person);
+      caps[t.Person] = queue.DefaultCapacity;
+    }
+  }
+  if (ids.Count > 0) {
+    foreach (var p in Principal.Where(p => ids.Contains(p.Id)).ToList()) { names[p.Id] = NameOf(p); }
+  }
+  if (ids.Count == 0) { return result; }
+  var required = new List<Guid>();
+  foreach (var n in NeededSkill.Where(n => n.Item == item && n.Required).ToList()) { required.Add(n.Skill.Id); }
+  var held = HeldSkill.Where(h => ids.Contains(h.Person.Id)).Include(h => h.Skill).ToList();
+  var availability = new Dictionary<Guid, Availability>();
+  foreach (var a in Availability.Where(a => ids.Contains(a.Person.Id)).ToList()) { availability[a.Person.Id] = a; }
+  var awayUntil = new Dictionary<Guid, DateTime>();
+  foreach (var a in Absence.Where(a => ids.Contains(a.Person.Id) && a.State == AbsenceState.Away).ToList()) { awayUntil[a.Person.Id] = a.Until; }
+  var loads = LoadsOf(ids);
+  Guid? holder = item.Assignee == null ? null : item.Assignee.Id;
+  foreach (var pid in ids) {
+    var missing = false;
+    foreach (var s in required) { if (!held.Any(h => h.Person.Id == pid && h.Skill.Id == s)) { missing = true; } }
+    if (missing) { continue; }
+    Availability? a = availability.ContainsKey(pid) ? availability[pid] : null;
+    var c = new Candidate { Person = pid, Name = names.ContainsKey(pid) ? names[pid] : "", IsMe = me != null && me.Id == pid,
+                            Holds = holder != null && holder.Value == pid,
+                            Load = loads.ContainsKey(pid) ? loads[pid] : 0, Capacity = caps[pid] };
+    if (a != null) {
+      c.Status = a.Status;
+      if (a.Capacity != null && a.Capacity.Value < c.Capacity) { c.Capacity = a.Capacity.Value; }
+      c.OnHours = ServiceHours.IsOpen(a.Hours, now);
+      if (a.Status == Presence.Away) { c.Away = true; c.AwayUntil = a.AwayUntil; }
+    }
+    if (awayUntil.ContainsKey(pid)) { c.Away = true; c.AwayUntil = awayUntil[pid]; }
+    c.Languages = string.Join(" · ", held.Where(h => h.Person.Id == pid && h.Skill.Kind == SkillKind.Language)
+      .Select(h => h.Skill.Code).ToList());
+    c.Free = !c.Away && c.Status == Presence.Available && c.OnHours && c.Load < c.Capacity;
+    result.Add(c);
+  }
+  return result.OrderBy(c => c.Holds ? 0 : 1).ThenBy(c => c.Free ? 0 : 1)
+    .ThenBy(c => c.Capacity <= 0 ? 1.0 : (double)c.Load / (double)c.Capacity).ThenBy(c => c.Name).ToList();
+}
+
+/// The work that needs each of `ids` now — one grouped read.
+Dictionary<Guid, int> LoadsOf(List<Guid> ids) {
+  var loads = new Dictionary<Guid, int>();
+  foreach (var l in WorkItem.Where(w => w.Assignee != null && ids.Contains(w.Assignee.Id)
+      && (w.Handling == Handling.New || w.Handling == Handling.Owed || w.Handling == Handling.Answered
+          || w.Handling == Handling.WaitingOnOthers))
+    .GroupBy(w => new() { Person = w.Assignee.Id })
+    .Select(g => new LoadOf { Person = g.Key.Person, Count = g.Count() })
+    .ToList()) {
+    loads[l.Person] = l.Count;
+  }
+  return loads;
+}
+
+// ── the team, as a lead sees it ───────────────────────────────────────────────────────────────────────────────────────
+
+/// One person on the inbox, as "Team load" shows them.
+public class TeamRow {
+  public Guid Person;
+  public string Name = "";
+  public int Load = 0;
+  public int Capacity = 0;
+  /// Of their load, how many are at risk or breached.
+  public int AtRisk = 0;
+  public Presence Status = Presence.Available;
+  public bool OnHours = true;
+  public bool Away = false;
+  public DateTime? AwayUntil;
+  /// Who covers for them while they are away — empty: their work goes back to the queue.
+  public string Cover = "";
+  /// The queues they work, by name — "Support · Billing".
+  public string Queues = "";
+}
+
+/// Everybody who works a queue: their load against their capacity, what of it is at risk, whether they are on, and who
+/// covers for them while away. Five statements however large the team; the busiest first.
+[SuppressWarning("cost-unbounded-read")]   // one row per person who works a queue — the team view shows every one of them
+public List<TeamRow> TeamRows() {
+  var now = DateTime.UtcNow;
+  var rows = new Dictionary<Guid, TeamRow>();
+  var order = new List<Guid>();
+  var queues = new Dictionary<Guid, List<string>>();
+  foreach (var m in QueueMember.Where(m => m.Active && m.Queue.Active).Include(m => m.Member).Include(m => m.Queue).ToList()) {
+    var pid = m.Member.Id;
+    var cap = m.Capacity != null ? m.Capacity.Value : m.Queue.DefaultCapacity;
+    if (!rows.ContainsKey(pid)) {
+      rows[pid] = new TeamRow { Person = pid, Name = NameOf(m.Member), Capacity = cap };
+      order.Add(pid);
+      queues[pid] = new List<string>();
+    }
+    if (cap > rows[pid].Capacity) { rows[pid].Capacity = cap; }
+    if (!queues[pid].Contains(m.Queue.Name)) { queues[pid].Add(m.Queue.Name); }
+  }
+  if (order.Count == 0) { return new List<TeamRow>(); }
+  var covers = new Dictionary<Guid, Guid>();
+  foreach (var a in Availability.Where(a => order.Contains(a.Person.Id)).ToList()) {
+    var r = rows[a.Person.Id];
+    r.Status = a.Status;
+    if (a.Capacity != null && a.Capacity.Value < r.Capacity) { r.Capacity = a.Capacity.Value; }
+    r.OnHours = ServiceHours.IsOpen(a.Hours, now);
+    if (a.Status == Presence.Away) { r.Away = true; r.AwayUntil = a.AwayUntil; }
+    if (a.CoveredBy != null) { covers[a.Person.Id] = a.CoveredBy.Id; }
+  }
+  foreach (var a in Absence.Where(a => order.Contains(a.Person.Id) && a.State == AbsenceState.Away).ToList()) {
+    var r = rows[a.Person.Id];
+    r.Away = true;
+    r.AwayUntil = a.Until;
+    if (a.CoveredBy != null) { covers[a.Person.Id] = a.CoveredBy.Id; }
+  }
+  foreach (var t in WorkItem.Where(w => w.Assignee != null && order.Contains(w.Assignee.Id)
+      && (w.Handling == Handling.New || w.Handling == Handling.Owed || w.Handling == Handling.Answered
+          || w.Handling == Handling.WaitingOnOthers))
+    .GroupBy(w => new() { Person = w.Assignee.Id, Sla = w.Sla })
+    .Select(g => new PersonTally { Person = g.Key.Person, Sla = g.Key.Sla, Count = g.Count() })
+    .ToList()) {
+    if (!rows.ContainsKey(t.Person)) { continue; }
+    rows[t.Person].Load = rows[t.Person].Load + t.Count;
+    if (t.Sla != SlaState.OnTrack) { rows[t.Person].AtRisk = rows[t.Person].AtRisk + t.Count; }
+  }
+  foreach (var pid in order) {
+    rows[pid].Queues = string.Join(" · ", queues[pid]);
+    if (covers.ContainsKey(pid)) {
+      var cover = covers[pid];
+      rows[pid].Cover = rows.ContainsKey(cover) ? rows[cover].Name : "somebody outside the queues";
+    }
+  }
+  return order.Select(pid => rows[pid])
+    .OrderByDescending(r => r.Capacity <= 0 ? 0.0 : (double)r.Load / (double)r.Capacity).ThenBy(r => r.Name).ToList();
+}
+
+// ── how I stand ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// How the viewer stands for routing — what "my status" shows.
+public class MyStanding {
+  public Presence Status = Presence.Available;
+  public bool OnHours = true;
+  public bool Away = false;
+  public DateTime? AwayUntil;
+  public string Cover = "";
+  /// Work that needs them now.
+  public int Load = 0;
+}
+
+/// The viewer's own standing: their status, hours, any time away and its cover, and their load.
+public MyStanding MyPresence() {
+  var me = Session.CurrentUser;
+  var s = new MyStanding();
+  if (me == null) { return s; }
+  var now = DateTime.UtcNow;
+  var a = Availability.Where(x => x.Person == me).Include(x => x.CoveredBy).FirstOrDefault();
+  if (a != null) {
+    s.Status = a.Status;
+    s.OnHours = ServiceHours.IsOpen(a.Hours, now);
+    if (a.Status == Presence.Away) { s.Away = true; s.AwayUntil = a.AwayUntil; }
+    if (a.CoveredBy != null) { s.Cover = NameOf(a.CoveredBy); }
+  }
+  var away = Absence.Where(x => x.Person == me && x.State == AbsenceState.Away).Include(x => x.CoveredBy).FirstOrDefault();
+  if (away != null) {
+    s.Away = true;
+    s.AwayUntil = away.Until;
+    if (away.CoveredBy != null) { s.Cover = NameOf(away.CoveredBy); }
+  }
+  s.Load = LoadOf(me!);
+  return s;
+}
+
+/// Say how you stand for routing — Available (give me work), Busy (working, give me nothing new) or Offline. Going
+/// away is `GoAway` (it hands your work over); coming back from it is `ComeBack`. Available again pulls pooled work.
+public void SetMyPresence(Presence status) {
+  if (status == Presence.Away) { throw new ValidationException("Going away hands your work over — say until when, with GoAway."); }
+  var me = Session.CurrentUser;
+  if (me == null) { throw new ValidationException("Sign in first."); }
+  var a = Availability.FirstOrDefault(x => x.Person == me);
+  if (a == null) { a = new Availability { Person = me!, Status = status }; }
+  else { a.Status = status; a.AwayUntil = null; }
+  UnitOfWork.Commit();
+  if (status == Presence.Available) { Refill(me, null, DateTime.UtcNow); }
+}
+
+// ── why is this here — `TrailLines`, `TrailWords` and `InboxStepWords` in Events.osy ──────────────────────────────────
+
+// ── many at once, by id — what a list's bulk bar calls ────────────────────────────────────────────────────────────────
+
+/// Take every item of `ids` that can be taken; say why for the rest.
+[SuppressWarning("cost-unbounded-read")]   // one row per id the bulk bar passed
+public BulkResult TakeAll(List<Guid> ids) { return TakeMany(WorkItem.Where(w => ids.Contains(w.Id)).ToList()); }
+
+/// Move every item of `ids` that can be moved to `queue`; say why for the rest.
+[SuppressWarning("cost-unbounded-read")]   // one row per id the bulk bar passed
+public BulkResult MoveAll(List<Guid> ids, Guid queue) {
+  var to = Queue.Single(q => q.Id == queue);
+  return MoveMany(WorkItem.Where(w => ids.Contains(w.Id)).ToList(), to);
+}
+
+/// Hand every item of `ids` to `person` where they may hold it; say why for the rest.
+[SuppressWarning("cost-unbounded-read")]   // one row per id the bulk bar passed
+public BulkResult HandAllTo(List<Guid> ids, Guid person) {
+  var to = Principal.Single(p => p.Id == person);
+  var result = new BulkResult();
+  foreach (var item in WorkItem.Where(w => ids.Contains(w.Id)).ToList()) {
+    try { HandWorkTo(item, to, item.Assignee == null ? null : item.Assignee.Id); result.Moved = result.Moved + 1; }
+    catch (Exception e) { result.NotMoved.Add(item.Title + ": " + e.Message); }
+  }
+  return result;
+}
+
+/// Set the priority of every item of `ids`; say why for the rest.
+[SuppressWarning("cost-unbounded-read")]   // one row per id the bulk bar passed
+public BulkResult PrioritiseAll(List<Guid> ids, WorkPriority priority) {
+  var result = new BulkResult();
+  foreach (var item in WorkItem.Where(w => ids.Contains(w.Id)).ToList()) {
+    try { Prioritise(item, priority); result.Moved = result.Moved + 1; }
+    catch (Exception e) { result.NotMoved.Add(item.Title + ": " + e.Message); }
+  }
+  return result;
+}
+
+/// Escalate every item of `ids` a level, saying `why`; say why not for the rest (the top level has no next).
+[SuppressWarning("cost-unbounded-read")]   // one row per id the bulk bar passed
+public BulkResult EscalateAll(List<Guid> ids, string why) {
+  var result = new BulkResult();
+  foreach (var item in WorkItem.Where(w => ids.Contains(w.Id)).ToList()) {
+    try { EscalateWork(item, why); result.Moved = result.Moved + 1; }
+    catch (Exception e) { result.NotMoved.Add(item.Title + ": " + e.Message); }
+  }
+  return result;
+}
+
+/// What a bulk change did, as one sentence: "Moved 4. 2 could not be: …".
+public string BulkSentence(BulkResult r, string verb) {
+  var s = verb + " " + r.Moved + ".";
+  if (r.NotMoved.Count == 0) { return s; }
+  return s + " " + r.NotMoved.Count + " could not be — " + string.Join("; ", r.NotMoved) ;
+}
+
+/// The items a saved view's app filter keeps — the app's own `InboxViews.Narrow`, asked on the server.
+public List<Guid> AppFiltered(InboxView view) {
+  if (view.AppFilter == "") { return new List<Guid>(); }
+  return App.Setting<InboxSetup>().Views.Narrow(view.AppFilter);
+}
+
+/// `AppFiltered` for the saved view `id` — none when there is no such view, or it has no app filter.
+public List<Guid> AppFilteredBy(Guid id) {
+  var view = InboxView.FirstOrDefault(v => v.Id == id);
+  return view == null ? new List<Guid>() : AppFiltered(view);
+}

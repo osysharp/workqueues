@@ -1,0 +1,333 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+
+// ── account-based routing: the organisation's own people first, and never stuck ────────────────────────────────────
+//
+// An item of an organisation with an account team is OFFERED to that team before the queue hands it out:
+//
+//     owner ──▶ backup (or the owner's cover) ──▶ the pod ──▶ the segment queue (ForTier / ForSegment) ──▶ the queue
+//
+// Each offer waits the queue's `OfferFor` IN THE QUEUE'S HOURS, then falls through to the next step. A person who
+// cannot take it NOW — away, off their hours, busy, at capacity, or not allowed to hold it — is skipped at once, and the
+// trail says why: dedicated never means stuck. Taking the item, or responding to it, accepts the offer; the offered
+// person may decline it, which falls through at once. The item's clocks never wait for routing: account routing changes
+// who gets it first, never what was promised.
+
+/// Where an offer stands — `OfferFlow`'s.
+// ⚠ Appended, never inserted: an enum is stored by position.
+public enum OfferState {
+  [Label("Offered")] Offered,
+  [Label("Accepted")] Accepted,
+  /// Its time ran out, or it was declined: the next step was offered.
+  [Label("Fell through")] FellThrough,
+  /// Overtaken — somebody else took the item, or the offered person went away.
+  [Label("Withdrawn")] Withdrawn,
+}
+
+/// An item offered to one person first. Durable: `OfferFlow` falls it through on time, in the queue's hours.
+public entity RoutingOffer {
+  [Required] WorkItem Item;
+  [Required] Principal To;
+  /// Which step of the account chain: `AccountOwner`, `AccountBackup`, `AccountPod`.
+  AssignReason Step;
+  /// How long it waits, in `Hours`.
+  TimeSpan For;
+  /// The hours its timer runs in — the queue's when it was offered. None: around the clock.
+  Osysharp.ServiceHours.ServiceHours? Hours;
+  OfferState State;                                    // no default — OfferFlow owns it
+  DateTime At;
+  /// When it falls through: `For` of the queue's working time after `At` — the instant the offer's own run expires
+  /// (`ServiceHours.After`, the engine's walk). What a list counts down to. None: the hours never open.
+  DateTime? EndsAt;
+  // SECURITY-INVARIANT(inbox-service-internals-are-staffs) — the requester's side reads no routing.
+  security { allow read when WorksInbox; }
+}
+
+/// One offer's life: it waits `For` in `Hours`, then falls through to the next step of the account chain. The item's
+/// run settles it when the item is taken, responded to, declined or given to somebody else.
+public workflow OfferFlow {
+  Tracks       = RoutingOffer.State;
+  Autostart    = true;
+  Initial      = Offered;
+  // From when the offer was MADE — now for a live item, and the arrival's own instant for one imported with its history
+  // (its run replays `at:` the time it happened). Started at the import instead, an imported item's offer ran a fresh
+  // quarter of an hour while the list counted down to — and past — the end it was stamped with (seen on the seeded
+  // helpdesk: "→ Elin −34h").
+  StartedAt    = this.Item.At;
+  ServiceHours = this.Item.Hours;
+  Accrues      = [Offered];
+
+  // Raised by the item's run when the item moved on. Ungated (a timer-driven body raises it too) and safe so: its arm
+  // decides nothing from the raise — it reads the item and only ends an offer the item has already moved past.
+  event Settle();
+
+  state Offered {
+    Expire = this.Item.For;
+    on Expire { goto FellThrough; }
+    on Settle {
+      when (this.Item.Item.Assignee != null && this.Item.Item.Assignee.Id == this.Item.To.Id) { goto Accepted; }
+      when (this.Item.Item.OfferedTo == null || this.Item.Item.OfferedTo.Id != this.Item.To.Id) { goto Withdrawn; }
+      default { }
+    }
+  }
+  terminal success Accepted { }
+  terminal success FellThrough { enter { OfferLapsed(this.Item); } }
+  terminal cancel Withdrawn { }
+}
+
+// ── the verbs ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Take the item offered to you — the same as `TakeWork` on it.
+public void AcceptOffer(WorkItem item) { TakeWork(item, null); }
+
+/// Say no to the item offered to you: it falls through to the next step at once.
+public void DeclineOffer(WorkItem item) { WorkHandling.RaiseDecline(item); }
+
+/// The live offer on `item`, or null.
+public RoutingOffer? OfferOn(WorkItem item) {
+  return RoutingOffer.FirstOrDefault(o => o.Item == item && o.State == OfferState.Offered);
+}
+
+// ── the chain (called from the item's run, and from an offer's) ───────────────────────────────────────────────────────
+
+/// The steps of the chain, in order.
+AssignReason StepAt(int i) {
+  if (i == 0) { return AssignReason.AccountOwner; }
+  if (i == 1) { return AssignReason.AccountBackup; }
+  return AssignReason.AccountPod;
+}
+
+int IndexOf(AssignReason step) {
+  if (step == AssignReason.AccountOwner) { return 0; }
+  if (step == AssignReason.AccountBackup) { return 1; }
+  return 2;
+}
+
+/// Does `item` go through its organisation's account team? Account routing is on, it has an organisation with a
+/// team, nobody holds it yet, and its queue is not restricted (a restricted queue's work is its members' alone).
+bool RoutesByAccount(WorkItem item) {
+  return App.Setting<InboxSetup>().AccountRouting && item.Organization != null && item.Assignee == null
+    && item.Queue != null && !item.Queue.Restricted
+    && AccountTeamMember.Any(t => t.Organization == item.Organization);
+}
+
+/// Who, at step `i` of the chain: the owner; the backups and the owner's cover; the pod, least loaded first.
+[SuppressWarning("cost-unbounded-read")]   // one organisation's account team
+List<Principal> CandidatesAt(WorkItem item, int i) {
+  var people = new List<Principal>();
+  var team = AccountTeamMember.Where(t => t.Organization == item.Organization).Include(t => t.Member).ToList();
+  if (i == 0) {
+    foreach (var t in team) { if (t.Role == AccountTeamRole.Owner) { people.Add(t.Member); } }
+    return people;
+  }
+  if (i == 1) {
+    foreach (var t in team) { if (t.Role == AccountTeamRole.Backup) { people.Add(t.Member); } }
+    foreach (var t in team) {
+      if (t.Role != AccountTeamRole.Owner) { continue; }
+      var cover = CoverOf(t.Member);
+      if (cover != null && !people.Any(p => p.Id == cover.Id)) { people.Add(cover!); }
+    }
+    return people;
+  }
+  var pod = new List<Principal>();
+  var ids = new List<Guid>();
+  foreach (var t in team) { if (t.Role == AccountTeamRole.Member) { pod.Add(t.Member); ids.Add(t.Member.Id); } }
+  // The least loaded first — a pod shares the account's work. Every member's load in ONE grouped read, however big
+  // the pod: asking each member's count inside the sort is a statement per member.
+  var loads = LoadsOf(ids);
+  return pod.OrderBy(p => loads.ContainsKey(p.Id) ? loads[p.Id] : 0).ThenBy(p => p.DisplayName).ToList();
+}
+
+/// Who covers for `person` now: the cover named on their live absence, else on their availability. Null: nobody.
+Principal? CoverOf(Principal person) {
+  var absence = Absence.FirstOrDefault(a => a.Person == person && a.State == AbsenceState.Away && a.CoveredBy != null);
+  if (absence != null) { return absence.CoveredBy; }
+  var availability = Availability.FirstOrDefault(a => a.Person == person);
+  return availability == null ? null : availability.CoveredBy;
+}
+
+/// Why `person` cannot take `item` now — null when they can. What the trail records when they are skipped.
+Unavailability? WhyNotNow(WorkItem item, Principal person) {
+  if (!MayHold(person, item)) { return Unavailability.MayNotHold; }
+  var now = DurableClock.UtcNow;
+  if (Absence.Any(a => a.Person == person && a.State == AbsenceState.Away)) { return Unavailability.Away; }
+  var a = Availability.FirstOrDefault(x => x.Person == person);
+  if (a != null && a.Status == Presence.Away) { return Unavailability.Away; }
+  if (a != null && a.Status == Presence.Busy) { return Unavailability.Busy; }
+  if (a != null && a.Status == Presence.Offline) { return Unavailability.Offline; }
+  if (a != null && !ServiceHours.IsOpen(a.Hours, now)) { return Unavailability.OffShift; }
+  var cap = a != null && a.Capacity != null ? a.Capacity.Value : item.Queue.DefaultCapacity;
+  if (LoadOf(person) >= cap) { return Unavailability.AtCapacity; }
+  return null;
+}
+
+/// Until when `person` is away — their absence's end, else the end their availability names. Null: not said.
+DateTime? AwayUntil(Principal person) {
+  var absence = Absence.FirstOrDefault(a => a.Person == person && a.State == AbsenceState.Away);
+  if (absence != null) { return absence.Until; }
+  var a = Availability.FirstOrDefault(x => x.Person == person);
+  return a != null && a.Status == Presence.Away ? a.AwayUntil : null;
+}
+
+/// Route `item` through its account chain from step `from`: offer it to the first person there who can take it now;
+/// each one skipped is a step of the trail with why; past the pod, it falls through to the segment queue (or stays in
+/// its own) and that queue hands it out.
+void RouteOn(WorkItem item, int from) {
+  for (var i = from; i < 3; i++) {
+    foreach (var person in CandidatesAt(item, i)) {
+      var cannot = WhyNotNow(item, person);
+      if (cannot == null && Offer(item, person, StepAt(i))) { return; }
+      var because = cannot ?? Unavailability.MayNotHold;
+      // Each one skipped is a fact of the trail — who, why, until when — not a clause in the next step's words.
+      var skipped = new Assignment { Item = item, Step = NextStep(item), FromQueue = item.Queue, ToQueue = item.Queue,
+                                     Reason = i == 0 ? AssignReason.OwnerAway : AssignReason.Skipped, About = person,
+                                     Because = because, Until = because == Unavailability.Away ? AwayUntil(person) : null,
+                                     At = DurableClock.UtcNow };
+      Raise(new RoutingSkipped { Item = item, Step = StepOf(skipped) });
+    }
+  }
+  FallToTheQueue(item);
+}
+
+/// Past the account team: to the segment queue that serves its tier or segment, if there is one, and that queue (or
+/// its own) hands it out.
+[SuppressWarning("cost-unbounded-read")]   // the desk's active queues — configuration, not data
+void FallToTheQueue(WorkItem item) {
+  var tier = TierOf(item);
+  Queue? pod = null;
+  foreach (var q in Queue.Where(q => q.Active).OrderBy(q => q.Position).ToList()) {
+    if (item.Queue != null && q.Id == item.Queue.Id) { continue; }
+    if (q.ForSegment != "" && q.ForSegment == item.Segment) { pod = q; break; }
+    if (pod == null && q.ForTier != null && tier != null && q.ForTier.Id == tier.Id) { pod = q; }
+  }
+  if (pod != null) {
+    var fromQueue = item.Queue;
+    item.Queue = pod;
+    var fell = new Assignment { Item = item, Step = NextStep(item), FromQueue = fromQueue, ToQueue = pod,
+                                Reason = AssignReason.FellThrough, At = DurableClock.UtcNow };
+    Raise(new ItemMoved { Item = item, Step = StepOf(fell) });
+    TakePolicy(item);
+  }
+  Distribute(item, null);
+}
+
+/// Offer `item` to `person` at `step`: they see it in "Offered to me", and it falls through after the queue's
+/// `OfferFor` in the queue's hours. False: not offered — they may not hold it.
+bool Offer(WorkItem item, Principal person, AssignReason step) {
+  // SECURITY-INVARIANT(inbox-work-goes-only-to-who-may-hold-it) — an offer is a promise to hold; it asks too.
+  if (!MayHold(person, item)) { return false; }
+  var queue = item.Queue;
+  item.OfferedTo = person;
+  var now = DurableClock.UtcNow;
+  new RoutingOffer { Item = item, To = person, Step = step, For = queue.OfferFor, Hours = queue.Hours, At = now,
+                     EndsAt = ServiceHours.After(queue.Hours, now, queue.OfferFor) };
+  var offered = new Assignment { Item = item, Step = NextStep(item), FromQueue = queue, ToQueue = queue, Reason = step,
+                                 About = person, Minutes = (int)queue.OfferFor.TotalMinutes, At = DurableClock.UtcNow };
+  Raise(new ItemOffered { Item = item, Step = StepOf(offered), To = person });
+  return true;
+}
+
+/// An offer's time ran out: if it is still the live one, the next step is offered.
+void OfferLapsed(RoutingOffer offer) {
+  var item = offer.Item;
+  if (item.OfferedTo == null || item.OfferedTo.Id != offer.To.Id || item.Assignee != null) { return; }
+  item.OfferedTo = null;
+  var lapsed = new Assignment { Item = item, Step = NextStep(item), FromQueue = item.Queue, ToQueue = item.Queue,
+                                Reason = AssignReason.FellThrough, About = offer.To, Because = Unavailability.DidNotTake,
+                                Minutes = (int)offer.For.TotalMinutes, At = DurableClock.UtcNow };
+  Raise(new OfferFellThrough { Item = item, Step = StepOf(lapsed) });
+  RouteOn(item, IndexOf(offer.Step) + 1);
+}
+
+/// The offered person said no (`Declined`), or went away (`Away`, until `until`): it falls through at once.
+void Withdraw(WorkItem item, Unavailability because, DateTime? until = null) {
+  var offer = OfferOn(item);
+  if (offer == null || item.OfferedTo == null) { return; }
+  var who = item.OfferedTo;
+  item.OfferedTo = null;
+  var fell = new Assignment { Item = item, Step = NextStep(item), FromQueue = item.Queue, ToQueue = item.Queue,
+                              Reason = AssignReason.FellThrough, About = who, Because = because, Until = until,
+                              At = DurableClock.UtcNow };
+  Raise(new OfferFellThrough { Item = item, Step = StepOf(fell) });
+  OfferFlow.RaiseSettle(offer);
+  RouteOn(item, IndexOf(offer.Step) + 1);
+}
+
+/// The item moved on — taken by the offered person (accepted), or by somebody else (withdrawn): its offer is settled.
+void SettleOffer(WorkItem item, Principal? holder) {
+  var offer = OfferOn(item);
+  if (offer == null) { return; }
+  if (item.OfferedTo != null && (holder == null || item.OfferedTo.Id != holder.Id)) {
+    Raise(new OfferWithdrawn { Item = item, About = NameAt(item.OfferedTo), To = NameAt(holder) });
+  }
+  item.OfferedTo = null;
+  OfferFlow.RaiseSettle(offer);
+}
+
+// ── my accounts ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One of the viewer's accounts, as "My accounts" shows it.
+public class AccountRow {
+  public Guid Organization;
+  public string Name = "";
+  public string Tier = "";
+  /// Being worked: new, owed, answered.
+  public int Open = 0;
+  /// Being worked and at risk or breached.
+  public int AtRisk = 0;
+  /// Offered to the viewer now.
+  public int Offered = 0;
+  /// Waiting on the requester, on others, or held.
+  public int Waiting = 0;
+}
+
+/// One group of the accounts' grouped read.
+public class AccountTally {
+  public Guid? Organization;
+  public Handling Handling;
+  public SlaState Sla;
+  public bool Offered;
+  public int Count;
+}
+
+/// The organisations whose account team the viewer is on, each with its open, at-risk, offered and waiting work — the
+/// viewer's own reads, a fixed handful of statements however many accounts and items.
+[SuppressWarning("cost-unbounded-read")]   // the tiers (configuration) and the caller's own account-team seats
+public List<AccountRow> MyAccounts() {
+  var me = Session.CurrentUser;
+  var rows = new List<AccountRow>();
+  var byOrg = new Dictionary<Guid, AccountRow>();
+  var tiers = new Dictionary<Guid, string>();
+  foreach (var t in OrganizationTier.ToList()) { tiers[t.Id] = t.Name; }
+  foreach (var m in AccountTeamMember.Where(m => m.Member == me).Include(m => m.Organization).ToList()) {
+    if (byOrg.ContainsKey(m.Organization.Id)) { continue; }
+    var tier = m.Organization.Tier;
+    var row = new AccountRow { Organization = m.Organization.Id, Name = m.Organization.Name,
+                               Tier = tier != null && tiers.ContainsKey(tier.Id) ? tiers[tier.Id] : "" };
+    byOrg[m.Organization.Id] = row;
+    rows.Add(row);
+  }
+  if (rows.Count == 0) { return rows; }
+  var tallies = WorkItem.Where(w => w.Organization != null && w.Handling != Handling.Done && w.Handling != Handling.Closed
+      && w.Handling != Handling.Cancelled && AccountTeamMember.Any(t => t.Organization == w.Organization && t.Member == me))
+    .GroupBy(w => new() { Organization = w.Organization.Id, Handling = w.Handling, Sla = w.Sla, Offered = w.OfferedTo == me })
+    .Select(g => new AccountTally { Organization = g.Key.Organization, Handling = g.Key.Handling, Sla = g.Key.Sla,
+                                    Offered = g.Key.Offered, Count = g.Count() })
+    .ToList();
+  foreach (var t in tallies) {
+    if (t.Organization == null || !byOrg.ContainsKey(t.Organization.Value)) { continue; }
+    var row = byOrg[t.Organization.Value];
+    if (Working(t.Handling)) {
+      row.Open = row.Open + t.Count;
+      if (t.Sla != SlaState.OnTrack) { row.AtRisk = row.AtRisk + t.Count; }
+      if (t.Offered) { row.Offered = row.Offered + t.Count; }
+    }
+    if (Waiting(t.Handling)) { row.Waiting = row.Waiting + t.Count; }
+  }
+  return rows.OrderByDescending(r => r.AtRisk).ThenByDescending(r => r.Open).ThenBy(r => r.Name).ToList();
+}

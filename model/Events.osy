@@ -1,0 +1,557 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+
+// ── what happens to an item — the inbox's EVENTS, raised where it happens, said in the reader's words when read ──────
+//
+// ⚑ THE INBOX TELLS WHAT HAPPENED AS EVENTS. Each `[Event]` below is about the item (its first member) and is raised
+//   where it happens — so Automations offers it as a trigger, Webhooks as a subscription and Activity as a timeline line,
+//   and an app hears whichever it cares about with an `[On]` function. Nobody registers anything:
+//       [On] void TellTheLeads(PickupOverdue e) { … }
+//   An event nothing hears costs nothing: it is gone at the raise.
+//
+// ⚑ FACTS, NEVER A SENTENCE. A step of an item's trail is an `Assignment` row of facts — who had it, who has
+//   it, which queue, why, until when — and an event carries the same facts (`InboxStep`), with people as they were NAMED
+//   at the time ("" for nobody — never a word for nobody, which would be English). `e.Sentence()` says them on the
+//   server, in the language of whoever is reading: a desk in Arabic reads "why is this here" in Arabic, one in Swedish
+//   in Swedish, from the same events. `InboxNotice(e)` says the ones that name a person TO that person.
+//
+// ⚑ WHO IS TOLD. Four events name who should know: `ItemOffered.To`, `HolderChanged.Told` (work handed to a cover),
+//   `PromiseToldToHolder.Holder`, and — for the leads, whom only the app knows — `PickupOverdue` and
+//   `PromiseToldToLeads`. `Osysharp.WorkQueues.Notifications` tells the named ones in their bell.
+
+/// Why somebody could not take an item just then. ⚠ Appended, never inserted: an enum is stored by position.
+public enum Unavailability {
+  [Label("May not hold it")] MayNotHold,
+  [Label("Away")] Away,
+  [Label("Busy")] Busy,
+  [Label("Offline")] Offline,
+  [Label("Off shift")] OffShift,
+  [Label("At capacity")] AtCapacity,
+  [Label("Declined")] Declined,
+  [Label("Did not take it in time")] DidNotTake,
+}
+
+/// A step of an item's trail as facts — who had it and who has it, which queue, why — as they were at the time. What a
+/// step's event carries (`HolderChanged.Step`), and what the trail is said from.
+public class InboxStep {
+  /// Why it moved.
+  public AssignReason? Reason;
+  /// Who held it before, who holds it now, and who did it — "" for nobody (the inbox did it, or nobody holds it).
+  public string From = "";
+  public string To = "";
+  public string By = "";
+  /// Who else it is about — offered to, skipped, the one whose offer ran out, the one a rule named.
+  public string About = "";
+  /// The queue it waits in, and the one it came from.
+  public string Queue = "";
+  public string FromQueue = "";
+  /// The routing rule that did it.
+  public string Rule = "";
+  /// Why somebody could not take it, and until when they are away.
+  public Unavailability? Because;
+  public DateTime? Until;
+  /// A number of minutes — an offer's window, how long it went untaken.
+  public int? Minutes;
+  /// The level it was escalated to.
+  public int? Level;
+  /// The promise and its moment, when a promise is why.
+  public SlaMetric? Metric;
+  public SlaMoment? Moment;
+  /// Somebody's own words — why it was escalated.
+  public string Detail = "";
+  /// When it happened.
+  public DateTime At = DateTime.MinValue;
+}
+
+// ── the events ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// It arrived and its promise was chosen — by `Policy` (its name), or by a due date it carries.
+[Event("It arrives in the inbox")]
+public sealed class ItemArrived {
+  public WorkItem Item;
+  public string Policy = "";
+  public DateTime? Due;
+  public override string Sentence() { return ArrivedWords(this); }
+}
+
+/// It landed in a queue — the default one, the one its account falls through to, or the one a routing rule named.
+/// Every arrival raises it; it is bookkeeping, so hear `ItemRouted` for "a rule put it there".
+[Event("It lands in a queue")]
+public sealed class ItemQueued {
+  public WorkItem Item;
+  public InboxStep Step;
+  public override string Sentence() { return InboxStepWords(Step); }
+}
+
+/// A routing rule placed it in a queue — `Step.Rule` names the rule, `Step.To` the queue. Raised beside `ItemQueued`
+/// only when a rule decided, so a timeline or an automation that cares about routing hears it without hearing every
+/// arrival.
+[Event("A routing rule places it")]
+public sealed class ItemRouted {
+  public WorkItem Item;
+  public InboxStep Step;
+  public override string Sentence() { return InboxStepWords(Step); }
+}
+
+/// Who holds it changed — somebody took it, was given it or handed it on, or let it go. `Told`: somebody the inbox
+/// handed it to who should know (a cover, while its holder is away).
+[Event("Its holder changes")]
+public sealed class HolderChanged {
+  public WorkItem Item;
+  public InboxStep Step;
+  public Principal? Told;
+  public override string Sentence() { return InboxStepWords(Step); }
+}
+
+/// It moved to another queue — by somebody, or falling through to the queue that serves its account.
+[Event("It moves to another queue")]
+public sealed class ItemMoved {
+  public WorkItem Item;
+  public InboxStep Step;
+  public override string Sentence() { return InboxStepWords(Step); }
+}
+
+/// It was escalated a level.
+[Event("It is escalated")]
+public sealed class ItemEscalated {
+  public WorkItem Item;
+  public InboxStep Step;
+  public override string Sentence() { return InboxStepWords(Step); }
+}
+
+/// It was offered to `To` — it is theirs if they take it in time.
+[Event("It is offered to somebody")]
+public sealed class ItemOffered {
+  public WorkItem Item;
+  public InboxStep Step;
+  public Principal To;
+  public override string Sentence() { return InboxStepWords(Step); }
+}
+
+/// An offer fell through — declined, not taken in time, or its person went away.
+[Event("An offer falls through")]
+public sealed class OfferFellThrough {
+  public WorkItem Item;
+  public InboxStep Step;
+  public override string Sentence() { return InboxStepWords(Step); }
+}
+
+/// Somebody else took it while it was offered: the offer to `About` is withdrawn.
+[Event("An offer is withdrawn")]
+public sealed class OfferWithdrawn {
+  public WorkItem Item;
+  public string About = "";
+  public string To = "";
+  public override string Sentence() { return WithdrawnWords(this); }
+}
+
+/// Routing passed somebody over — away, at capacity, or not allowed to hold it — or a rule named somebody who may not.
+[Event("Routing passes somebody over")]
+public sealed class RoutingSkipped {
+  public WorkItem Item;
+  public InboxStep Step;
+  public override string Sentence() { return SkippedWords(Step); }
+}
+
+/// Nobody was free: it waits in the queue's pool, for a speaker of `Language` when it waits for one.
+[Event("It waits for somebody free")]
+public sealed class ItemPooled {
+  public WorkItem Item;
+  public string Queue = "";
+  public string Language = "";
+  public override string Sentence() { return PooledWords(this); }
+}
+
+/// Nobody picked it up within its queue's pickup time — the leads should know.
+[Event("Nobody picks it up in time")]
+public sealed class PickupOverdue {
+  public WorkItem Item;
+  public string Queue = "";
+  public int? Minutes;
+  public override string Sentence() { return OverdueWords(this); }
+}
+
+/// Its priority changed — by somebody, or by its promise (`Metric` at its `Moment`).
+[Event("Its priority changes")]
+public sealed class PriorityChanged {
+  public WorkItem Item;
+  public WorkPriority? WasPriority;
+  public WorkPriority? Priority;
+  public SlaMetric? Metric;
+  public SlaMoment? Moment;
+  public override string Sentence() { return PrioritisedWords(this); }
+}
+
+/// Its due date moved, and why.
+[Event("Its due date moves")]
+public sealed class DueMoved {
+  public WorkItem Item;
+  public DateTime? WasDue;
+  public DateTime? Due;
+  public string Detail = "";
+  public override string Sentence() { return DueWords(this); }
+}
+
+/// It was cancelled, and why.
+[Event("It is cancelled")]
+public sealed class ItemCancelled {
+  public WorkItem Item;
+  public string Detail = "";
+  public override string Sentence() { return CancelledWords(this); }
+}
+
+/// It was reopened — by the team, or because its requester wrote back.
+[Event("It is reopened")]
+public sealed class ItemReopened {
+  public WorkItem Item;
+  public bool ByRequester;
+  public override string Sentence() { return ByRequester ? "Reopened: the requester wrote back." : "Reopened."; }
+}
+
+/// A promise on it is at risk — `Metric`'s clock reached its at-risk point at `At`.
+[Event("A promise is at risk")]
+public sealed class PromiseAtRisk {
+  public WorkItem Item;
+  public SlaMetric Metric;
+  public DateTime At;
+  public override string Sentence() { return PromiseWords(Metric, "at-risk"); }
+}
+
+/// A promise on it was missed — `Metric`'s clock ran out at `At` (an imported item's, at its own minute).
+[Event("A promise is missed")]
+public sealed class PromiseBreached {
+  public WorkItem Item;
+  public SlaMetric Metric;
+  public DateTime At;
+  public override string Sentence() { return PromiseWords(Metric, "breached"); }
+}
+
+/// A promise on it was kept — on time, or `Late`.
+[Event("A promise is kept")]
+public sealed class PromiseMet {
+  public WorkItem Item;
+  public SlaMetric Metric;
+  public bool Late;
+  public override string Sentence() { return PromiseWords(Metric, Late ? "met-late" : "met"); }
+}
+
+/// Its policy says to tell whoever holds it that a promise is at risk or missed — `Holder`, named `About` at the time.
+[Event("Whoever holds it is told of a promise")]
+public sealed class PromiseToldToHolder {
+  public WorkItem Item;
+  public Principal Holder;
+  public string About = "";
+  public SlaMetric? Metric;
+  public SlaMoment? Moment;
+  public override string Sentence() { return ToldHolderWords(this); }
+}
+
+/// Its policy says to tell the leads that a promise is at risk or missed — whom only the app knows.
+[Event("The leads are told of a promise")]
+public sealed class PromiseToldToLeads {
+  public WorkItem Item;
+  public SlaMetric? Metric;
+  public SlaMoment? Moment;
+  public override string Sentence() { return ToldLeadsWords(this); }
+}
+
+/// It was linked to `Other` (as it was named) — the link's kind by its key; `Back`: this is the item the link names
+/// ("Duplicated by #1043" rather than "Duplicate of #1042").
+[Event("It is linked to another")]
+public sealed class ItemLinked {
+  public WorkItem Item;
+  public string Link = "";
+  public string Other = "";
+  public WorkItem? OtherItem;
+  public bool Back;
+  public override string Sentence() { return LinkedWords(this); }
+}
+
+/// A link of it was removed.
+[Event("A link of it is removed")]
+public sealed class ItemUnlinked {
+  public WorkItem Item;
+  public string Link = "";
+  public string Other = "";
+  public WorkItem? OtherItem;
+  public bool Back;
+  public override string Sentence() { return UnlinkedWords(this); }
+}
+
+// ── about any of them ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whether `e` is one of the inbox's own events.
+public bool IsInboxEvent(Event e) {
+  var own = typeof(ItemArrived).FullName;
+  var space = own.Substring(0, own.LastIndexOf(".") + 1);
+  var type = Events.Type(e);
+  return type.StartsWith(space) && !type.Substring(space.Length).Contains(".");
+}
+
+/// When `e` happened — a promise's moment as its clock reached it (an imported item's breach is dated at its own minute,
+/// not the night it was found), else when it was raised.
+public DateTime InboxTime(Event e) {
+  if (e is PromiseAtRisk risk) { return risk.At; }
+  if (e is PromiseBreached missed) { return missed.At; }
+  var delivery = Events.Delivery();
+  return delivery != null ? delivery!.RaisedAt : DateTime.UtcNow;
+}
+
+/// What `e` says to the PERSON IT NAMES — the one offered it, the cover handed it, the holder or a lead told of a promise
+/// — in their language: "Offered to you.", "Handed to you — Ines is away until Mon 8 Jun 06:00 UTC.", "First response
+/// is at risk.", "Nobody has picked it up in Billing — it has waited more than 30 minutes." Any other event says its own
+/// sentence. The item's own line is the app's to show beside it (its title as it is now).
+public string InboxNotice(Event e) {
+  if (e is ItemOffered offered) { return OfferedNotice(offered.Step); }
+  if (e is HolderChanged handed) { return HandedNotice(handed.Step); }
+  if (e is PromiseToldToHolder holder) { return PromiseNotice(holder.Metric, holder.Moment) ?? e.Sentence(); }
+  if (e is PromiseToldToLeads leads) { return PromiseNotice(leads.Metric, leads.Moment) ?? e.Sentence(); }
+  return e.Sentence();
+}
+
+// ── how each says itself — the facts as `happened`, in the reader's language ─────────────────────────────────────────
+
+/// How somebody is named on the trail: their name as it is now, their address when they have none, "" for nobody.
+string NameAt(Principal? p) {
+  if (p == null) { return ""; }
+  return p.DisplayName != "" ? p.DisplayName : p.Email;
+}
+
+/// A step of the trail as the facts an event carries, and the trail says.
+InboxStep StepOf(Assignment a) {
+  return new InboxStep {
+    Reason = a.Reason, From = NameAt(a.From), To = NameAt(a.To), By = NameAt(a.By), About = NameAt(a.About),
+    Queue = a.ToQueue != null ? a.ToQueue.Name : "", FromQueue = a.FromQueue != null ? a.FromQueue.Name : "",
+    Rule = a.Rule != null ? a.Rule.Name : "", Because = a.Because, Until = a.Until, Minutes = a.Minutes, Level = a.Level,
+    Metric = a.Metric, Moment = a.Moment, Detail = a.Detail, At = a.At,
+  };
+}
+
+/// The words for an account step — "account owner", "backup", "account team".
+string StepWord(AssignReason step) {
+  if (step == AssignReason.AccountOwner) { return "account owner"; }
+  if (step == AssignReason.AccountBackup) { return "backup"; }
+  return "account team";
+}
+
+/// An instant as a person reads it on the trail — "Mon 8 Jun 06:00 UTC", in their language.
+string When(DateTime at) { return $"{at:ddd d MMM HH:mm} UTC"; }
+
+/// A promise's moment, in the app's words for the promise — "First reply is at risk", "Resolution was missed".
+string MomentWords(SlaMetric metric, SlaMoment moment) {
+  var promise = Capital(Words(metric));
+  return moment == SlaMoment.AtRisk ? $"{promise} is at risk" : $"{promise} was missed";
+}
+
+/// Why somebody could not take it, as the start of a sentence — "Ines is away until Mon 8 Jun 06:00 UTC".
+string Unavailable(string who, Unavailability? because, DateTime? until) {
+  var name = who == "" ? "Somebody" : who;
+  if (because == Unavailability.Away && until != null) { return $"{name} is away until {When(until.Value)}"; }
+  if (because == Unavailability.Away) { return $"{name} is away"; }
+  if (because == Unavailability.Busy) { return $"{name} is busy"; }
+  if (because == Unavailability.Offline) { return $"{name} is offline"; }
+  if (because == Unavailability.OffShift) { return $"{name} is off shift"; }
+  if (because == Unavailability.AtCapacity) { return $"{name} is at capacity"; }
+  return $"{name} may not hold it";
+}
+
+/// What a promise's moment says — "First reply is at risk.", "Resolution time was missed.", "First reply met late."
+string PromiseWords(SlaMetric metric, string moment) {
+  var promise = Capital(Words(metric));
+  if (moment == "at-risk") { return $"{promise} is at risk."; }
+  if (moment == "breached") { return $"{promise} time was missed."; }
+  if (moment == "met-late") { return $"{promise} met late."; }
+  return $"{promise} met.";
+}
+
+string ArrivedWords(ItemArrived happened) {
+  if (happened.Policy != "") { return $"Arrived — promised by {happened.Policy}."; }
+  if (happened.Due != null) { return $"Arrived — due by {happened.Due.Value:d MMMM yyyy HH:mm} UTC."; }
+  return "Arrived — no promise applies.";
+}
+
+string PooledWords(ItemPooled happened) {
+  var queue = happened.Queue;
+  return happened.Language != "" ? $"Waiting for a speaker of {happened.Language} to be free."
+                                 : $"Waiting in {queue} for somebody to be free.";
+}
+
+string SkippedWords(InboxStep happened) {
+  var about = happened.About != "" ? happened.About : "somebody";
+  if (happened.Reason == null && happened.Rule != "") { return $"Rule “{happened.Rule}” names {about}, who may not hold it here."; }
+  return InboxStepWords(happened);
+}
+
+string OverdueWords(PickupOverdue happened) {
+  var queue = happened.Queue;
+  return $"Nobody has picked it up in {queue} — it has waited more than {happened.Minutes ?? 0} minutes.";
+}
+
+string WithdrawnWords(OfferWithdrawn happened) {
+  var to = happened.To != "" ? happened.To : "nobody";
+  var about = happened.About != "" ? happened.About : "somebody";
+  return $"The offer to {about} is withdrawn — {to} has it.";
+}
+
+string PrioritisedWords(PriorityChanged happened) {
+  if (happened.WasPriority == null || happened.Priority == null) { return "Something happened."; }
+  var was = happened.WasPriority.Value.Label;
+  var now = happened.Priority.Value.Label;
+  if (happened.Metric != null && happened.Moment != null) {
+    return $"Priority {was} → {now} — {MomentWords(happened.Metric.Value, happened.Moment.Value)}.";
+  }
+  return $"Priority {was} → {now}.";
+}
+
+string DueWords(DueMoved happened) {
+  var due = happened.Due != null ? $"{happened.Due.Value:d MMM yyyy}" : "—";
+  var wasDue = happened.WasDue != null ? $"{happened.WasDue.Value:d MMM yyyy}" : "—";
+  return $"Due {wasDue} → {due}: {happened.Detail}";
+}
+
+string CancelledWords(ItemCancelled happened) { return $"Cancelled: {happened.Detail}"; }
+
+string LinkedWords(ItemLinked happened) { return $"Linked: {LinkWords(happened.Link, happened.Back)} {happened.Other}."; }
+
+string UnlinkedWords(ItemUnlinked happened) { return $"Link removed: {LinkWords(happened.Link, happened.Back)} {happened.Other}."; }
+
+string ToldHolderWords(PromiseToldToHolder happened) {
+  var about = happened.About != "" ? happened.About : "somebody";
+  if (happened.Metric == null || happened.Moment == null) { return "Something happened."; }
+  return $"Told {about}: {MomentWords(happened.Metric.Value, happened.Moment.Value)}.";
+}
+
+string ToldLeadsWords(PromiseToldToLeads happened) {
+  if (happened.Metric == null || happened.Moment == null) { return "Something happened."; }
+  return $"Told the leads: {MomentWords(happened.Metric.Value, happened.Moment.Value)}.";
+}
+
+/// "Offered to you — it is yours if you take it within 15 minutes."
+string OfferedNotice(InboxStep happened) {
+  return happened.Minutes != null && happened.Minutes > 0
+    ? $"Offered to you — it is yours if you take it within {happened.Minutes} minutes." : "Offered to you.";
+}
+
+/// What a step that put it on somebody says to them — "Handed to you — Ines is away until …", "Escalated to you in L2."
+string HandedNotice(InboxStep happened) {
+  var by = happened.By;
+  var r = happened.Reason;
+  if ((r == AssignReason.OwnerAway || r == AssignReason.Cover || r == AssignReason.OffHoursCover) && happened.From != "") {
+    return $"Handed to you — {Unavailable(happened.From, Unavailability.Away, happened.Until)}.";
+  }
+  if (r == AssignReason.Escalated) { return $"Escalated to you in {happened.Queue}."; }
+  if (by != "" && by != happened.To) { return $"{by} handed it to you."; }
+  return "Given to you.";
+}
+
+/// "First response is at risk." — said to whoever holds it, or a lead.
+string? PromiseNotice(SlaMetric? metric, SlaMoment? moment) {
+  if (metric == null || moment == null) { return null; }
+  return $"{MomentWords(metric.Value, moment.Value)}.";
+}
+
+/// What a step of the trail says to whoever is reading — "Arrived in Billing — rule “Billing words”.", "Ines took it.",
+/// "Moved to Billing by Rahul." The one place the trail is put into words: the trail on screen and every step's event
+/// read it here.
+public string InboxStepWords(InboxStep happened) {
+  var to = happened.To != "" ? happened.To : "nobody";
+  var from = happened.From != "" ? happened.From : "nobody";
+  var by = happened.By;
+  var about = happened.About != "" ? happened.About : "somebody";
+  var queue = happened.Queue;
+  var r = happened.Reason;
+  if (r == null) { return "Something happened."; }
+  if (r == AssignReason.Arrived) { return $"Arrived in {queue}."; }
+  if (r == AssignReason.Rule && happened.To == "") { return $"Arrived in {queue} — rule “{happened.Rule}”."; }
+  if (r == AssignReason.Rule) { return $"Given to {to} — rule “{happened.Rule}”."; }
+  if (r == AssignReason.Claimed) { return $"{to} took it."; }
+  if (r == AssignReason.HandedOn) {
+    return by == "" || by == happened.To ? $"{to} took it." : $"{by} handed it to {to}.";
+  }
+  if (r == AssignReason.Released && happened.Until != null) {
+    return $"{Unavailable(from, Unavailability.Away, happened.Until)} — back to {queue}.";
+  }
+  if (r == AssignReason.Released) {
+    return by == "" || by == happened.From ? $"{from} released it." : $"{by} released it from {from}.";
+  }
+  if (r == AssignReason.Moved) {
+    var moved = by == "" ? $"Moved to {queue}." : $"Moved to {queue} by {by}.";
+    return happened.From != "" && happened.To == "" ? $"{moved} {from} is not in {queue}, so it is unheld." : moved;
+  }
+  if (r == AssignReason.Escalated) {
+    var level = happened.Level ?? 0;
+    var up = happened.Metric != null && happened.Moment != null
+      ? $"Escalated to {queue} (L{level}) — {MomentWords(happened.Metric.Value, happened.Moment.Value)}."
+      : happened.Detail != "" ? $"Escalated to {queue} (L{level}) — {happened.Detail}."
+      : $"Escalated to {queue} (L{level}).";
+    return happened.From != "" && happened.To == "" ? $"{up} {from} is not in {queue}, so it is unheld." : up;
+  }
+  if (r == AssignReason.RoundRobin) { return $"Given to {to} — their turn in {queue}."; }
+  if (r == AssignReason.LeastLoaded) { return $"Given to {to} — the least loaded in {queue}."; }
+  if (r == AssignReason.Refill) { return $"Given to {to} — they were free."; }
+  if (r == AssignReason.Cover) { return $"{Unavailable(from, Unavailability.Away, happened.Until)} — covered by {to}."; }
+  if (r == AssignReason.OffHoursCover) { return $"{from} is off shift — {to} is on, and has it now."; }
+  if (r == AssignReason.OwnerAway || r == AssignReason.Skipped) {
+    return $"{Unavailable(happened.About, happened.Because, happened.Until)} — skipped.";
+  }
+  if (r == AssignReason.FellThrough && happened.Because == Unavailability.DidNotTake) {
+    return $"{about} did not take it in {happened.Minutes ?? 0} minutes — it falls through.";
+  }
+  if (r == AssignReason.FellThrough && happened.Because == Unavailability.Declined) { return $"{about} declined it."; }
+  if (r == AssignReason.FellThrough && happened.Because != null) {
+    return $"{Unavailable(happened.About, happened.Because, happened.Until)} — the offer falls through.";
+  }
+  if (r == AssignReason.FellThrough) { return $"To {queue} — the account team could not take it."; }
+  if (r == AssignReason.AccountOwner || r == AssignReason.AccountBackup || r == AssignReason.AccountPod) {
+    var step = StepWord(r.Value);
+    if (happened.To == "") {
+      return $"Offered to {about} ({step}); it falls through after {happened.Minutes ?? 0} minutes.";
+    }
+    return $"{to} took the offer ({step}).";
+  }
+  if (r == AssignReason.Imported) { return happened.To != "" ? $"Imported — held by {to}." : $"Imported into {queue}."; }
+  return "Something happened.";
+}
+
+// ── the trail, as its reader reads it ────────────────────────────────────────────────────────────────────────────────
+
+/// One step of an item's trail, said for its reader.
+public class TrailLine {
+  public Guid Id;
+  public int Step;
+  public AssignReason Reason;
+  public string Text = "";
+  public DateTime At;
+}
+
+/// `item`'s trail — every change of holder or queue, oldest first — said for the reader, in their language: "Arrived in
+/// Billing — rule “Billing words”.", "Offered to Ines (account owner) …", "Given to Rahul — the least loaded in
+/// Billing.". One read, with the names it shows.
+[SuppressWarning("cost-unbounded-read")]   // one item's trail
+public List<TrailLine> TrailLines(WorkItem item) {
+  return SaidSteps(Assignment.Where(a => a.Item == item).Include(a => a.From).Include(a => a.To).Include(a => a.By)
+    .Include(a => a.About).Include(a => a.ToQueue).Include(a => a.FromQueue).Include(a => a.Rule).OrderBy(a => a.Step).ToList());
+}
+
+/// The steps `ids` said for the reader — what a trail on screen fetches for the steps it has not said yet.
+[SuppressWarning("cost-unbounded-read")]   // one row per id the trail on screen asks for
+public List<TrailLine> TrailWords(List<Guid> ids) {
+  if (ids.Count == 0) { return new List<TrailLine>(); }
+  return SaidSteps(Assignment.Where(a => ids.Contains(a.Id)).Include(a => a.From).Include(a => a.To).Include(a => a.By)
+    .Include(a => a.About).Include(a => a.ToQueue).Include(a => a.FromQueue).Include(a => a.Rule).OrderBy(a => a.Step).ToList());
+}
+
+List<TrailLine> SaidSteps(List<Assignment> steps) {
+  var lines = new List<TrailLine>();
+  foreach (var a in steps) {
+    lines.Add(new TrailLine { Id = a.Id, Step = a.Step, Reason = a.Reason, At = a.At, Text = InboxStepWords(StepOf(a)) });
+  }
+  return lines;
+}
+
+/// The sentence `said` holds for step `id` — "" when it is not among them.
+public string TrailTextFor(List<TrailLine> said, Guid id) {
+  foreach (var l in said) { if (l.Id == id) { return l.Text; } }
+  return "";
+}

@@ -1,0 +1,17 @@
+// The producer's test project for Osysharp.WorkQueues — the smallest correct consumer, with TWO kinds of work so the kit's
+// generality is proven here and not only by the helpdesk: a `Request` (support-shaped: a requester who waits on us) and a
+// `Spend` (approval-shaped, with its OWN lifecycle workflow — two runs per item, which must agree).
+app InboxKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Identity@0;
+  use Osysharp.Organizations@0;
+  use Osysharp.Organizations.ServicePlans@0;
+  use Osysharp.Presence@0;
+  use Osysharp.Observability;
+  use Osysharp.WorkQueues@0;
+  use Osysharp.Workflow;
+  use Osysharp.ServiceHours;
+  use Osysharp.Ui;
+}
+

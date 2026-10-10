@@ -1,0 +1,339 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Workflow;
+
+// ── the four facts the app tells the kit ──────────────────────────────────────────────────────────────────────────────
+//
+// Each is a kit function that raises an event on the item's `WorkHandling` run. Call them where the fact HAPPENS — in
+// the function that sends the reply, in the `enter` of the app's own waiting state — and `at:` an instant to replay an
+// imported item's history as it really happened.
+//
+// ⚑ WHO MAY SAY IT: "we responded" and a change of priority are staff's (`WorksInbox`) — and refused from a timer, which
+//   is nobody. The others may be said by anyone who can read the item (staff, or the requester about their own), and
+//   from a timer in the app's own lifecycle — a week of silence that solves a ticket says `WorkDone` with nobody behind it.
+
+/// We gave the requester a response. Meets the first response, or the response owed since they last wrote.
+public void Responded(WorkItem item, DateTime? at = null) {
+  if (at == null) { WorkHandling.RaiseRespond(item); } else { WorkHandling.RaiseRespond(item, at: at.Value); }
+}
+
+/// The requester wrote. A response is owed again (unless one already is).
+public void RequesterWrote(WorkItem item, DateTime? at = null) {
+  if (at == null) { WorkHandling.RaiseRequesterWrites(item); } else { WorkHandling.RaiseRequesterWrites(item, at: at.Value); }
+}
+
+/// The item waits on someone: the requester (every clock pauses), somebody else (resolution runs, unless the policy
+/// pauses it), or nobody — held by agreement (every clock pauses). `ResumeWork` ends it; so does the requester writing.
+public void WaitOn(WorkItem item, WaitFor reason, DateTime? at = null) {
+  if (at == null) { WorkHandling.RaiseWait(item, reason); } else { WorkHandling.RaiseWait(item, reason, at: at.Value); }
+}
+
+/// The wait is over — the item is worked again, and a response is owed.
+public void ResumeWork(WorkItem item, DateTime? at = null) {
+  if (at == null) { WorkHandling.RaiseResume(item); } else { WorkHandling.RaiseResume(item, at: at.Value); }
+}
+
+/// It is done — solved, approved, decided. Meets the resolution clock. It may reopen.
+public void WorkDone(WorkItem item, DateTime? at = null) {
+  if (at == null) { WorkHandling.RaiseFinish(item); } else { WorkHandling.RaiseFinish(item, at: at.Value); }
+}
+
+/// It was done, and is not — the resolution clock runs again from where it stopped.
+public void ReopenWork(WorkItem item, DateTime? at = null) {
+  if (at == null) { WorkHandling.RaiseReopen(item); } else { WorkHandling.RaiseReopen(item, at: at.Value); }
+}
+
+/// Closed for good. An item closed before it was done is done first.
+public void CloseWork(WorkItem item, DateTime? at = null) {
+  if (at == null) { WorkHandling.RaiseClose(item); } else { WorkHandling.RaiseClose(item, at: at.Value); }
+}
+
+/// Cancelled — a duplicate, withdrawn. Every clock still owed ends with nothing to measure.
+public void CancelWork(WorkItem item, string reason) { WorkHandling.RaiseCancel(item, reason); }
+
+/// Change how urgent the item is: the policy is chosen again, and every clock still running is retargeted to the new
+/// promise, keeping the time already used.
+public void Prioritise(WorkItem item, WorkPriority priority) { WorkHandling.RaiseReprioritise(item, priority); }
+
+/// Move the item's absolute due date (an extension the law allows, a deadline agreed again), saying why — recorded on
+/// the item's trail; its resolution clock is retargeted to the new instant.
+public void MoveDue(WorkItem item, DateTime due, string why) { WorkHandling.RaiseMoveDue(item, due, why); }
+
+// ── the run ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One run per item, of ANY kind the app derives — beside the app's own lifecycle run, if it has one. The app owns the
+/// states; this run owns the time.
+///
+/// The RESOLUTION clock is the run's `Deadline`, accruing in the states that are worked; the RESPONSE clocks are the
+/// milestones of the `Respond` slot in `New` (first) and `Owed` (next). Each budget is what is LEFT of the item's
+/// promise (`Left`), so a clock that was paused resumes where it stopped. Every clock is also kept as an `SlaClock`
+/// record, written as it starts, pauses, goes at risk, is met or is breached.
+public workflow WorkHandling {
+  Tracks       = WorkItem.Handling;
+  Autostart    = true;
+  Initial      = New;
+  // An imported item keeps its real history: the run is taken to have started when the work arrived.
+  StartedAt    = this.Item.ArrivedAt;
+  ServiceHours = this.Item.Hours;
+  Accrues      = [New, Owed, Answered, WaitingOnOthers];
+  // The resolution promise. It goes at risk at the item's fraction of the WHOLE budget, measured on the deadline's own
+  // clock — paused while the item waits, moved when the promise is retargeted.
+  Deadline {
+    Within = TargetFor(this.Item, SlaMetric.Resolution);
+    Remind AtRisk(After = Within * this.Item.AtRiskAt) { AtRisk(this.Item, SlaMetric.Resolution); }
+    // An ABSOLUTE due date (`DueAt`) is real time: these two fire at its at-risk point and at the instant itself, through
+    // nights, weekends and waits alike. (The SLA-time reminder and `on Deadline` above then find the moment already
+    // recorded, and do nothing.) An item without one arms neither.
+    Remind DueAtRisk(After = AbsoluteAtRiskIn(this.Item), Accrues = false) { AtRisk(this.Item, SlaMetric.Resolution); }
+    Remind Due(After = AbsoluteDueIn(this.Item), Accrues = false) { Breached(this.Item, SlaMetric.Resolution); }
+  }
+
+  [Authorize(u => WorksInbox)]
+  event Respond();
+  event RequesterWrites();
+  event Wait(WaitFor reason);
+  event Resume();
+  event Finish();
+  event Reopen();
+  event Close();
+  event Cancel(string reason);
+  [Authorize(u => WorksInbox)]
+  event Reprioritise(WorkPriority priority);
+  [Authorize(u => WorksInbox)]
+  event MoveDue(DateTime due, string why);
+  [Authorize(u => WorksInbox)]
+  event Escalate(string why);
+
+  // Who holds it, and where it waits (Holding.osy). An agent's verbs and a lead's are separate events, so the rule
+  // that only a lead moves a colleague's work is the event's own gate, not a check a caller could skip.
+  [Authorize(u => WorksInbox)]
+  event Take(Guid? expected);
+  [Authorize(u => LeadsInbox)]
+  event TakeOver(Guid? expected);
+  [Authorize(u => WorksInbox)]
+  event HandTo(Principal to, Guid? expected);
+  [Authorize(u => LeadsInbox)]
+  event HandOver(Principal to, Guid? expected);
+  [Authorize(u => LeadsInbox || u == this.Item.Assignee)]
+  event Release();
+  [Authorize(u => WorksInbox)]
+  event Move(Queue to);
+  [Authorize(u => LeadsInbox)]
+  event MoveOver(Queue to);
+  // The offered person says no: it falls through at once.
+  [Authorize(u => this.Item.OfferedTo != null && u == this.Item.OfferedTo)]
+  event Decline();
+  // The pool may have somebody for this now — raised by the kit when a person's load drops. Ungated, because a body
+  // driven by nobody (a timer, a reminder) raises it too; and safe ungated, because its arm decides nothing from the
+  // raise: it routes the item exactly as an arrival would, from the rows, and does nothing to an item that is held,
+  // offered, done, or in a queue that hands nothing out.
+  event Route();
+
+  on Take(Guid? expected) { HoldFor(this.Item, actor, actor, AssignReason.Claimed, expected, false); }
+  on TakeOver(Guid? expected) { HoldFor(this.Item, actor, actor, AssignReason.Claimed, expected, true); }
+  on HandTo(Principal to, Guid? expected) { HoldFor(this.Item, to, actor, AssignReason.HandedOn, expected, false); }
+  on HandOver(Principal to, Guid? expected) { HoldFor(this.Item, to, actor, AssignReason.HandedOn, expected, true); }
+  on Release { LetGo(this.Item, actor); }
+  on Move(Queue to) { MoveTo(this.Item, to, actor, false); TakePolicy(this.Item); Workflow.Retarget(); }
+  on MoveOver(Queue to) { MoveTo(this.Item, to, actor, true); TakePolicy(this.Item); Workflow.Retarget(); }
+  on Route { if (Pooled(this.Item)) { Distribute(this.Item, AssignReason.Refill); } }
+  on Decline { Withdraw(this.Item, Unavailability.Declined); }
+
+  Start {
+    // Its tier is read once, for where it waits and what it is promised.
+    var tier = TierOf(this.Item);
+    ArriveAt(this.Item, tier);
+    TakePolicyAt(this.Item, tier, started: false);
+    if (RoutesByAccount(this.Item)) { RouteOn(this.Item, 0); } else { Distribute(this.Item, null); }
+    Raise(new ItemArrived { Item = this.Item, Policy = this.Item.Policy != null ? this.Item.Policy.Name : "", Due = this.Item.DueAt });
+  }
+
+  // The resolution promise ran out. Recorded, never fatal: the item carries on, still owed.
+  on Deadline { Breached(this.Item, SlaMetric.Resolution); }
+
+  on Escalate(string why) { LevelUp(this.Item, actor, why, null); TakePolicy(this.Item); Workflow.Retarget(); }
+
+  on Reprioritise(WorkPriority priority) {
+    var was = this.Item.Priority;
+    this.Item.Priority = priority;
+    TakePolicy(this.Item);
+    Workflow.Retarget();
+    Raise(new PriorityChanged { Item = this.Item, WasPriority = was, Priority = priority });
+  }
+
+  on MoveDue(DateTime due, string why) {
+    if (why.Trim() == "") { throw new ValidationException("Say why the due date moves — it is recorded on the item."); }
+    var was = this.Item.DueAt;
+    this.Item.DueAt = due;
+    TakePolicy(this.Item);
+    RetimeAbsolute(this.Item);
+    Workflow.Retarget();
+    Raise(new DueMoved { Item = this.Item, WasDue = was, Due = due, Detail = why.Trim() });
+  }
+
+  on Cancel(string reason) {
+    when (this.Item.Handling == Handling.Closed || this.Item.Handling == Handling.Cancelled) { }
+    default {
+      var clocks = RunningClocks(this.Item);
+      EndClockIn(this.Item, clocks, SlaMetric.FirstResponse);
+      EndClockIn(this.Item, clocks, SlaMetric.NextResponse);
+      EndClockIn(this.Item, clocks, SlaMetric.Resolution);
+      Raise(new ItemCancelled { Item = this.Item, Detail = reason });
+      goto Cancelled;
+    }
+  }
+
+  on Close {
+    when (this.Item.Handling == Handling.Closed || this.Item.Handling == Handling.Cancelled) { }
+    when (this.Item.Handling != Handling.Done) { EndTheWork(this.Item); goto Closed; }
+    default { goto Closed; }
+  }
+
+  on Finish {
+    when (this.Item.Handling == Handling.Done || this.Item.Handling == Handling.Closed || this.Item.Handling == Handling.Cancelled) { }
+    default { EndTheWork(this.Item); goto Done; }
+  }
+
+  // The requester wrote: a response is owed — the first, if none was ever given.
+  on RequesterWrites {
+    when (IsWaitingOrAnswered(this.Item) && this.Item.FirstRespondedAt == null) { goto New; }
+    when (IsWaitingOrAnswered(this.Item)) { goto Owed; }
+    when (this.Item.Handling == Handling.Done) {
+      ReopenClock(this.Item, SlaMetric.Resolution);
+      this.Item.DoneAt = null;
+      Raise(new ItemReopened { Item = this.Item, ByRequester = true });
+      goto Owed;
+    }
+    default { }
+  }
+
+  on Wait(WaitFor reason) {
+    when (this.Item.Handling == Handling.Done || this.Item.Handling == Handling.Closed || this.Item.Handling == Handling.Cancelled) { }
+    when (reason == WaitFor.Requester) { goto WaitingOnRequester; }
+    when (reason == WaitFor.Others && (this.Item.Policy == null || !this.Item.Policy.PauseWhileWaitingOnOthers)) { goto WaitingOnOthers; }
+    default { goto Paused; }
+  }
+
+  on Resume {
+    when (IsWaiting(this.Item) && this.Item.FirstRespondedAt == null) { goto New; }
+    when (IsWaiting(this.Item)) { goto Owed; }
+    default { }
+  }
+
+  on Reopen {
+    when (this.Item.Handling == Handling.Done) {
+      ReopenClock(this.Item, SlaMetric.Resolution);
+      this.Item.DoneAt = null;
+      Raise(new ItemReopened { Item = this.Item });
+      goto Owed;
+    }
+    default { }
+  }
+
+  /// Nobody has responded. The first-response clock runs.
+  state New {
+    enter { RunClocks(this.Item, [SlaMetric.Resolution, SlaMetric.FirstResponse]); }
+    exit  { PauseClock(this.Item, SlaMetric.FirstResponse); }
+    subscribe Respond() as FirstResponse {
+      Finished {
+        Within = Left(this.Item, SlaMetric.FirstResponse);
+        Remind AtRisk(After = AtRiskIn(this.Item, SlaMetric.FirstResponse)) { AtRisk(this.Item, SlaMetric.FirstResponse); }
+        // Nobody has picked it up in the queue's pickup time — the leads are told. Real time since it arrived.
+        Remind Pickup(After = PickupIn(this.Item), Accrues = false) { PickupDue(this.Item); }
+        // Follow-the-sun: halfway to the promise, a holder off their hours hands it to somebody on theirs.
+        Remind OffHours(After = OffHoursCheckIn(this.Item)) { CoverIfOffHours(this.Item); }
+        // The language wait is over: anybody free may be given it now.
+        Remind LanguageWait(After = LanguageWaitIn(this.Item), Accrues = false) {
+          if (Pooled(this.Item)) { Distribute(this.Item, null); }
+        }
+        // No goto: still owed, and still shown as owed.
+        Unfinished { Breached(this.Item, SlaMetric.FirstResponse); }
+      }
+    }
+    on FirstResponse {
+      AcceptOnResponse(this.Item, actor);
+      Met(this.Item, SlaMetric.FirstResponse);
+      this.Item.FirstRespondedAt = DurableClock.UtcNow;
+      goto Answered;
+    }
+  }
+
+  /// The requester wrote; a response is owed. A next-response clock runs — the one owed since they wrote, resumed if a
+  /// wait paused it.
+  state Owed {
+    enter { RunClocks(this.Item, [SlaMetric.Resolution, SlaMetric.NextResponse]); }
+    exit  { PauseClock(this.Item, SlaMetric.NextResponse); }
+    subscribe Respond() as NextResponse {
+      Finished {
+        Within = Left(this.Item, SlaMetric.NextResponse);
+        Remind AtRisk(After = AtRiskIn(this.Item, SlaMetric.NextResponse)) { AtRisk(this.Item, SlaMetric.NextResponse); }
+        Unfinished { Breached(this.Item, SlaMetric.NextResponse); }
+      }
+    }
+    on NextResponse {
+      AcceptOnResponse(this.Item, actor);
+      Met(this.Item, SlaMetric.NextResponse);
+      if (this.Item.FirstRespondedAt == null) { this.Item.FirstRespondedAt = DurableClock.UtcNow; }
+      goto Answered;
+    }
+  }
+
+  /// Responded, and nothing is owed until they write again.
+  state Answered {
+    enter { RunClock(this.Item, SlaMetric.Resolution); }
+    // Responding again owes nothing and changes nothing.
+    on Respond { }
+  }
+
+  /// Waiting on the requester: every clock is paused — and it no longer counts toward its holder's load.
+  state WaitingOnRequester {
+    enter { PauseClock(this.Item, SlaMetric.Resolution); Refill(this.Item.Assignee, this.Item); }
+    on Respond { }
+  }
+
+  /// Waiting on somebody else: resolution runs — the requester still waits on us.
+  state WaitingOnOthers {
+    enter { RunClock(this.Item, SlaMetric.Resolution); }
+    on Respond { }
+  }
+
+  /// Held: every clock is paused.
+  state Paused {
+    enter { PauseClock(this.Item, SlaMetric.Resolution); }
+    on Respond { }
+  }
+
+  /// Done. The resolution clock is met; it may reopen. Its holder has room for the next.
+  state Done {
+    enter { PauseClock(this.Item, SlaMetric.Resolution); Refill(this.Item.Assignee, this.Item); }
+    on Respond { }
+  }
+
+  terminal success Closed { }
+  terminal cancel Cancelled { }
+}
+
+/// Waiting on anybody — the requester, others, or held.
+bool IsWaiting(WorkItem item) {
+  return item.Handling == Handling.WaitingOnRequester || item.Handling == Handling.WaitingOnOthers || item.Handling == Handling.Paused;
+}
+
+/// Waiting, or answered with nothing owed — where the requester writing makes a response owed again.
+bool IsWaitingOrAnswered(WorkItem item) { return item.Handling == Handling.Answered || IsWaiting(item); }
+
+/// The work is done: whatever response is owed ends unanswered, and the resolution is met.
+void EndTheWork(WorkItem item) {
+  var clocks = RunningClocks(item);
+  EndClockIn(item, clocks, SlaMetric.FirstResponse);
+  EndClockIn(item, clocks, SlaMetric.NextResponse);
+  MetIn(item, clocks, SlaMetric.Resolution);
+  item.DoneAt = DurableClock.UtcNow;
+}
+
+string Label(WorkPriority p) {
+  if (p == WorkPriority.Low) { return "Low"; }
+  if (p == WorkPriority.High) { return "High"; }
+  if (p == WorkPriority.Urgent) { return "Urgent"; }
+  return "Normal";
+}

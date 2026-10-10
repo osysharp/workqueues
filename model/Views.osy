@@ -1,0 +1,401 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.Workflow;
+
+// ── views: what a list shows, and how many ────────────────────────────────────────────────────────────────────────────
+//
+// ⚑ A VIEW ONLY FILTERS. Every list and every count is the VIEWER's own read, through every rule — the app's grants,
+//   the kit's floor, a restricted queue — so a view, a saved view or a count can never show anybody an item they may
+//   not read (SECURITY-INVARIANTs inbox-a-view-grants-nothing, inbox-a-count-is-the-viewers-own).
+//
+// Phases: WORKING = New, Owed, Answered · WAITING = waiting on the requester, on others, or paused · DONE = done.
+
+/// The views every inbox has. No setup; every app gets the same words.
+public enum BuiltInView {
+  /// What I hold — worked or waiting.
+  [Label("Mine")] Mine,
+  /// What is offered to me first (account routing).
+  [Label("Offered to me")] Offered,
+  /// The work of the organisations whose account team I am on.
+  [Label("My accounts")] MyAccounts,
+  /// Worked, and nobody holds it.
+  [Label("Unassigned")] Unassigned,
+  /// Everything being worked.
+  [Label("All open")] Open,
+  /// Not done, and a promise is at risk or breached.
+  [Label("At risk")] AtRisk,
+  /// Waiting on the requester, on others, or held.
+  [Label("Waiting")] Waiting,
+  /// Done — may reopen.
+  [Label("Done")] Done,
+}
+
+/// Who a saved view's items must be held by.
+public enum Holder { [Label("Anyone")] Anyone, [Label("Me")] Me, [Label("Nobody")] Nobody }
+
+/// A saved view — one person's own, or shared with everybody on the inbox.
+public entity InboxView {
+  [Required("Name the view."), MaxLength(60)] string Name;
+  /// Whose it is; none: shared with everybody on the inbox.
+  Principal? Owner;
+  Queue? Queue;
+  Holder Holder = Holder.Anyone;
+  /// At least this urgent.
+  WorkPriority? AtLeast;
+  /// Items of organisations on this tier.
+  OrganizationTier? Tier;
+  CustomerAccount? Organization;
+  bool AtRiskOnly = false;
+  bool IncludeWaiting = false;
+  bool IncludeDone = false;
+  [MaxLength(20)] string Language = "";
+  [MaxLength(60)] string Segment = "";
+  [MaxLength(60)] string Kind = "";
+  /// The app's own filter, by key ("tag:refund") — `InboxSetup.Views.Narrow` says which items it keeps.
+  [MaxLength(80)] string AppFilter = "";
+  int Position = 0;
+  bool Active = true;
+  security {
+    // SECURITY-INVARIANT(inbox-a-view-grants-nothing): a view is a filter over what its reader may already read; a
+    // personal view is its owner's alone, and only an inbox admin keeps the shared ones. Guarded by
+    // tests/security.test.osy `a_personal_view_is_its_owners_and_a_shared_view_shows_each_reader_only_their_own_reads`.
+    allow read when WorksInbox where Owner == null || Owner == user;
+    // …and keeps the shared ones only when an inbox admin (SECURITY-INVARIANT inbox-service-levels-are-the-admins).
+    // One rule per kind of caller (`when` is who, `where` is which rows) — the floor an app may only tighten is derived
+    // per kind of caller, exactly.
+    allow create, update, delete when WorksInbox || AdministersInbox where Owner == user;
+    allow create, update, delete when AdministersInbox;
+  }
+}
+
+/// One row of a list — what the queue scans.
+public class WorkRow {
+  public Guid Id;
+  public string Title = "";
+  public string Reference = "";
+  public Guid? QueueId;
+  public string Queue = "";
+  public Guid? HolderId;
+  public string Holder = "";
+  public WorkPriority Priority;
+  public Handling Handling;
+  public Guid? OrganizationId;
+  public string Organization = "";
+  /// The organisation's tier — "Enterprise" — or empty.
+  public string Tier = "";
+  /// Who it is for, when they have an account.
+  public string Requester = "";
+  public string Language = "";
+  /// The app's own kind key ("incident", "po-over-10k").
+  public string Kind = "";
+  public string Segment = "";
+  public int EscalationLevel = 1;
+  public SlaState Sla;
+  /// When the governing promise runs out; none: no live promise.
+  public DateTime? DueAt;
+  /// The governing promise's whole budget, and which promise it is — none while nothing runs.
+  public TimeSpan? Budget;
+  public SlaMetric? Metric;
+  /// That promise in the app's words ("first response", "feedback due") — what a screen reader hears.
+  public string DueWord = "";
+  public bool EverBreached;
+  /// When the earliest promise still owed was MISSED — a late item's lateness counts from here ("−0:30"). The missed
+  /// clock is retired; what still runs (a missed first response leaves the resolution deadline) is `DueAt`.
+  public DateTime? BreachedAt;
+  /// That missed promise in the app's words ("first response") — "" when nothing was missed.
+  public string MissedWord = "";
+  public DateTime ArrivedAt;
+  /// Offered first to — while an account-routing offer is live — and when that offer falls through.
+  public Guid? OfferedToId;
+  public string OfferedTo = "";
+  public DateTime? OfferEndsAt;
+}
+
+/// What the rail shows — every built-in view's count and each queue's, from ONE grouped read.
+public class InboxCounts {
+  public int Mine = 0;
+  public int Offered = 0;
+  public int Unassigned = 0;
+  public int Open = 0;
+  public int AtRisk = 0;
+  public int Waiting = 0;
+  public int Done = 0;
+  public List<QueueCount> Queues = new List<QueueCount>();
+}
+
+/// One queue's count: its worked items, the unheld ones, and those at risk.
+public class QueueCount {
+  public Guid Queue;
+  public string Name = "";
+  public int Open = 0;
+  public int Unassigned = 0;
+  public int AtRisk = 0;
+}
+
+/// One group of the grouped read.
+public class Tally {
+  public Guid? Queue;
+  public Handling Handling;
+  public bool Mine;
+  public bool Held;
+  public bool Offered;
+  public SlaState Sla;
+  public int Count;
+}
+
+bool Working(Handling h) { return h == Handling.New || h == Handling.Owed || h == Handling.Answered; }
+bool Waiting(Handling h) {
+  return h == Handling.WaitingOnRequester || h == Handling.WaitingOnOthers || h == Handling.Paused;
+}
+
+/// Every count the rail shows — ONE grouped read of the items (queue × phase × held-by-me × held × offered × promise),
+/// as the viewer may read them, summed here; and one read of the queues' names.
+// SECURITY-INVARIANT(inbox-a-count-is-the-viewers-own): every count is the caller's own secured read of the items —
+// never a privileged aggregate — so a count can never say that items the viewer may not read exist. Guarded by
+// tests/security.test.osy `a_queue_count_never_includes_items_the_viewer_cannot_read`.
+[SuppressWarning("cost-unbounded-read")]   // the desk's active queues — configuration, not data (the counts are one grouped read)
+public InboxCounts Counts() {
+  var me = Session.CurrentUser;
+  var tallies = WorkItem.Where(w => w.Handling != Handling.Closed && w.Handling != Handling.Cancelled)
+    .GroupBy(w => new() { Queue = w.Queue.Id, Handling = w.Handling, Mine = w.Assignee == me, Held = w.Assignee != null,
+                          Offered = w.OfferedTo == me, Sla = w.Sla })
+    .Select(g => new Tally { Queue = g.Key.Queue, Handling = g.Key.Handling, Mine = g.Key.Mine, Held = g.Key.Held,
+                             Offered = g.Key.Offered, Sla = g.Key.Sla, Count = g.Count() })
+    .ToList();
+  return Summed(tallies, Queue.Where(q => q.Active).OrderBy(q => q.Position).ThenBy(q => q.Name).ToList());
+}
+
+/// The grouped read, summed into every view's and every queue's count. Pure: the rail sums the same tallies in the
+/// browser that `Counts()` sums on the server, so the two can never disagree about what a view holds.
+public InboxCounts Summed(List<Tally> tallies, List<Queue> queues) {
+  // Each count is its own sum over the tallies — the same in the browser (where this is the rail's live computation)
+  // and on the server.
+  return new InboxCounts {
+    Mine = tallies.Where(t => t.Mine && (Working(t.Handling) || Waiting(t.Handling))).Sum(t => t.Count),
+    Offered = tallies.Where(t => t.Offered && Working(t.Handling)).Sum(t => t.Count),
+    Unassigned = tallies.Where(t => !t.Held && Working(t.Handling)).Sum(t => t.Count),
+    Open = tallies.Where(t => Working(t.Handling)).Sum(t => t.Count),
+    AtRisk = tallies.Where(t => t.Sla != SlaState.OnTrack && Working(t.Handling)).Sum(t => t.Count),
+    Waiting = tallies.Where(t => Waiting(t.Handling)).Sum(t => t.Count),
+    Done = tallies.Where(t => t.Handling == Handling.Done).Sum(t => t.Count),
+    Queues = queues.Select(q => new QueueCount { Queue = q.Id, Name = q.Name,
+      Open = tallies.Where(t => t.Queue == q.Id && Working(t.Handling)).Sum(t => t.Count),
+      Unassigned = tallies.Where(t => t.Queue == q.Id && !t.Held && Working(t.Handling)).Sum(t => t.Count),
+      AtRisk = tallies.Where(t => t.Queue == q.Id && t.Sla != SlaState.OnTrack && Working(t.Handling)).Sum(t => t.Count),
+    }).ToList(),
+  };
+}
+
+/// The items of a built-in view, as the viewer may read them — one read.
+public List<WorkRow> Rows(BuiltInView view) {
+  var me = Session.CurrentUser;
+  var all = Workflow.WorkByItem<WorkItem>().Include(r => r.Item);
+  if (view == BuiltInView.Mine) {
+    return Project(all.Where(r => r.Item.Assignee == me && r.Item.Handling != Handling.Done).ToList());
+  }
+  if (view == BuiltInView.Offered) {
+    return Project(all.Where(r => r.Item.OfferedTo == me && (r.Item.Handling == Handling.New
+      || r.Item.Handling == Handling.Owed || r.Item.Handling == Handling.Answered)).ToList());
+  }
+  if (view == BuiltInView.MyAccounts) {
+    return Project(all.Where(r => r.Item.Handling != Handling.Done
+      && AccountTeamMember.Any(m => m.Organization == r.Item.Organization && m.Member == me)).ToList());
+  }
+  if (view == BuiltInView.Unassigned) {
+    return Project(all.Where(r => r.Item.Assignee == null && (r.Item.Handling == Handling.New
+      || r.Item.Handling == Handling.Owed || r.Item.Handling == Handling.Answered)).ToList());
+  }
+  if (view == BuiltInView.AtRisk) {
+    return Project(all.Where(r => r.Item.Sla != SlaState.OnTrack && (r.Item.Handling == Handling.New
+      || r.Item.Handling == Handling.Owed || r.Item.Handling == Handling.Answered)).ToList());
+  }
+  if (view == BuiltInView.Waiting) {
+    return Project(all.Where(r => r.Item.Handling == Handling.WaitingOnRequester
+      || r.Item.Handling == Handling.WaitingOnOthers || r.Item.Handling == Handling.Paused).ToList());
+  }
+  if (view == BuiltInView.Done) {
+    return Project(all.Where(r => r.Item.Handling == Handling.Done).ToList());
+  }
+  return Project(all.Where(r => r.Item.Handling == Handling.New || r.Item.Handling == Handling.Owed
+    || r.Item.Handling == Handling.Answered).ToList());
+}
+
+/// The items waiting in `queue` — worked or waiting — as the viewer may read them.
+public List<WorkRow> RowsIn(Queue queue) {
+  return Project(Workflow.WorkByItem<WorkItem>().Include(r => r.Item).Where(r => r.Item.Queue == queue && r.Item.Handling != Handling.Done).ToList());
+}
+
+/// The items of a saved view, as the viewer may read them — one read, then the app's own filter.
+public List<WorkRow> RowsOf(InboxView view) {
+  var me = Session.CurrentUser;
+  var rows = Workflow.WorkByItem<WorkItem>().Include(r => r.Item).Where(r =>
+      (r.Item.Handling == Handling.New || r.Item.Handling == Handling.Owed || r.Item.Handling == Handling.Answered
+       || (view.IncludeWaiting && (r.Item.Handling == Handling.WaitingOnRequester
+           || r.Item.Handling == Handling.WaitingOnOthers || r.Item.Handling == Handling.Paused))
+       || (view.IncludeDone && r.Item.Handling == Handling.Done))
+      && (view.Queue == null || r.Item.Queue == view.Queue)
+      && (view.Holder != Holder.Me || r.Item.Assignee == me)
+      && (view.Holder != Holder.Nobody || r.Item.Assignee == null)
+      && (view.Organization == null || r.Item.Organization == view.Organization)
+      && (view.Tier == null || r.Item.Organization.Tier == view.Tier)
+      && (!view.AtRiskOnly || r.Item.Sla != SlaState.OnTrack)
+      && (view.Language == "" || r.Item.Language == view.Language)
+      && (view.Segment == "" || r.Item.Segment == view.Segment)
+      && (view.Kind == "" || r.Item.Kind == view.Kind)).ToList();
+  if (view.AtLeast != null) {
+    var floor = view.AtLeast.Value;
+    rows = rows.Where(r => (int)r.Item.Priority >= (int)floor).ToList();
+  }
+  if (view.AppFilter != "") {
+    var keep = App.Setting<InboxSetup>().Views.Narrow(view.AppFilter);
+    rows = rows.Where(r => keep.Contains(r.Item.Id)).ToList();
+  }
+  return Project(rows);
+}
+
+/// The views the viewer has: the shared ones, then their own.
+[SuppressWarning("cost-unbounded-read")]   // the shared views and the caller's own — configuration, not data
+public List<InboxView> ViewsOf() {
+  var me = Session.CurrentUser;
+  return InboxView.Where(v => v.Active).OrderBy(v => v.Position).ThenBy(v => v.Name).ToList();
+}
+
+/// When a live offer falls through, by item — read off the offers' own runs.
+public class OfferEnd {
+  public Guid Item;
+  public DateTime? EndsAt;
+}
+
+/// When a promise on an item was missed, and which — read off the clocks still owed.
+public class MissedAt {
+  public Guid Item;
+  public SlaMetric Metric;
+  public DateTime? At;
+}
+
+/// The list's rows, with the names they show read ONCE per kind — the queues, the holders, the organisations — never
+/// once per row or per name (a list of 500 is not 1,500 lookups). The references are read off the items as ids: a
+/// reference's `.Id` and `!= null` read the key the item row already holds and load nothing, so the items are read
+/// once.
+[SuppressWarning("cost-unbounded-read")]   // the queues (configuration); every other read is keyed by the rows of one page
+List<WorkRow> Project(List<Osysharp.WorkItemRow_Osysharp_WorkQueues_WorkItem> rows) {
+  var queueNames = new Dictionary<Guid, string>();
+  foreach (var q in Queue.ToList()) { queueNames[q.Id] = q.Name; }
+  var holderOf = new Dictionary<Guid, Guid>();
+  var orgOf = new Dictionary<Guid, Guid>();
+  var requesterOf = new Dictionary<Guid, Guid>();
+  var offeredOf = new Dictionary<Guid, Guid>();
+  var personIds = new List<Guid>();
+  var orgIds = new List<Guid>();
+  var offeredItems = new List<Guid>();
+  foreach (var r in rows) {
+    var w = r.Item;
+    if (w.Assignee != null) {
+      holderOf[w.Id] = w.Assignee.Id;
+      if (!personIds.Contains(w.Assignee.Id)) { personIds.Add(w.Assignee.Id); }
+    }
+    if (w.Requester != null) {
+      requesterOf[w.Id] = w.Requester.Id;
+      if (!personIds.Contains(w.Requester.Id)) { personIds.Add(w.Requester.Id); }
+    }
+    if (w.OfferedTo != null) {
+      offeredOf[w.Id] = w.OfferedTo.Id;
+      offeredItems.Add(w.Id);
+      if (!personIds.Contains(w.OfferedTo.Id)) { personIds.Add(w.OfferedTo.Id); }
+    }
+    if (w.Organization != null) {
+      orgOf[w.Id] = w.Organization.Id;
+      if (!orgIds.Contains(w.Organization.Id)) { orgIds.Add(w.Organization.Id); }
+    }
+  }
+  var holderNames = new Dictionary<Guid, string>();
+  if (personIds.Count > 0) {
+    foreach (var p in Principal.Where(p => personIds.Contains(p.Id)).ToList()) { holderNames[p.Id] = NameOf(p); }
+  }
+  var orgNames = new Dictionary<Guid, string>();
+  var orgTiers = new Dictionary<Guid, string>();
+  if (orgIds.Count > 0) {
+    var tierOf = new Dictionary<Guid, Guid>();
+    var tierIds = new List<Guid>();
+    foreach (var o in CustomerAccount.Where(o => orgIds.Contains(o.Id))
+        .Select(o => new NamedRef { Id = o.Id, Name = o.Name, Ref = o.Tier.Id }).ToList()) {
+      orgNames[o.Id] = o.Name;
+      if (o.Ref != null && o.Ref.Value != Guid.Empty) {
+        tierOf[o.Id] = o.Ref.Value;
+        if (!tierIds.Contains(o.Ref.Value)) { tierIds.Add(o.Ref.Value); }
+      }
+    }
+    // The tiers' names — only when an organisation on the list has one.
+    if (tierIds.Count > 0) {
+      var tierNames = new Dictionary<Guid, string>();
+      foreach (var t in OrganizationTier.Where(t => tierIds.Contains(t.Id)).ToList()) { tierNames[t.Id] = t.Name; }
+      foreach (var kv in tierOf) { if (tierNames.ContainsKey(kv.Value)) { orgTiers[kv.Key] = tierNames[kv.Value]; } }
+    }
+  }
+  // When each late item's promise was missed — one read of the clocks still owed, only when a row is late.
+  var lateItems = rows.Where(r => r.Item.Sla == SlaState.Breached).Select(r => r.Item.Id).ToList();
+  var missed = new Dictionary<Guid, MissedAt>();
+  if (lateItems.Count > 0) {
+    foreach (var m in SlaClock.Where(c => lateItems.Contains(c.Item.Id) && c.Outcome == ClockOutcome.Running && c.BreachedAt != null)
+        .Select(c => new MissedAt { Item = c.Item.Id, Metric = c.Metric, At = c.BreachedAt }).ToList()) {
+      if (m.At == null) { continue; }
+      if (!missed.ContainsKey(m.Item) || m.At.Value < missed[m.Item].At!.Value) { missed[m.Item] = m; }
+    }
+  }
+  // When each live offer falls through — the instant its run expires, stamped on it when it was made.
+  var offerEnds = new Dictionary<Guid, DateTime>();
+  if (offeredItems.Count > 0) {
+    foreach (var o in RoutingOffer.Where(r => r.State == OfferState.Offered && offeredItems.Contains(r.Item.Id))
+        .Select(r => new OfferEnd { Item = r.Item.Id, EndsAt = r.EndsAt }).ToList()) {
+      if (o.EndsAt != null) { offerEnds[o.Item] = o.EndsAt.Value; }
+    }
+  }
+  var result = new List<WorkRow>();
+  foreach (var r in rows) {
+    var i = r.Item;
+    Guid? queueId = i.Queue == null ? null : i.Queue.Id;
+    Guid? holderId = holderOf.ContainsKey(i.Id) ? holderOf[i.Id] : null;
+    Guid? orgId = orgOf.ContainsKey(i.Id) ? orgOf[i.Id] : null;
+    Guid? requesterId = requesterOf.ContainsKey(i.Id) ? requesterOf[i.Id] : null;
+    Guid? offeredId = offeredOf.ContainsKey(i.Id) ? offeredOf[i.Id] : null;
+    var late = missed.ContainsKey(i.Id) ? missed[i.Id] : null;
+    // While the resolution governs, an absolute due date is what the row counts down to — it runs while the item waits.
+    DateTime? due = i.DueAt != null && r.GoverningSlot == null && i.DoneAt == null ? i.DueAt : r.BreachesAt;
+    SlaMetric? metric = due == null && late != null ? late.Metric : MetricOf(i.Handling, r.GoverningSlot, due);
+    result.Add(new WorkRow {
+      Id = i.Id, Title = i.Title, Reference = i.Reference,
+      QueueId = queueId, Queue = queueId != null && queueNames.ContainsKey(queueId.Value) ? queueNames[queueId.Value] : "",
+      HolderId = holderId, Holder = holderId != null && holderNames.ContainsKey(holderId.Value) ? holderNames[holderId.Value] : "",
+      Priority = i.Priority, Handling = i.Handling,
+      OrganizationId = orgId, Organization = orgId != null && orgNames.ContainsKey(orgId.Value) ? orgNames[orgId.Value] : "",
+      Tier = orgId != null && orgTiers.ContainsKey(orgId.Value) ? orgTiers[orgId.Value] : "",
+      Requester = requesterId != null && holderNames.ContainsKey(requesterId.Value) ? holderNames[requesterId.Value] : "",
+      Language = i.Language, Kind = i.Kind, Segment = i.Segment, EscalationLevel = i.EscalationLevel,
+      Sla = i.Sla, DueAt = due, Budget = r.Budget, Metric = metric,
+      DueWord = metric == null ? "" : Words(metric.Value),
+      EverBreached = r.EverBreached, BreachedAt = late == null ? null : late.At,
+      MissedWord = late == null ? "" : Words(late.Metric), ArrivedAt = i.ArrivedAt,
+      OfferedToId = offeredId, OfferedTo = offeredId != null && holderNames.ContainsKey(offeredId.Value) ? holderNames[offeredId.Value] : "",
+      OfferEndsAt = offerEnds.ContainsKey(i.Id) ? offerEnds[i.Id] : null,
+    });
+  }
+  return result;
+}
+
+/// An id, a name and one reference's id — read as a projection.
+public class NamedRef {
+  public Guid Id;
+  public string Name = "";
+  public Guid? Ref;
+}
+
+/// Which promise a row's countdown is: a response milestone governs while the item is new (the first) or owed (the
+/// next); the run's own deadline is the resolution. None: nothing runs.
+SlaMetric? MetricOf(Handling handling, string? governingSlot, DateTime? due) {
+  if (due == null) { return null; }
+  if (governingSlot == null) { return SlaMetric.Resolution; }
+  return handling == Handling.New ? SlaMetric.FirstResponse : SlaMetric.NextResponse;
+}

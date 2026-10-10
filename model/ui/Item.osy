@@ -1,0 +1,410 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.Presence;
+
+// ── one item: who has it, what it was promised, why it is here, and who else is on it ───────────────────────────────
+
+/// Can the caller take or hand on work a colleague holds? Leads always; agents when the app lets them
+/// (`InboxSetup.AgentsHandOn`). The run asks again — this only spares a press that would be refused.
+public bool MayMoveOthersWork() { return LeadsInbox || App.Setting<InboxSetup>().AgentsHandOn; }
+
+/// Everything an item's screen asks the server for as it opens: whether the reader may move a colleague's work, the
+/// app's words for its promises, its trail said for the reader, and every kind of link in the reader's words. A page
+/// that shows several of the inbox's components on one item asks this ONCE (`OpenItem`) and hands it to each
+/// (`opened:` on `AssignControl`, `ItemClocks`, `WhyHere`, `ItemLinks`), so opening an item costs one call to the server
+/// instead of one per component.
+public class ItemOpening {
+  /// False until the server has answered — a component handed one waits for it instead of asking for itself.
+  public bool Loaded;
+  public bool OthersOk;
+  public List<string> MetricWords = [];
+  public List<TrailLine> Trail = [];
+  public List<LinkChoice> LinkWords = [];
+}
+
+/// What `item` opens with (`ItemOpening`). Reads only.
+public ItemOpening OpenItem(WorkItem item) {
+  return new ItemOpening { Loaded = true, OthersOk = MayMoveOthersWork(), MetricWords = MetricWords(),
+                           Trail = TrailLines(item), LinkWords = AllLinkWords() };
+}
+
+/// WHO HAS IT, AND HANDING IT ON — the item's holder as a chip that opens the hand-to menu, plus Take / Release.
+/// The menu lists ONLY people who may hold the item (its queue's members and, where the queue allows, its account
+/// team; never anybody missing a skill it requires), each with their load against capacity, their languages, and
+/// whether they are on — so a hand-on is a choice made with the facts. A refusal comes back as the run's own sentence
+/// ("Rahul took this just now."). Keys: A opens the menu, T takes, U releases. `opened`: what the page already asked
+/// for the item (`OpenItem`) — then this asks nothing of its own as it opens.
+[Composable]
+public component AssignControl(WorkItem item, ItemOpening? opened = null) {
+  bool open = false;
+  bool asked = false;
+  List<Candidate> people = [];
+  string problem = "";
+
+  live var me = Session.CurrentUser;
+  live var meId = me == null ? Guid.Empty : me.Id;
+  live var holderId = item.Assignee == null ? Guid.Empty : item.Assignee.Id;
+  live var mine = holderId != Guid.Empty && holderId == meId;
+  live var lead = LeadsInbox;
+  live var holderName = item.Assignee == null ? "Nobody" : item.Assignee.DisplayName;
+  // Closed or cancelled for good: there is nothing left to take or hand on — who had it is a fact, not an offer.
+  live var finished = item.Handling == Handling.Closed || item.Handling == Handling.Cancelled;
+
+  on mount { if (opened == null) { asked = MayMoveOthersWork(); } }
+  live var othersOk = opened != null ? opened.OthersOk : asked;
+
+  action Toggle() {
+    problem = "";
+    open = !open;
+    if (open) { people = Eligible(item); }
+  }
+  action Close() { open = false; }
+  action TakeIt() {
+    problem = "";
+    try { TakeWork(item, item.Assignee == null ? null : item.Assignee.Id); }
+    catch (Exception ex) { problem = ex.Message; }
+  }
+  action Release() {
+    problem = "";
+    try { ReleaseWork(item); } catch (Exception ex) { problem = ex.Message; }
+  }
+  action Hand(Guid person) {
+    problem = "";
+    open = false;
+    try { HandWorkTo(item, Principal.Single(p => p.Id == person), item.Assignee == null ? null : item.Assignee.Id); }
+    catch (Exception ex) { problem = ex.Message; }
+  }
+
+  render {
+    if (finished) { HeadFact("Assignee", holderName); }
+    if (!finished) {
+    Stack(gap: 2, label: "Assignment") {
+      Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+        Box(position: Position.Relative) {
+          Pressable(onClick: Toggle, label: "Assignee: " + holderName, expanded: open, shortcut: "A",
+                    px: 2, py: 1, rounded: Radius.Md, bg: Colors.Sunken, borderW: 1, border: Colors.Border,
+                    transition: Motion.Fast) {
+            Row(gap: 2, align: Align.Center) {
+              if (item.Assignee == null) { Lamp(live: true); } else { Avatar(InitialsOf(holderName), size: Size.Sm); }
+              Text("Assignee", fontSize: FontSize.Caption, color: Colors.TextMuted);
+              Text(holderName, fontSize: FontSize.Label, fontWeight: FontWeight.Medium, whiteSpace: WhiteSpace.Nowrap);
+              KeyHintOf(Toggle);
+              Icon(Icons.ChevronDown, size: 12, color: Colors.TextMuted);
+            }
+          }
+          if (open) {
+            Backdrop(Close);
+            Menu(from: MenuFrom.BelowStart, label: "Hand to") {
+              if (people.Count == 0) {
+                Box(px: 3, py: 2, maxW: "280px") {
+                  Text("Nobody may hold this — its queue has no members who hold the skills it needs.",
+                       fontSize: FontSize.Label, color: Colors.TextMuted);
+                }
+              }
+              foreach (var c in people) {
+                CandidateRow(c, () => Hand(c.Person), c.Holds || (!c.IsMe && holderId != Guid.Empty && !othersOk && !lead));
+              }
+            }
+          }
+        }
+        if (!mine && (holderId == Guid.Empty || othersOk || lead)) {
+          Button(holderId == Guid.Empty ? "Take it" : "Take it over", onPress: TakeIt, size: Size.Sm,
+                 tone: holderId == Guid.Empty ? Tone.Primary : Tone.Ghost, shortcut: "T");
+        }
+        if (holderId != Guid.Empty && (mine || lead)) {
+          Button("Release", onPress: Release, size: Size.Sm, tone: Tone.Ghost, shortcut: "U");
+        }
+      }
+      if (problem != "") { Alert(problem, tone: Tone.Warning); }
+    }
+    }
+  }
+}
+
+/// One person in the hand-to menu: who, their languages, whether they are on, and a meter of their load against what
+/// the inbox gives them — amber at capacity. A row for somebody who already holds it (or whom this caller may not hand
+/// it to) is shown and cannot be pressed.
+[Composable]
+public component CandidateRow(Candidate c, Action onPick, bool disabled = false) {
+  live var pct = c.Capacity <= 0 ? 100 : Math.Min(100, c.Load * 100 / c.Capacity);
+  variants {
+    base { Display = Display.Flex; W = "100%"; MinW = "260px"; Px = 3; Py = 2; Rounded = Radius.Md; Transition = Motion.Fast;
+           Color = Colors.OnSurface; Hover { Bg = Colors.Muted; }
+           Focus { Bg = Colors.Muted; OutlineW = 0; } }
+  }
+  render {
+    Pressable(onClick: onPick, label: c.Name + (c.IsMe ? " (you)" : ""), role: UiRole.MenuItem, disabled: disabled, w: "100%") {
+      Row(gap: 3, align: Align.Center, w: "100%", opacity: disabled ? "0.55" : "1") {
+        Avatar(InitialsOf(c.Name), size: Size.Sm);
+        Stack(gap: "2px", grow: 1, minW: "0") {
+          Row(gap: 2, align: Align.Center, minW: "0") {
+            Text(c.Name + (c.IsMe ? " (you)" : ""), fontSize: FontSize.Label, fontWeight: FontWeight.Medium,
+                 whiteSpace: WhiteSpace.Nowrap, overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis, minW: "0");
+            if (c.Holds) { Icon(Icons.Check, size: 12, color: Colors.Primary); }
+            if (c.Languages != "") {
+              Text(c.Languages, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap);
+            }
+          }
+          Text(StandingWords(c), fontSize: FontSize.Caption, color: c.Away ? Colors.Waiting : Colors.TextMuted,
+               whiteSpace: WhiteSpace.Nowrap);
+        }
+        Stack(gap: "3px", align: Align.End, shrink: 0) {
+          Text(c.Load + "/" + c.Capacity, fontFamily: Font.Mono, fontSize: FontSize.Caption, fontVariant: FontVariant.TabularNums,
+               color: c.Load >= c.Capacity ? Colors.Warning : Colors.TextMuted, label: c.Load + " of " + c.Capacity + " in hand");
+          LoadMeter(pct, c.Load >= c.Capacity);
+        }
+      }
+    }
+  }
+}
+
+/// A thin meter — load against capacity — amber when full.
+[Composable]
+public component LoadMeter(int percent, bool full) {
+  render {
+    Box(w: "44px", h: "4px", rounded: Radius.Pill, bg: Colors.Muted, overflow: Overflow.Hidden, decorative: true) {
+      Box(h: "100%", w: percent + "%", rounded: Radius.Pill, bg: full ? Colors.Warning : Colors.Primary, transition: Motion.Slow) { }
+    }
+  }
+}
+
+/// How a person stands, in words: "Available", "Busy", "Off shift", "Away until Fri 12 Oct".
+public string StandingWords(Candidate c) {
+  if (c.Away) { return c.AwayUntil != null ? "Away until " + $"{c.AwayUntil.Value:ddd d MMM}" : "Away"; }
+  if (c.Status == Presence.Busy) { return "Busy"; }
+  if (c.Status == Presence.Offline) { return "Offline"; }
+  if (!c.OnHours) { return "Off shift"; }
+  return c.Load >= c.Capacity ? "At capacity" : "Available";
+}
+
+// ── what the item was promised ───────────────────────────────────────────────────────────────────────────────────────
+
+/// The app's words for the three promises, in metric order — what a screen labels its chips with ("first response",
+/// "feedback due"). The app's code, so asked on the server once.
+public List<string> MetricWords() {
+  return [Words(SlaMetric.FirstResponse), Words(SlaMetric.NextResponse), Words(SlaMetric.Resolution)];
+}
+
+/// The word for `metric` from `MetricWords()` — the kit's own until they have arrived.
+public string WordFor(List<string> words, SlaMetric metric) {
+  var i = (int)metric;
+  return i < words.Count ? words[i] : metric.Label.ToLower();
+}
+
+/// The newest record of each promise, in metric order — what a header shows.
+public List<SlaClock> LatestPerMetric(List<SlaClock> records) {
+  List<SlaClock> latest = [];
+  foreach (var metric in new List<SlaMetric> { SlaMetric.FirstResponse, SlaMetric.NextResponse, SlaMetric.Resolution }) {
+    var c = records.Where(r => r.Metric == metric).OrderByDescending(r => r.Cycle).FirstOrDefault();
+    if (c != null) { latest.Add(c); }
+  }
+  return latest;
+}
+
+/// What is left of a promise now: to its due instant while it runs, its unused budget while paused.
+public TimeSpan LeftOf(SlaClock c, DateTime now) {
+  if (c.RunningSince != null && c.DueAt != null) { return c.DueAt.Value - now; }
+  return c.Target - c.BusinessTime;
+}
+
+/// THE ITEM'S PROMISES — a chip per metric for an item's head: "first response · 0:42", "next response · 3h",
+/// "resolution · 2d", each with a meter that shortens as the time goes — amber in its last quarter, red once missed;
+/// a paused one says so; a met one says so with a check that draws itself. Live: the clocks' own records, each of which
+/// carries when it runs out, so the countdown is exact in business hours without asking the server again. An item no
+/// policy covers says that, rather than drawing a zero. `opened`: what the page already asked for the item (`OpenItem`)
+/// — then this asks nothing of its own as it opens.
+[Composable]
+public component ItemClocks(WorkItem item, ItemOpening? opened = null) {
+  live var itemId = item.Id;
+  // A promise is a policy's clocks OR an absolute due date (a statutory deadline) — `HasPromise`, never `Policy` alone,
+  // which said "No promise applies" beside a running `DueAt` clock.
+  live var promised = HasPromise(item);
+  live var records = SlaClock.Where(c => c.Item.Id == itemId).ToList();
+  live var shown = LatestPerMetric(records);
+  List<string> asked = [];
+  DateTime now = DateTime.UtcNow;
+  on mount { if (opened == null) { asked = MetricWords(); } }
+  live var words = opened != null ? opened.MetricWords : asked;
+  on every (TimeSpan.FromSeconds(15)) { now = DateTime.UtcNow; }
+  render {
+    Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap, label: "Promises") {
+      if (!promised) {
+        Text("No promise applies", fontSize: FontSize.Caption, color: Colors.TextMuted);
+      }
+      foreach (var c in shown) { ClockChip(c, WordFor(words, c.Metric), LeftOf(c, now)); }
+    }
+  }
+}
+
+/// One promise as a chip — see `ItemClocks`.
+[Composable]
+public component ClockChip(SlaClock c, string word, TimeSpan left) {
+  live var running = c.Outcome == ClockOutcome.Running && c.RunningSince != null;
+  live var total = c.Target.TotalSeconds <= 0.0 ? 1.0 : c.Target.TotalSeconds;
+  live var pct = Math.Max(0, Math.Min(100, Convert.ToInt(left.TotalSeconds * 100.0 / total)));
+  live var late = c.BreachedAt != null || left.TotalSeconds < 0.0;
+  live var risky = !late && (c.AtRiskAt != null || left.TotalSeconds < total * 0.25);
+  render {
+    Stack(gap: "3px", px: 2, py: 1, rounded: Radius.Md, bg: Colors.Sunken, borderW: 1,
+          border: late && c.Outcome == ClockOutcome.Running ? Colors.Danger : Colors.Border, minW: "136px",
+          label: word + ": " + ClockWords(c, left)) {
+      Row(gap: 2, align: Align.Center) {
+        // Kept: a check that draws itself — the figure beside it says "met", so the tick carries no word of its own.
+        if (c.Outcome == ClockOutcome.Met) {
+          Box(animation: KitDraw, display: Display.InlineFlex, decorative: true) { Icon(Icons.Check, size: 12, color: Colors.Success); }
+        }
+        else if (c.Outcome == ClockOutcome.Running && !running) { Icon(Icons.Pause, size: 12, color: Colors.Waiting); }
+        else if (c.Outcome == ClockOutcome.Running) { Lamp(tone: late ? Tone.Danger : (risky ? Tone.Warning : Tone.Default)); }
+        Text(word, fontSize: FontSize.Caption, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap);
+        Spacer();
+        Text(ClockFigure(c, left), fontFamily: Font.Mono, fontSize: FontSize.Caption, fontVariant: FontVariant.TabularNums,
+             whiteSpace: WhiteSpace.Nowrap,
+             color: c.Outcome == ClockOutcome.Met ? Colors.Success
+               : (late ? Colors.Danger : (risky ? Colors.Warning : (running ? Colors.OnSurface : Colors.Waiting))));
+      }
+      if (c.Outcome == ClockOutcome.Running) {
+        // The meter SHORTENS as the time goes — continuously, through the floor's slow transition; its colour steps at
+        // the quarter and at the breach, and never flashes.
+        Box(h: "3px", rounded: Radius.Pill, bg: Colors.Muted, overflow: Overflow.Hidden, decorative: true) {
+          Box(h: "100%", w: pct + "%", rounded: Radius.Pill, transition: Motion.Slow,
+              bg: late ? Colors.Danger : (risky ? Colors.Warning : (running ? Colors.Primary : Colors.Waiting))) { }
+        }
+      }
+    }
+  }
+}
+
+/// A clock's figure: what is left ("0:42"), how late ("−0:05"), "paused", or how it ended.
+public string ClockFigure(SlaClock c, TimeSpan left) {
+  if (c.Outcome == ClockOutcome.Met) { return "met"; }
+  if (c.Outcome == ClockOutcome.Breached) { return "met late"; }
+  if (c.Outcome == ClockOutcome.Cancelled) { return "—"; }
+  var now = DateTime.UtcNow;
+  var figure = Countdown(now + left, now);
+  return c.RunningSince != null ? figure : figure + " · paused";
+}
+
+/// A clock in words, for a screen reader: "due in 42 minutes", "missed 5 minutes ago", "paused, 3 hours left", "met".
+public string ClockWords(SlaClock c, TimeSpan left) {
+  if (c.Outcome == ClockOutcome.Met) { return "met"; }
+  if (c.Outcome == ClockOutcome.Breached) { return "met late"; }
+  if (c.Outcome == ClockOutcome.Cancelled) { return "ended"; }
+  if (c.RunningSince == null) { return "paused, " + Spoken(left) + " left"; }
+  return left.TotalSeconds < 0.0 ? "missed " + Spoken(left) + " ago" : "due in " + Spoken(left);
+}
+
+// ── why is this here ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// WHY THIS IS HERE — the item's trail in sentences, oldest first: where it arrived and by which rule, who it was
+/// offered to and why that fell through, who was given it and why, every hand-on, move and escalation, with when. Live:
+/// the next step appears as it is recorded. Each step is a row of facts, said by the server in the reader's language —
+/// the whole trail in ONE read as it opens (`TrailLines`); a step recorded later fetches its own as it appears.
+/// `opened`: what the page already asked for the item (`OpenItem`) — then the trail asks nothing of its own as it opens.
+[Composable]
+public component WhyHere(WorkItem item, ItemOpening? opened = null) {
+  live var itemId = item.Id;
+  live var trail = Assignment.Where(a => a.Item.Id == itemId).OrderBy(a => a.Step).ToList();
+  List<TrailLine> asked = [];
+  bool askedLoaded = false;
+  DateTime now = DateTime.UtcNow;
+  on mount {
+    if (opened == null) {
+      asked = TrailLines(item);
+      askedLoaded = true;
+    }
+  }
+  live var said = opened != null ? opened.Trail : asked;
+  live var saidLoaded = opened != null ? opened.Loaded : askedLoaded;
+  on every (TimeSpan.FromSeconds(30)) { now = DateTime.UtcNow; }
+  render {
+    Stack(gap: 0, role: UiRole.List, label: "Why this is here") {
+      if (saidLoaded) {
+        foreach (var a in trail) {
+          TrailStep(a, TrailTextFor(said, a.Id), a.Step == trail.Count, now);
+        }
+      }
+    }
+  }
+}
+
+/// One step of an item's trail — its sentence for the reader (`TrailLines`), or, for a step recorded after the trail
+/// opened, fetched as it appears. `latest`: the step that says where the item is now.
+[Composable]
+public component TrailStep(Assignment step, string sentence = "", bool latest = false, DateTime? now = null) {
+  string fetched = "";
+  on mount {
+    if (sentence == "") {
+      var lines = TrailWords(new List<Guid> { step.Id });
+      if (lines.Count > 0) { fetched = lines[0].Text; }
+    }
+  }
+  live var line = sentence != "" ? sentence : fetched;
+  live var at = now ?? DateTime.UtcNow;
+  render {
+    if (line != "") {
+      Row(gap: 3, align: Align.Start, py: "6px", role: UiRole.ListItem, animation: KitArrive) {
+        Stack(gap: 0, align: Align.Center, pt: "5px", shrink: 0) {
+          Box(w: "7px", h: "7px", rounded: Radius.Circle, decorative: true, bg: latest ? Colors.Primary : Colors.Border) { }
+        }
+        Text(line, fontSize: FontSize.Label, color: latest ? Colors.OnSurface : Colors.TextSecondary, grow: 1, minW: "0");
+        Text(Ago(step.At, at), fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted,
+             whiteSpace: WhiteSpace.Nowrap, label: Ago(step.At, at) + " ago");
+      }
+    }
+  }
+}
+
+// ── who else is on it ────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// WHO ELSE IS ON THIS ITEM, and what they are doing — "Rahul — replying" — for the item's header. Having the item open
+/// IS being here (as `activity`, "viewing" by default). Staff only, by the app's `CollaboratesOnRecords`; a seat says who
+/// and what they are doing, never what they wrote.
+[Composable]
+public component ItemSeats(WorkItem item, string activity = "viewing") {
+  render { RecordSeats(item.Id, activity: activity); }
+}
+
+// ── an item's head ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// AN ITEM'S HEAD — its reference and title, who else is on it, who has it (and handing it on), where it waits, how
+/// urgent it is, and its promises. The app draws what the item IS below it; this is what the inbox knows about it.
+/// It asks the server once for what its parts need (`OpenItem`) — or takes `opened`, when the page asked already.
+[Composable]
+public component WorkItemHead(WorkItem item, ItemOpening? opened = null) {
+  ItemOpening own = new ItemOpening();
+  on mount { if (opened == null) { own = OpenItem(item); } }
+  live var o = opened ?? own;
+  render {
+    Stack(gap: 3, px: 5, pt: 4, pb: 3, bg: Colors.Surface, borderBW: 1, border: Colors.Border, label: "Item") {
+      Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap) {
+        WorkLamp(item.Handling, item.Sla);
+        if (item.Reference != "") {
+          Text(item.Reference, fontFamily: Font.Mono, fontSize: FontSize.Label, color: Colors.TextMuted);
+        }
+        Text(item.Title, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em", grow: 1, minW: "0");
+        ItemSeats(item);
+      }
+      Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+        AssignControl(item, opened: o);
+        HeadFact("Queue", item.Queue == null ? "None" : item.Queue.Name + (item.EscalationLevel > 1 ? " · L" + item.EscalationLevel : ""));
+        HeadFact("Priority", item.Priority.Label, PriorityTone(item.Priority));
+        HeadFact("State", item.Handling.Label);
+      }
+      ItemClocks(item, opened: o);
+    }
+  }
+}
+
+/// One fact of an item's head — what it is and what it holds, with a lamp in its tone when it has one.
+[Composable]
+public component HeadFact(string label, string value, Tone tone = Tone.Ghost) {
+  render {
+    Row(gap: 2, align: Align.Center, px: 2, py: 1, rounded: Radius.Md, bg: Colors.Sunken, borderW: 1, border: Colors.Border,
+        label: label + ": " + value) {
+      if (tone != Tone.Ghost) { Lamp(tone: tone); }
+      Text(label, fontSize: FontSize.Caption, color: Colors.TextMuted);
+      Text(value, fontSize: FontSize.Label, fontWeight: FontWeight.Medium, whiteSpace: WhiteSpace.Nowrap);
+    }
+  }
+}

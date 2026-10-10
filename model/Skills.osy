@@ -1,0 +1,92 @@
+namespace Osysharp.WorkQueues;
+
+using Osysharp.Identity;
+
+// ── skills and languages: who CAN take an item, and who is BEST for it ──────────────────────────────────────────────
+//
+// An item NEEDS skills — set by a routing rule, by the app's `InboxRouting.SkillsFor`, or (its language) by the kit at
+// arrival. A REQUIRED one limits who may hold the item at all (`MayHold`); a PREFERRED one ranks who is given it first.
+// An item's language is always preferred, never required: for the queue's `LanguageWait` only speakers are given it,
+// and after that anybody free may be — dedicated never means stuck.
+
+/// What a routing skill is.
+// ⚠ Appended, never inserted: an enum is stored by position.
+public enum SkillKind {
+  [Label("Skill")] Skill,
+  /// A language a person can work in — its `Code` is BCP-47 ("es", "pt-BR").
+  [Label("Language")] Language,
+}
+
+/// Something work can need and people can have — "Billing", "System design", "Spanish". Rows an inbox admin keeps.
+/// Not `Skill`: `Osysharp.Agents` declares that, for an AI agent's skills.
+[Unique(Name, "There is already a skill of that name.")]
+public entity RoutingSkill {
+  [Required("Name the skill."), MaxLength(60)] string Name;
+  SkillKind Kind = SkillKind.Skill;
+  /// For a language: its BCP-47 code ("es"). It matches an item's `Language` by the primary subtag — "es" speaks to
+  /// "es-MX".
+  [MaxLength(20)] string Code = "";
+  security {
+    allow read when WorksInbox;
+    // SECURITY-INVARIANT(inbox-service-levels-are-the-admins) — see Queue.
+    allow create, update, delete when AdministersInbox;
+  }
+}
+
+/// A person holds a skill, at a level: 1 basic · 2 working · 3 expert. Kept by leads.
+[Unique(Person, Skill, "They already hold that skill.")]
+public entity HeldSkill {
+  [Required] Principal Person;
+  [Required] RoutingSkill Skill;
+  int Level = 2;
+  security {
+    allow read when WorksInbox;
+    allow create, update, delete when LeadsInbox || AdministersInbox;
+  }
+}
+
+/// An item needs a skill — required (only its holders may hold the item) or preferred (they are given it first).
+/// Written by the run: by a routing rule, by the app's `InboxRouting.SkillsFor`, from the item's language.
+[Unique(Item, Skill)]
+public entity NeededSkill {
+  [Required] WorkItem Item;
+  [Required] RoutingSkill Skill;
+  bool Required = true;
+  // SECURITY-INVARIANT(inbox-service-internals-are-staffs) — the requester's side reads no routing.
+  security { allow read when WorksInbox; }
+}
+
+/// The primary subtag of a BCP-47 tag, lower case: "es-MX" → "es".
+string PrimaryTag(string tag) {
+  var t = tag.Trim().ToLower();
+  var dash = t.IndexOf("-");
+  return dash < 0 ? t : t.Substring(0, dash);
+}
+
+/// The language skill that matches `language`, or null.
+[SuppressWarning("cost-unbounded-read")]   // the desk's language skills — configuration, not data
+RoutingSkill? LanguageSkill(string language) {
+  if (language == "") { return null; }
+  var want = PrimaryTag(language);
+  foreach (var s in RoutingSkill.Where(s => s.Kind == SkillKind.Language).ToList()) {
+    if (PrimaryTag(s.Code) == want) { return s; }
+  }
+  return null;
+}
+
+/// Say that `item` needs `skill`. A need already there keeps the stronger of the two.
+void Need(WorkItem item, RoutingSkill skill, bool required) {
+  var had = NeededSkill.FirstOrDefault(n => n.Item == item && n.Skill == skill);
+  if (had == null) { new NeededSkill { Item = item, Skill = skill, Required = required }; return; }
+  if (required && !had.Required) { had.Required = true; }
+}
+
+/// The skills `item` needs, by name — "Billing (required), Spanish".
+[SuppressWarning("cost-unbounded-read")]   // one item's needed skills
+public string NeedsOf(WorkItem item) {
+  var parts = new List<string>();
+  foreach (var n in NeededSkill.Where(n => n.Item == item).Include(n => n.Skill).OrderBy(n => n.Skill.Name).ToList()) {
+    parts.Add(n.Required ? n.Skill.Name + " (required)" : n.Skill.Name);
+  }
+  return string.Join(", ", parts);
+}

@@ -30,10 +30,14 @@ public entity WorkItem {
   /// The queue it waits in. Written by the kit's run (routing, moves, escalation) — never by app code. The app may name
   /// one when it creates the item; the run records it.
   Queue? Queue;
-  /// Who holds it. Written by the kit's run — never by app code; every change is an `Assignment` row.
+  /// Who holds it. Written by the kit's run — never by app code; every change is a `Handover` row.
   Principal? Assignee;
   /// Who it is offered to first, while an account-routing offer is live. None otherwise.
   Principal? OfferedTo;
+  /// The one person it is FOR, when it is put to somebody by name — a question asked of them, an approval that is
+  /// theirs to give. Said when the item is made; the run gives it to them as it arrives instead of routing it, when
+  /// they may hold it (`MayHold`). None: the queue's own way of handing work out decides.
+  [Immutable] Principal? Addressee;
   /// How urgent it is. Set at create; changed only through `Prioritise`, which re-reads the policy.
   WorkPriority Priority = WorkPriority.Normal;
   /// Where it stands — the `WorkHandling` run's alone.
@@ -86,13 +90,13 @@ public entity WorkItem {
   int EscalationLevel = 1;
 
   [ForeignKey(Item)] SlaClock[] Clocks;
-  [ForeignKey(Item)] Assignment[] Assignments;
+  [ForeignKey(Item)] Handover[] Handovers;
 
   security {
     // SECURITY-INVARIANT(inbox-assignment-only-through-the-run): who holds an item, which queue it waits in, how
     // urgent it is and what it was promised change only inside the kit's run (a workflow body writes as the system and
     // is not gated by these denies), so every change is authorised by the run's own events and recorded as an
-    // `Assignment`. App code — a page, a function, an import — cannot write them, whatever its own grants say.
+    // `Handover`. App code — a page, a function, an import — cannot write them, whatever its own grants say.
     // Guarded by tests/security.test.osy `the_assignee_queue_and_priority_cannot_be_written_except_through_the_kit` and
     // `every_change_of_holder_is_recorded_with_its_reason`.
     // ⚠ "The run" is ANY workflow body, the app's own lifecycle included: a workflow the app writes may set these too.
@@ -122,7 +126,7 @@ public entity WorkItem {
 [SuppressWarning("cost-unbounded-read")]   // one item's rows, and forgetting it must reach every one
 public int ForgetWorkItem(WorkItem item) {
   var gone = 0;
-  foreach (var x in Assignment.Where(a => a.Item == item).ToList()) { x.Delete(); gone = gone + 1; }
+  foreach (var x in Handover.Where(a => a.Item == item).ToList()) { x.Delete(); gone = gone + 1; }
   foreach (var x in SlaClock.Where(c => c.Item == item).ToList()) { x.Delete(); gone = gone + 1; }
   foreach (var x in Escalation.Where(e => e.Item == item).ToList()) { x.Delete(); gone = gone + 1; }
   foreach (var x in RoutingOffer.Where(o => o.Item == item).ToList()) { x.Delete(); gone = gone + 1; }

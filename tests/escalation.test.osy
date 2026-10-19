@@ -93,7 +93,7 @@ void a_breach_escalates_to_the_next_level_and_rereads_the_policy() {
     Assert.Equal(2, up.ToLevel);
     Assert.Equal(SlaMetric.FirstResponse, up.Metric);
     Assert.Null(up.By);                                               // a promise did it
-    Assert.Equal(AssignReason.Escalated, TrailOf(r).Last().Reason);
+    Assert.Equal(HandoverReason.Escalated, TrailOf(r).Last().Reason);
     Assert.Equal("Escalated to Tier 2 (L2) — First response was missed.", Said(TrailOf(r).Last()));
   }
   runas (Ines) {                                                      // escalated by hand, with a reason
@@ -176,6 +176,6 @@ void the_escalation_actions_do_what_they_say() {
   runas (Lena) {
     var moved = Request.Single(x => x.Title == "Invoice export blank");
     Assert.Equal("Billing", moved.Queue!.Name);                       // the breach moved it
-    Assert.Equal(AssignReason.Moved, TrailOf(moved).Last().Reason);
+    Assert.Equal(HandoverReason.Moved, TrailOf(moved).Last().Reason);
   }
 }

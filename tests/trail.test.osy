@@ -15,7 +15,7 @@ void the_trail_keeps_facts_and_is_said_in_the_readers_language() {
     Workflow.Settle(r);
     var moved = TrailOf(r)[2];
     // The step is facts — from whom, to nobody, by whom, into which queue — and no sentence at all.
-    Assert.Equal(AssignReason.Moved, moved.Reason);
+    Assert.Equal(HandoverReason.Moved, moved.Reason);
     Assert.Equal("Ines", moved.From!.DisplayName);
     Assert.Null(moved.To);
     Assert.Equal("Lena", moved.By!.DisplayName);
@@ -39,7 +39,7 @@ void what_the_app_is_told_is_facts_it_can_say_in_any_language() {
   Workflow.Settle(r);
   var told = StepHeard(r, "work-queues.holder-changed");
   Assert.Equal("Ines", told.To);
-  Assert.Equal(AssignReason.Claimed, told.Reason);
+  Assert.Equal(HandoverReason.Claimed, told.Reason);
   Assert.Equal("Ines took it.", InboxStepWords(told));
   Session.SetLanguage("sv");
   Assert.Equal("Ines tog ärendet.", InboxStepWords(told));

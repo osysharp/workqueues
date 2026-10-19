@@ -60,6 +60,6 @@ void after_the_language_wait_anyone_may_take_it() {
     TestClock.Advance(TimeSpan.FromMinutes(2));
     Workflow.Settle(r);
     Assert.Equal("Ines", HolderOf(r));                                // then anybody free — dedicated never means stuck
-    Assert.Equal(AssignReason.RoundRobin, TrailOf(r)[1].Reason);
+    Assert.Equal(HandoverReason.RoundRobin, TrailOf(r)[1].Reason);
   }
 }

@@ -9,13 +9,13 @@ using Osysharp.Organizations.ServicePlans;
 //
 // Each verb is a kit function that raises an event on the item's `WorkHandling` run; the event's `[Authorize]` decides
 // who may raise it, and the run's body does the write as the system — so the holder, the queue and the priority are
-// written ONLY there (SECURITY-INVARIANT inbox-assignment-only-through-the-run), and every change is an `Assignment`.
+// written ONLY there (SECURITY-INVARIANT inbox-assignment-only-through-the-run), and every change is a `Handover`.
 //
 // ⚑ THE PAGE SAYS WHO IT SAW HOLDING THE ITEM (`expected`). If somebody else holds it now, the take is refused with
 //   the sentence that names them — "Rahul took this 2 minutes ago" — instead of quietly taking it from them.
 
-/// Why an item moved — one per `Assignment`.
-public enum AssignReason {
+/// Why an item moved — one per `Handover`.
+public enum HandoverReason {
   [Label("Arrived")] Arrived,
   [Label("Claimed")] Claimed,
   [Label("Released")] Released,
@@ -36,6 +36,9 @@ public enum AssignReason {
   [Label("Imported")] Imported,
   /// Somebody on the account team after its owner could not take it just then (`Because`), so the next was asked.
   [Label("Skipped")] Skipped,
+  /// The item was made for one named person (`WorkItem.Addressee`) — a question put to them, an approval that is
+  /// theirs — and was given to them as it arrived, or handed on to another by the kit that made it (`AddressWork`).
+  [Label("Addressed")] Addressed,
 }
 
 /// ONE change of who holds an item, or where it waits — the history "why is this here" reads, and reports' raw data.
@@ -43,13 +46,13 @@ public enum AssignReason {
 ///
 /// ⚑ FACTS, NOT A SENTENCE: "Moved to Billing by Lena — Ines is not in Billing, so it is unheld." is said
 ///   from `Reason`, `By`, `From`, `To` and `ToQueue` when it is read (`InboxStepWords`), in the reader's language.
-public entity Assignment {
+public entity Handover {
   [Required] WorkItem Item;
   Principal? From;
   Principal? To;
   Queue? FromQueue;
   Queue? ToQueue;
-  AssignReason Reason;
+  HandoverReason Reason;
   /// Who did it — none: the inbox did (routing, a timer).
   Principal? By;
   /// The routing rule that routed it, when one did.
@@ -134,8 +137,8 @@ public BulkResult MoveMany(List<WorkItem> items, Queue queue) {
 
 /// The trail of `item`, oldest first — "why is this here".
 [SuppressWarning("cost-unbounded-read")]   // one item's trail
-public List<Assignment> TrailOf(WorkItem item) {
-  return Assignment.Where(a => a.Item == item).OrderBy(a => a.Step).ToList();
+public List<Handover> TrailOf(WorkItem item) {
+  return Handover.Where(a => a.Item == item).OrderBy(a => a.Step).ToList();
 }
 
 /// The next step of `item`'s trail.
@@ -151,17 +154,40 @@ string NameOf(Principal? p) {
   return p.DisplayName != "" ? p.DisplayName : p.Email;
 }
 
+/// An item made for one named person is theirs as it arrives, when they may hold it. Answers whether it was given.
+bool GivenToAddressee(WorkItem item) {
+  if (item.Addressee == null || !MayHold(item.Addressee, item)) { return false; }
+  HoldFor(item, item.Addressee, null, HandoverReason.Addressed, null, true);
+  return true;
+}
+
+/// ⭐ FOR A KIT WHOSE ITEMS ARE PUT TO PEOPLE BY NAME: give `item` to `to` from inside a run — a request that went
+/// unanswered goes on to the next person. Answers false, and changes nothing, when `to` may not hold it (`MayHold`).
+///
+/// ⚑ ONLY A RUN SAYS THIS. Like every change of holder it is the run's to make: called from a page or a plain
+///   function it is refused — a person hands work on with `HandWorkTo`, which asks whether THEY may.
+public bool AddressWork(WorkItem item, Principal to) {
+  if (!Workflow.InRun) {
+    throw new ValidationException("`AddressWork` is said by a workflow's body — the run that owns the item. A person hands work on with `HandWorkTo`.");
+  }
+  if (!MayHold(to, item)) { return false; }
+  // Whoever holds it now is who it is taken from: the run knows, so nobody "moved first".
+  Guid? holder = item.Assignee == null ? null : item.Assignee.Id;
+  HoldFor(item, to, null, HandoverReason.Addressed, holder, true);
+  return true;
+}
+
 /// Somebody other than the page expected holds `item` — refused, naming them and since when.
 void RefuseIfMovedFirst(WorkItem item, Guid? expected) {
   if (item.Assignee == null) { return; }
   if (expected != null && expected.Value == item.Assignee.Id) { return; }
   var holder = item.Assignee;
-  var since = Assignment.Where(a => a.Item == item && a.To == holder).OrderByDescending(a => a.At).FirstOrDefault();
+  var since = Handover.Where(a => a.Item == item && a.To == holder).OrderByDescending(a => a.At).FirstOrDefault();
   throw new ValidationException(TookFirst(NameOf(holder), since == null ? DurableClock.UtcNow : since.At, now: DurableClock.UtcNow) + ".");
 }
 
 /// Put `item` on `to`, done `by`.
-void HoldFor(WorkItem item, Principal to, Principal? by, AssignReason reason, Guid? expected, bool asLead) {
+void HoldFor(WorkItem item, Principal to, Principal? by, HandoverReason reason, Guid? expected, bool asLead) {
   if (item.Assignee != null && item.Assignee.Id == to.Id) { return; }               // already theirs
   RefuseIfMovedFirst(item, expected);
   // SECURITY-INVARIANT(inbox-moving-anothers-work-is-a-leads): unless the app lets agents hand on, only the holder or a
@@ -173,7 +199,7 @@ void HoldFor(WorkItem item, Principal to, Principal? by, AssignReason reason, Gu
     if (item.Assignee != null && !mine) {
       throw new ValidationException(NameOf(item.Assignee) + " holds this — only a lead can move work a colleague holds.");
     }
-    if (reason == AssignReason.HandedOn && !mine) {
+    if (reason == HandoverReason.HandedOn && !mine) {
       throw new ValidationException("Only a lead can hand on work you do not hold — take it first.");
     }
   }
@@ -188,7 +214,7 @@ void HoldFor(WorkItem item, Principal to, Principal? by, AssignReason reason, Gu
   if (accepted) { reason = offer.Step; }
   item.Assignee = to;
   // Said when read: an accepted offer "took the offer", handing it to yourself "took it", else "handed it to".
-  var step = new Assignment { Item = item, Step = NextStep(item), From = from, To = to, FromQueue = item.Queue, ToQueue = item.Queue,
+  var step = new Handover { Item = item, Step = NextStep(item), From = from, To = to, FromQueue = item.Queue, ToQueue = item.Queue,
                               Reason = reason, By = by, At = DurableClock.UtcNow };
   Raise(new HolderChanged { Item = item, Step = StepOf(step) });
   SettleOffer(item, to);
@@ -201,7 +227,7 @@ void AcceptOnResponse(WorkItem item, Principal? responder) {
   var offer = OfferOn(item);
   if (offer == null || !MayHold(responder!, item)) { return; }
   item.Assignee = responder;
-  var step = new Assignment { Item = item, Step = NextStep(item), To = responder, FromQueue = item.Queue, ToQueue = item.Queue,
+  var step = new Handover { Item = item, Step = NextStep(item), To = responder, FromQueue = item.Queue, ToQueue = item.Queue,
                               Reason = offer.Step, By = responder, At = DurableClock.UtcNow };
   Raise(new HolderChanged { Item = item, Step = StepOf(step) });
   SettleOffer(item, responder);
@@ -229,8 +255,8 @@ void LetGo(WorkItem item, Principal? by) {
   if (item.Assignee == null) { return; }
   var from = item.Assignee;
   item.Assignee = null;
-  var step = new Assignment { Item = item, Step = NextStep(item), From = from, FromQueue = item.Queue, ToQueue = item.Queue,
-                              Reason = AssignReason.Released, By = by, At = DurableClock.UtcNow };
+  var step = new Handover { Item = item, Step = NextStep(item), From = from, FromQueue = item.Queue, ToQueue = item.Queue,
+                              Reason = HandoverReason.Released, By = by, At = DurableClock.UtcNow };
   Raise(new HolderChanged { Item = item, Step = StepOf(step) });
   Distribute(item, null, from.Id);
   Refill(from, item);
@@ -255,8 +281,8 @@ void MoveTo(WorkItem item, Queue queue, Principal? by, bool asLead) {
   item.Queue = queue;
   // Its holder keeps it only when they may hold it there — a step from them to nobody says it is unheld.
   if (holder != null && !MayHold(holder, item)) { item.Assignee = null; }
-  var step = new Assignment { Item = item, Step = NextStep(item), From = holder, To = item.Assignee, FromQueue = fromQueue, ToQueue = queue,
-                              Reason = AssignReason.Moved, By = by, At = DurableClock.UtcNow };
+  var step = new Handover { Item = item, Step = NextStep(item), From = holder, To = item.Assignee, FromQueue = fromQueue, ToQueue = queue,
+                              Reason = HandoverReason.Moved, By = by, At = DurableClock.UtcNow };
   Raise(new ItemMoved { Item = item, Step = StepOf(step) });
   if (holder != null && item.Assignee == null) {
     Distribute(item, null);

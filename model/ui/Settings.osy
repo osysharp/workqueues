@@ -65,12 +65,14 @@ public decimal HoursOf(TimeSpan? t) { return t == null ? 0 : Convert.ToDecimal(M
 public component QueueSettings() {
   live var admin = AdministersInbox;
   live var lead = LeadsInbox;
+  [SuppressWarning("ui-page-query-without-a-take")]   // edited in place: a new row joins only an every-row list; configuration, a handful by design
   live var queues = Queue.Include(q => q.EscalatesTo).Include(q => q.Hours).OrderBy(q => q.Level).ThenBy(q => q.Position)
     .ThenBy(q => q.Name).ToList();
+  [SuppressWarning("ui-page-query-without-a-take")]   // edited in place: a new row joins only an every-row list; configuration, a handful by design
   live var members = QueueMember.Include(m => m.Member).Include(m => m.Queue).OrderBy(m => m.Member.DisplayName).ToList();
   live var calendars = Osysharp.ServiceHours.ServiceHours.OrderBy(h => h.Name).ToList();
   // Who could be added: everybody who already works a queue. Somebody new is added by their address.
-  live var workers = Principal.Where(p => QueueMember.Any(m => m.Member == p)).OrderBy(p => p.DisplayName).ToList();
+  live var workers = Principal.Where(p => QueueMember.Any(m => m.Member == p)).OrderBy(p => p.DisplayName).Take(500).ToList();
   Queue? timing = null;
   int pickup = 0;
   int language = 10;
@@ -233,11 +235,13 @@ public string ConditionsOf(SlaPolicy p) {
 [Composable]
 public component SlaPolicySettings() {
   live var admin = AdministersInbox;
+  [SuppressWarning("ui-page-query-without-a-take")]   // edited in place: a new row joins only an every-row list; configuration, a handful by design
   live var policies = SlaPolicy.Include(p => p.Tier).Include(p => p.Queue).Include(p => p.Hours)
     .OrderBy(p => p.Position).ThenBy(p => p.Name).ToList();
+  [SuppressWarning("ui-page-query-without-a-take")]   // edited in place: a new row joins only an every-row list; configuration, a handful by design
   live var targets = SlaTarget.Include(t => t.Policy).ToList();
-  live var tiers = OrganizationTier.OrderBy(t => t.Rank).ToList();
-  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Name).ToList();
+  live var tiers = OrganizationTier.OrderBy(t => t.Rank).Take(100).ToList();
+  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Name).Take(200).ToList();
   live var calendars = Osysharp.ServiceHours.ServiceHours.OrderBy(h => h.Name).ToList();
   SlaPolicy? editing = null;
   // ONE policy open at a time: the page reads as the list of promises, and opens to the fields of the one being changed.
@@ -411,9 +415,11 @@ public string ClockText(TimeSpan t) {
 public component BusinessHoursSettings() {
   live var admin = AdministersInbox;
   live var calendars = Osysharp.ServiceHours.ServiceHours.OrderBy(h => h.Name).ToList();
+  [SuppressWarning("ui-page-query-without-a-take")]   // edited in place: a new row joins only an every-row list; configuration, a handful by design
   live var windows = ServiceWindow.Include(w => w.ServiceHours).OrderBy(w => w.Day).ThenBy(w => w.Start).ToList();
   // The holidays still to come: one that is over stops no clock again, so the list does not grow with every year the
   // desk has been open. Its row is kept — the page simply does not read it.
+  [SuppressWarning("ui-page-query-without-a-take")]   // edited in place: a new row joins only an every-row list; configuration, a handful by design
   live var holidays = ServiceException.Where(e => e.To >= DateTime.UtcNow.Date).Include(e => e.ServiceHours)
     .OrderBy(e => e.From).ToList();
   string problem = "";
@@ -519,12 +525,13 @@ public string RuleWhen(RoutingRule r) {
 [Composable]
 public component RoutingRuleSettings(string appAction = "The app's action", string appActionHint = "tag:refund") {
   live var admin = AdministersInbox;
+  [SuppressWarning("ui-page-query-without-a-take")]   // edited in place: a new row joins only an every-row list; configuration, a handful by design
   live var rules = RoutingRule.Include(r => r.ToQueue).Include(r => r.Tier).Include(r => r.Organization)
     .Include(r => r.NeedSkill).Include(r => r.AssignTo).OrderBy(r => r.Position).ThenBy(r => r.Name).ToList();
-  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Name).ToList();
-  live var tiers = OrganizationTier.OrderBy(t => t.Rank).ToList();
-  live var skills = RoutingSkill.OrderBy(s => s.Kind).ThenBy(s => s.Name).ToList();
-  live var workers = Principal.Where(p => QueueMember.Any(m => m.Member == p)).OrderBy(p => p.DisplayName).ToList();
+  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Name).Take(200).ToList();
+  live var tiers = OrganizationTier.OrderBy(t => t.Rank).Take(100).ToList();
+  live var skills = RoutingSkill.OrderBy(s => s.Kind).ThenBy(s => s.Name).Take(200).ToList();
+  live var workers = Principal.Where(p => QueueMember.Any(m => m.Member == p)).OrderBy(p => p.DisplayName).Take(500).ToList();
 
   action AddRule() { UnitOfWork.Mark("Add a rule"); new RoutingRule { Name = "New rule", Position = rules.Count }; }
   action Up(RoutingRule r) {
@@ -584,9 +591,11 @@ public component RoutingRuleSettings(string appAction = "The app's action", stri
 public component SkillSettings() {
   live var admin = AdministersInbox;
   live var lead = LeadsInbox;
+  [SuppressWarning("ui-page-query-without-a-take")]   // edited in place: a new row joins only an every-row list; configuration, a handful by design
   live var skills = RoutingSkill.OrderBy(s => s.Kind).ThenBy(s => s.Name).ToList();
+  [SuppressWarning("ui-page-query-without-a-take")]   // edited in place: a new row joins only an every-row list; configuration, a handful by design
   live var held = HeldSkill.Include(h => h.Person).Include(h => h.Skill).OrderBy(h => h.Person.DisplayName).ToList();
-  live var workers = Principal.Where(p => QueueMember.Any(m => m.Member == p)).OrderBy(p => p.DisplayName).ToList();
+  live var workers = Principal.Where(p => QueueMember.Any(m => m.Member == p)).OrderBy(p => p.DisplayName).Take(500).ToList();
 
   action AddSkill() { UnitOfWork.Mark("Add a skill"); new RoutingSkill { Name = "New skill" }; }
   action AddLanguage() { UnitOfWork.Mark("Add a language"); new RoutingSkill { Name = "New language", Kind = SkillKind.Language }; }
@@ -648,10 +657,11 @@ public component SkillSettings() {
 [Composable]
 public component SharedViewSettings(string appFilter = "The app's filter", string appFilterHint = "tag:refund") {
   live var admin = AdministersInbox;
+  [SuppressWarning("ui-page-query-without-a-take")]   // edited in place: a new row joins only an every-row list; configuration, a handful by design
   live var views = InboxView.Where(v => v.Owner == null).Include(v => v.Queue).Include(v => v.Tier)
     .OrderBy(v => v.Position).ThenBy(v => v.Name).ToList();
-  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Name).ToList();
-  live var tiers = OrganizationTier.OrderBy(t => t.Rank).ToList();
+  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Name).Take(200).ToList();
+  live var tiers = OrganizationTier.OrderBy(t => t.Rank).Take(100).ToList();
 
   action AddView() { UnitOfWork.Mark("Add a view"); new InboxView { Name = "New view", Position = views.Count }; }
   action Remove(InboxView v) { UnitOfWork.Mark("Remove " + v.Name); v.Delete(); }

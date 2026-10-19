@@ -90,7 +90,7 @@ entity Told {
   [MaxLength(300)] string Text = "";
   /// Some of the facts it was told — who has it now, and why — so a test can say them again in another language.
   [MaxLength(200)] string To = "";
-  AssignReason? Reason;
+  HandoverReason? Reason;
   DateTime At = DateTime.UtcNow;
   // Written by the run, and — for a link, which a person makes outside any run — by whoever works the inbox.
   security { allow read, create when WorksInbox; }
@@ -103,7 +103,7 @@ InboxStep StepHeard(WorkItem item, string kind) {
 }
 
 /// A step of an item's trail as its reader reads it — said by the server from the step's facts (`TrailWords`).
-string Said(Assignment step) { return TrailWords(new List<Guid> { step.Id })[0].Text; }
+string Said(Handover step) { return TrailWords(new List<Guid> { step.Id })[0].Text; }
 
 // What the inbox tells, heard as the app hears it: every one of its events, with the sentence the kit says for it — and,
 // for the ones that name somebody to tell, what that person reads (`InboxNotice`). An app with a bell uses

@@ -34,7 +34,7 @@ public component MyStatus() {
   live var look = StandingLamp(s.Status, s.Away, s.OnHours);
   // Who could cover: everybody else who works a queue.
   live var colleagues = Principal.Where(p => p.Id != meId && QueueMember.Any(m => m.Member == p && m.Active))
-    .OrderBy(p => p.DisplayName).ToList();
+    .OrderBy(p => p.DisplayName).Take(500).ToList();
 
   on mount { s = MyPresence(); }
 
@@ -130,7 +130,7 @@ public component TeamLoad() {
   }
 
   render {
-    Stack(gap: 0, role: UiRole.List, label: "Team load") {
+    Stack(gap: 0, role: (!loaded || rows.Count == 0) ? UiRole.Group : UiRole.List, label: "Team load") {
       if (problem != "") { Box(pb: 2) { Alert(problem, tone: Tone.Warning); } }
       // While the team is read: the shape of the rows to come, never an empty screen that then jumps.
       if (!loaded) { Stack(gap: 3, p: 3) { Skeleton(shape: SkeletonShape.Line); Skeleton(shape: SkeletonShape.Line); Skeleton(shape: SkeletonShape.HalfLine); } }
@@ -189,7 +189,7 @@ public component MyAccountsPanel(string prefix = "/inbox") {
   bool loaded = false;
   on mount { rows = MyAccounts(); loaded = true; }
   render {
-    Stack(gap: 0, role: UiRole.List, label: "Accounts I look after") {
+    Stack(gap: 0, role: (!loaded || rows.Count == 0) ? UiRole.Group : UiRole.List, label: "Accounts I look after") {
       if (!loaded) { Stack(gap: 3, p: 3) { Skeleton(shape: SkeletonShape.Line); Skeleton(shape: SkeletonShape.HalfLine); } }
       if (loaded && rows.Count == 0) { EmptyState("No accounts", body: "You are on no organisation's account team."); }
       foreach (var a in rows) {

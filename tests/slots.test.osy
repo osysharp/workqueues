@@ -1,0 +1,128 @@
+// WHAT ANOTHER KIT ADDS TO THE INBOX — the two slots (model/ui/Slots.osy), filled by this project's own `kits/proposals`
+// (Acme.Proposals: a kind of item the inbox has never heard of). `WorkItemDetail`: the kit that owns a kind of item
+// draws it on the item's screen. `WorkBulkAction`: it adds one change to many of them to the list's bulk bar — which
+// runs as the person pressing, over the items they may change. Driven as a person; `osy test --pixels` photographs
+// both, wide and on a phone.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using InboxKitTests;
+using Acme.Proposals;
+
+/// A proposal, arrived and placed in the default queue.
+Proposal Proposed(string title, string change) {
+  var p = Propose(title, change);
+  Workflow.Settle(p);
+  return p;
+}
+
+/// A plain request beside them — an item of a kind nobody draws a detail for.
+Request Asked(string title) {
+  var r = new Request { Title = title, Organization = CompanyNamed("Orbit Labs"), Requester = PersonNamed("Dev") };
+  Workflow.Settle(r);
+  return r;
+}
+
+/// Is the proposal called `title` approved? Read as the lead, who reads every item.
+bool IsApproved(string title) {
+  var approved = false;
+  runas (Lena) { approved = Proposal.Single(p => p.Title == title).Approved; }
+  return approved;
+}
+
+/// ⭐ THE KIT THAT OWNS A KIND OF ITEM DRAWS IT. A proposal's screen shows the inbox's head and, under it, the
+/// proposal as Acme.Proposals draws it; a request's screen — a kind nobody contributes a detail for — shows the head
+/// and nothing of the proposal kit's. On a phone the detail stands under the head and nothing pushes the page sideways.
+[Test(Desk)]
+void another_kits_kind_of_item_is_drawn_by_that_kit() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));   // Tue 09:00 Stockholm — the browser's clock too
+  Guid proposal = Guid.Empty;
+  Guid request = Guid.Empty;
+  runas (Ines) {
+    proposal = Proposed("Raise the travel cap", "Raise the per-trip travel cap from 600 to 900.").Id;
+    request = Asked("Printer jams on page two").Id;
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ines);
+  Ui.Visit("/inbox/unassigned/i/" + proposal);
+  Assert.Visible("Raise the travel cap", within: "Item");
+  Assert.Visible("Proposed change", within: "Proposal");
+  Assert.Visible("Raise the per-trip travel cap from 600 to 900.", within: "Proposal");
+  Assert.Visible("Waiting for a yes", within: "Proposal");
+  Ui.Shot("slot-detail-wide-light");
+
+  Ui.Visit("/inbox/unassigned/i/" + request);
+  Assert.Visible("Printer jams on page two", within: "Item");
+  Assert.Hidden("Proposed change");
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/inbox/unassigned/i/" + proposal);
+  Assert.Visible("Proposed change", within: "Proposal");
+  Assert.NoOverflow();
+  Ui.Shot("slot-detail-phone-light");
+}
+
+/// ⭐ "APPROVE ALL", ADDED BY THE KIT THAT OWNS PROPOSALS — AND IT IS THE PERSON'S OWN ACT. With proposals picked the
+/// bulk bar offers the kit's button; with a request picked beside them it does not (they are not one kind). Ines
+/// holds two of the three proposals and Rahul the third: she picks all three and approves — hers are approved, his is
+/// exactly as it was, and the list says so. Nothing she could not have done one at a time happened in bulk.
+[Test(Desk)]
+void a_contributed_bulk_action_changes_only_what_the_person_may() {
+  TestClock.Set(new DateTime(2026, 6, 2, 7, 0, 0));   // Tue 09:00 Stockholm — the browser's clock too
+  runas (Ines) {
+    var first = Proposed("Raise the travel cap", "Raise the per-trip travel cap from 600 to 900.");
+    var second = Proposed("Add a fourth approver", "Add Finance as a fourth approver over 10,000.");
+    Proposed("Close the Malmö office", "Close the Malmö office in March.");
+    Asked("Printer jams on page two");
+    TakeWork(first);
+    TakeWork(second);
+    Workflow.Settle(first);
+    Workflow.Settle(second);
+  }
+  runas (Rahul) {
+    var third = Proposal.Single(p => p.Title == "Close the Malmö office");
+    TakeWork(third);
+    Workflow.Settle(third);
+  }
+
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ines);
+  Ui.Visit("/inbox/open");
+  Assert.Visible("Close the Malmö office", within: "All open list");
+
+  // A proposal and a request picked together are not one kind: the kit's button is not offered.
+  Ui.Click("Select Raise the travel cap");
+  Ui.Click("Select Printer jams on page two");
+  Assert.Visible("2 selected", within: "Selected");
+  Assert.Hidden("Approve all");
+  Ui.Click("Select Printer jams on page two");
+
+  // The three proposals: one kind, so the button is there beside the inbox's own.
+  Ui.Click("Select Add a fourth approver");
+  Ui.Click("Select Close the Malmö office");
+  Assert.Visible("3 selected", within: "Selected");
+  Assert.Clickable("Approve all");
+  Assert.Clickable("Escalate");
+  Ui.Shot("slot-bulk-wide-light");
+
+  Ui.Click("Approve all");
+  Assert.Visible("Approved 2 of 3 — the rest are not yours to approve.");
+  Assert.Hidden("3 selected");
+  Assert.True(IsApproved("Raise the travel cap"));
+  Assert.True(IsApproved("Add a fourth approver"));
+  Assert.False(IsApproved("Close the Malmö office"));        // Rahul's — hers to read, not to approve
+
+  // On a phone the bar wraps; the kit's button is still reachable and nothing pushes the page sideways.
+  Ui.Viewport(390, 844);
+  Ui.Visit("/inbox/open");
+  Ui.Click("Select Close the Malmö office");
+  Assert.Clickable("Approve all");
+  Assert.NoOverflow();
+  Ui.Shot("slot-bulk-phone-light");
+
+  // …and the same press by somebody who holds none of what is picked changes nothing.
+  Ui.Click("Approve all");
+  Assert.Visible("Approved 0 of 1 — the rest are not yours to approve.");
+  Assert.False(IsApproved("Close the Malmö office"));
+}

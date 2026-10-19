@@ -9,7 +9,7 @@ using Osysharp.Workflow;
 // moves the item there and raises its level: the promise is read again (a policy may be keyed by queue), the clocks are
 // retargeted keeping the time used, and the item is routed again at the new level — its holder keeps it only when they
 // are a member there (and `InboxSetup.KeepHolderOnEscalation`). Every escalation is an `Escalation` row and an
-// `Assignment` with reason `Escalated`.
+// `Handover` with reason `Escalated`.
 //
 // A policy's `SlaEscalation` rows say what its clocks DO when they go at risk or are breached — a CLOSED set: tell the
 // holder, tell the leads, raise the priority one step, escalate, move to a queue. Each fires once per clock cycle (the
@@ -59,8 +59,8 @@ void LevelUp(WorkItem item, Principal? by, string why, SlaMetric? metric, SlaMom
   if (item.OfferedTo != null) { SettleOffer(item, null); }
   new Escalation { Item = item, FromLevel = fromLevel, ToLevel = toLevel, FromQueue = from, ToQueue = to, By = by,
                    Why = why, Metric = metric, Moment = moment, At = DurableClock.UtcNow };
-  var step = new Assignment { Item = item, Step = NextStep(item), From = holder, To = item.Assignee, FromQueue = from, ToQueue = to,
-                              Reason = AssignReason.Escalated, By = by, Level = toLevel, Metric = metric, Moment = moment,
+  var step = new Handover { Item = item, Step = NextStep(item), From = holder, To = item.Assignee, FromQueue = from, ToQueue = to,
+                              Reason = HandoverReason.Escalated, By = by, Level = toLevel, Metric = metric, Moment = moment,
                               Detail = why, At = DurableClock.UtcNow };
   Raise(new ItemEscalated { Item = item, Step = StepOf(step) });
   if (item.Assignee == null) { Distribute(item, null); }

@@ -10,7 +10,7 @@ using Osysharp.Identity;
 //       [On] void TellTheLeads(PickupOverdue e) { … }
 //   An event nothing hears costs nothing: it is gone at the raise.
 //
-// ⚑ FACTS, NEVER A SENTENCE. A step of an item's trail is an `Assignment` row of facts — who had it, who has
+// ⚑ FACTS, NEVER A SENTENCE. A step of an item's trail is a `Handover` row of facts — who had it, who has
 //   it, which queue, why, until when — and an event carries the same facts (`InboxStep`), with people as they were NAMED
 //   at the time ("" for nobody — never a word for nobody, which would be English). `e.Sentence()` says them on the
 //   server, in the language of whoever is reading: a desk in Arabic reads "why is this here" in Arabic, one in Swedish
@@ -36,7 +36,7 @@ public enum Unavailability {
 /// step's event carries (`HolderChanged.Step`), and what the trail is said from.
 public class InboxStep {
   /// Why it moved.
-  public AssignReason? Reason;
+  public HandoverReason? Reason;
   /// Who held it before, who holds it now, and who did it — "" for nobody (the inbox did it, or nobody holds it).
   public string From = "";
   public string To = "";
@@ -319,7 +319,7 @@ string NameAt(Principal? p) {
 }
 
 /// A step of the trail as the facts an event carries, and the trail says.
-InboxStep StepOf(Assignment a) {
+InboxStep StepOf(Handover a) {
   return new InboxStep {
     Reason = a.Reason, From = NameAt(a.From), To = NameAt(a.To), By = NameAt(a.By), About = NameAt(a.About),
     Queue = a.ToQueue != null ? a.ToQueue.Name : "", FromQueue = a.FromQueue != null ? a.FromQueue.Name : "",
@@ -329,9 +329,9 @@ InboxStep StepOf(Assignment a) {
 }
 
 /// The words for an account step — "account owner", "backup", "account team".
-string StepWord(AssignReason step) {
-  if (step == AssignReason.AccountOwner) { return "account owner"; }
-  if (step == AssignReason.AccountBackup) { return "backup"; }
+string StepWord(HandoverReason step) {
+  if (step == HandoverReason.AccountOwner) { return "account owner"; }
+  if (step == HandoverReason.AccountBackup) { return "backup"; }
   return "account team";
 }
 
@@ -437,10 +437,10 @@ string OfferedNotice(InboxStep happened) {
 string HandedNotice(InboxStep happened) {
   var by = happened.By;
   var r = happened.Reason;
-  if ((r == AssignReason.OwnerAway || r == AssignReason.Cover || r == AssignReason.OffHoursCover) && happened.From != "") {
+  if ((r == HandoverReason.OwnerAway || r == HandoverReason.Cover || r == HandoverReason.OffHoursCover) && happened.From != "") {
     return $"Handed to you — {Unavailable(happened.From, Unavailability.Away, happened.Until)}.";
   }
-  if (r == AssignReason.Escalated) { return $"Escalated to you in {happened.Queue}."; }
+  if (r == HandoverReason.Escalated) { return $"Escalated to you in {happened.Queue}."; }
   if (by != "" && by != happened.To) { return $"{by} handed it to you."; }
   return "Given to you.";
 }
@@ -462,24 +462,25 @@ public string InboxStepWords(InboxStep happened) {
   var queue = happened.Queue;
   var r = happened.Reason;
   if (r == null) { return "Something happened."; }
-  if (r == AssignReason.Arrived) { return $"Arrived in {queue}."; }
-  if (r == AssignReason.Rule && happened.To == "") { return $"Arrived in {queue} — rule “{happened.Rule}”."; }
-  if (r == AssignReason.Rule) { return $"Given to {to} — rule “{happened.Rule}”."; }
-  if (r == AssignReason.Claimed) { return $"{to} took it."; }
-  if (r == AssignReason.HandedOn) {
+  if (r == HandoverReason.Arrived) { return $"Arrived in {queue}."; }
+  if (r == HandoverReason.Rule && happened.To == "") { return $"Arrived in {queue} — rule “{happened.Rule}”."; }
+  if (r == HandoverReason.Rule) { return $"Given to {to} — rule “{happened.Rule}”."; }
+  if (r == HandoverReason.Claimed) { return $"{to} took it."; }
+  if (r == HandoverReason.Addressed) { return $"Put to {to}."; }
+  if (r == HandoverReason.HandedOn) {
     return by == "" || by == happened.To ? $"{to} took it." : $"{by} handed it to {to}.";
   }
-  if (r == AssignReason.Released && happened.Until != null) {
+  if (r == HandoverReason.Released && happened.Until != null) {
     return $"{Unavailable(from, Unavailability.Away, happened.Until)} — back to {queue}.";
   }
-  if (r == AssignReason.Released) {
+  if (r == HandoverReason.Released) {
     return by == "" || by == happened.From ? $"{from} released it." : $"{by} released it from {from}.";
   }
-  if (r == AssignReason.Moved) {
+  if (r == HandoverReason.Moved) {
     var moved = by == "" ? $"Moved to {queue}." : $"Moved to {queue} by {by}.";
     return happened.From != "" && happened.To == "" ? $"{moved} {from} is not in {queue}, so it is unheld." : moved;
   }
-  if (r == AssignReason.Escalated) {
+  if (r == HandoverReason.Escalated) {
     var level = happened.Level ?? 0;
     var up = happened.Metric != null && happened.Moment != null
       ? $"Escalated to {queue} (L{level}) — {MomentWords(happened.Metric.Value, happened.Moment.Value)}."
@@ -487,30 +488,30 @@ public string InboxStepWords(InboxStep happened) {
       : $"Escalated to {queue} (L{level}).";
     return happened.From != "" && happened.To == "" ? $"{up} {from} is not in {queue}, so it is unheld." : up;
   }
-  if (r == AssignReason.RoundRobin) { return $"Given to {to} — their turn in {queue}."; }
-  if (r == AssignReason.LeastLoaded) { return $"Given to {to} — the least loaded in {queue}."; }
-  if (r == AssignReason.Refill) { return $"Given to {to} — they were free."; }
-  if (r == AssignReason.Cover) { return $"{Unavailable(from, Unavailability.Away, happened.Until)} — covered by {to}."; }
-  if (r == AssignReason.OffHoursCover) { return $"{from} is off shift — {to} is on, and has it now."; }
-  if (r == AssignReason.OwnerAway || r == AssignReason.Skipped) {
+  if (r == HandoverReason.RoundRobin) { return $"Given to {to} — their turn in {queue}."; }
+  if (r == HandoverReason.LeastLoaded) { return $"Given to {to} — the least loaded in {queue}."; }
+  if (r == HandoverReason.Refill) { return $"Given to {to} — they were free."; }
+  if (r == HandoverReason.Cover) { return $"{Unavailable(from, Unavailability.Away, happened.Until)} — covered by {to}."; }
+  if (r == HandoverReason.OffHoursCover) { return $"{from} is off shift — {to} is on, and has it now."; }
+  if (r == HandoverReason.OwnerAway || r == HandoverReason.Skipped) {
     return $"{Unavailable(happened.About, happened.Because, happened.Until)} — skipped.";
   }
-  if (r == AssignReason.FellThrough && happened.Because == Unavailability.DidNotTake) {
+  if (r == HandoverReason.FellThrough && happened.Because == Unavailability.DidNotTake) {
     return $"{about} did not take it in {happened.Minutes ?? 0} minutes — it falls through.";
   }
-  if (r == AssignReason.FellThrough && happened.Because == Unavailability.Declined) { return $"{about} declined it."; }
-  if (r == AssignReason.FellThrough && happened.Because != null) {
+  if (r == HandoverReason.FellThrough && happened.Because == Unavailability.Declined) { return $"{about} declined it."; }
+  if (r == HandoverReason.FellThrough && happened.Because != null) {
     return $"{Unavailable(happened.About, happened.Because, happened.Until)} — the offer falls through.";
   }
-  if (r == AssignReason.FellThrough) { return $"To {queue} — the account team could not take it."; }
-  if (r == AssignReason.AccountOwner || r == AssignReason.AccountBackup || r == AssignReason.AccountPod) {
+  if (r == HandoverReason.FellThrough) { return $"To {queue} — the account team could not take it."; }
+  if (r == HandoverReason.AccountOwner || r == HandoverReason.AccountBackup || r == HandoverReason.AccountPod) {
     var step = StepWord(r.Value);
     if (happened.To == "") {
       return $"Offered to {about} ({step}); it falls through after {happened.Minutes ?? 0} minutes.";
     }
     return $"{to} took the offer ({step}).";
   }
-  if (r == AssignReason.Imported) { return happened.To != "" ? $"Imported — held by {to}." : $"Imported into {queue}."; }
+  if (r == HandoverReason.Imported) { return happened.To != "" ? $"Imported — held by {to}." : $"Imported into {queue}."; }
   return "Something happened.";
 }
 
@@ -520,7 +521,7 @@ public string InboxStepWords(InboxStep happened) {
 public class TrailLine {
   public Guid Id;
   public int Step;
-  public AssignReason Reason;
+  public HandoverReason Reason;
   public string Text = "";
   public DateTime At;
 }
@@ -530,7 +531,7 @@ public class TrailLine {
 /// Billing.". One read, with the names it shows.
 [SuppressWarning("cost-unbounded-read")]   // one item's trail
 public List<TrailLine> TrailLines(WorkItem item) {
-  return SaidSteps(Assignment.Where(a => a.Item == item).Include(a => a.From).Include(a => a.To).Include(a => a.By)
+  return SaidSteps(Handover.Where(a => a.Item == item).Include(a => a.From).Include(a => a.To).Include(a => a.By)
     .Include(a => a.About).Include(a => a.ToQueue).Include(a => a.FromQueue).Include(a => a.Rule).OrderBy(a => a.Step).ToList());
 }
 
@@ -538,11 +539,11 @@ public List<TrailLine> TrailLines(WorkItem item) {
 [SuppressWarning("cost-unbounded-read")]   // one row per id the trail on screen asks for
 public List<TrailLine> TrailWords(List<Guid> ids) {
   if (ids.Count == 0) { return new List<TrailLine>(); }
-  return SaidSteps(Assignment.Where(a => ids.Contains(a.Id)).Include(a => a.From).Include(a => a.To).Include(a => a.By)
+  return SaidSteps(Handover.Where(a => ids.Contains(a.Id)).Include(a => a.From).Include(a => a.To).Include(a => a.By)
     .Include(a => a.About).Include(a => a.ToQueue).Include(a => a.FromQueue).Include(a => a.Rule).OrderBy(a => a.Step).ToList());
 }
 
-List<TrailLine> SaidSteps(List<Assignment> steps) {
+List<TrailLine> SaidSteps(List<Handover> steps) {
   var lines = new List<TrailLine>();
   foreach (var a in steps) {
     lines.Add(new TrailLine { Id = a.Id, Step = a.Step, Reason = a.Reason, At = a.At, Text = InboxStepWords(StepOf(a)) });

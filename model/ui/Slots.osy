@@ -1,0 +1,35 @@
+namespace Osysharp.WorkQueues;
+
+// ── what other kits, and the app, add to the inbox's screens ────────────────────────────────────────────────────────
+
+/// WHAT AN ITEM IS, DRAWN BY WHOEVER OWNS ITS KIND — the place on an item's screen, under its head, where a kit (or the
+/// app) shows one kind of item: an approval's amount and steps, a proposal's change, a return's parcel. A kit writes
+/// `component ReturnDetail(Return item) : WorkItemDetail<Return>` and every screen that draws `WorkItemDetail(item)` —
+/// `WorkItemView` does — shows it for a `Return` and for nothing else; an item of a kind nobody draws shows nothing
+/// here. One for every kind is `component Notes<T>(T item) : WorkItemDetail<T>`.
+/// In a test, open the item and assert what the contribution draws: `Assert.Visible("Proposed change")`.
+/// need: show my kind of item in the inbox, a detail view for an item, add a panel to an inbox item
+/// e.g. `WorkItemDetail(item);`
+[Slot] public abstract component WorkItemDetail<T>(T item) where T : entity;
+
+/// A CHANGE TO MANY ITEMS AT ONCE, ADDED BY WHOEVER OWNS THEIR KIND — a place on the list's bulk bar, drawn while
+/// something is picked. `kind` is the kind key the picked items share (`WorkItem.Kind`), or "" when they differ or
+/// have none — a contribution for one kind draws its button only for it. `ids` are the picked items. The
+/// contribution's action does the change with a function of its own — which runs as the person pressing, over the
+/// items they may change — and then tells the list how it went: `done("2 of 3 approved.")` says the sentence under the
+/// bar and clears the pick.
+/// In a test, pick rows (`Ui.Press("X")`) and press the contribution's button.
+/// need: approve all like this, a bulk action for my kind of item, add a button to the inbox's bulk bar
+/// e.g. `WorkBulkAction(kind, picked, Done);`
+[Slot] public abstract component WorkBulkAction(string kind, List<Guid> ids, Action<string> done);
+
+/// AN ITEM'S SCREEN — its head (`WorkItemHead`: who has it, where it waits, its promises) and, under it, what the item
+/// IS as the owner of its kind draws it (`WorkItemDetail`). The app adds what it wants below. `opened`: what the page
+/// already asked for the item (`OpenItem`) — then the head asks nothing of its own as it opens.
+[Composable]
+public component WorkItemView(WorkItem item, ItemOpening? opened = null) {
+  render {
+    WorkItemHead(item, opened);
+    WorkItemDetail(item);
+  }
+}

@@ -1,0 +1,58 @@
+namespace Acme.Proposals;
+
+using Osysharp.WorkQueues;
+
+/// A change somebody proposes, waiting for a yes. An ordinary inbox item: it waits in a queue, somebody holds it, and
+/// only the person who HOLDS it may approve it.
+public entity Proposal : WorkItem {
+  /// What would change, in a sentence.
+  [MaxLength(400)] string Change = "";
+  bool Approved;
+  security {
+    allow read, create when WorksInbox;
+    // The holder decides — nobody approves what a colleague holds.
+    allow update when WorksInbox where Assignee == user;
+  }
+}
+
+/// The kind key every proposal carries — what the list tells a bulk action the picked items share.
+public string ProposalKind() { return "proposal"; }
+
+/// Propose `change`, as an item called `title`.
+public Proposal Propose(string title, string change) {
+  return new Proposal { Title = title, Change = change, Kind = ProposalKind() };
+}
+
+/// Approve every one of `ids` the caller may — the ones they hold — and answer how many that was. It runs as the
+/// caller: a proposal a colleague holds is not theirs to change, and stays as it was.
+public int ApproveAll(List<Guid> ids) {
+  return Proposal.Where(p => ids.Contains(p.Id) && !p.Approved).Update(p => p.Approved = true);
+}
+
+// ── on the inbox's screens ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// A proposal on its item's screen: what would change, and whether it has its yes.
+[Contribution("Proposal")]
+component ProposalDetail(Proposal item) : WorkItemDetail<Proposal> {
+  render {
+    Stack(gap: 2, px: 5, py: 4, borderBW: 1, border: Colors.Border, label: "Proposal") {
+      Row(gap: 2, align: Align.Center) {
+        SectionLabel("Proposed change");
+        Badge(item.Approved ? "Approved" : "Waiting for a yes", tone: item.Approved ? Tone.Success : Tone.Warning);
+      }
+      Text(item.Change);
+    }
+  }
+}
+
+/// "Approve all" on the list's bulk bar — only while every picked item is a proposal.
+[Contribution("Approve all")]
+component ApproveProposals(string kind, List<Guid> ids, Action<string> done) : WorkBulkAction {
+  action Approve() {
+    var n = ApproveAll(ids);
+    done(n == ids.Count ? "Approved " + n + "." : "Approved " + n + " of " + ids.Count + " — the rest are not yours to approve.");
+  }
+  render {
+    if (kind == ProposalKind()) { Button("Approve all", onPress: Approve, size: Size.Sm, tone: Tone.Primary); }
+  }
+}

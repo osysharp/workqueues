@@ -36,8 +36,10 @@ team's (`WorksInbox`) — a requester cannot stop the team's clock or raise thei
   `TakeMany`, `MoveMany` — only somebody who **may hold** an item (an active member of its queue) is ever given it.
   `expected` is the holder the page showed: a take that lost the race is refused with "Rahul took this just now."
   A lead moves anybody's work; an agent only their own unless `InboxSetup.AgentsHandOn`.
-- **`Assignment`** — every change of holder or queue, with its reason and who did it. `TrailOf(item)` is "why is this
+- **`Handover`** — every change of holder or queue, with its reason and who did it. `TrailOf(item)` is "why is this
   here".
+- **`Addressee`** — an item made for one named person (a question put to them, an approval that is theirs) is given
+  to them as it arrives, when they may hold it, instead of being routed.
 
 ## Who is given it
 
@@ -79,7 +81,7 @@ team's (`WorksInbox`) — a requester cannot stop the team's clock or raise thei
 
 - **Levels** — `Queue.Level` and `Queue.EscalatesTo`. `EscalateWork(item, why)` moves the item up: its promise is read
   again and retargeted, it is routed again at the new level, and its holder keeps it only where they may hold it.
-  Each is an `Escalation` row and an `Assignment` (`Escalated`).
+  Each is an `Escalation` row and a `Handover` (`Escalated`).
 - **`SlaEscalation`** — what a policy's clocks do when at risk or breached: `TellHolder`, `TellLeads`, `RaisePriority`,
   `Escalate`, `MoveTo`. Once per clock cycle. Every promise goes at risk — the resolution too.
 
@@ -114,6 +116,23 @@ priority and `ItemClocks`; `WhyHere(item)` is its trail in sentences; `MyStatus(
 and the settings pages `QueueSettings`, `SlaPolicySettings` (with "which policy applies?"), `BusinessHoursSettings`,
 `RoutingRuleSettings`, `SkillSettings`, `SharedViewSettings`. They reflect the app's own `WorksInbox`/`LeadsInbox`/
 `AdministersInbox` — nothing to thread through. `osy docs ui-inbox-kit`; the test app's `model/pages.osy` places them all.
+
+### What another kit adds
+
+Two places on these screens are open to other kits, and to the app:
+
+- **An item's detail** — `WorkItemDetail`. The kit that owns a kind of item draws it under the item's head, on every
+  screen that shows `WorkItemView(item)`:
+  `component ReturnDetail(Return item) : WorkItemDetail<Return> { render { … } }`. An item of a kind nobody draws
+  shows the head alone.
+- **A change to many items** — `WorkBulkAction`. A button on the list's bulk bar, told the kind the picked items share
+  (`WorkItem.Kind`, or "" when they differ) and their ids:
+  `component ApproveAll(string kind, List<Guid> ids, Action<string> done) : WorkBulkAction { … }`. Its action calls a
+  function of its own kit and then `done("2 of 3 approved.")` — the list says the sentence and clears the pick. The
+  function runs as the person pressing: an item they may not change stays as it was.
+
+So an approval, a return or a proposal that arrives from another kit is an ordinary item in the same inbox, shown and
+worked the way its own kit decides. The test app's `kits/proposals` is a complete example in sixty lines.
 
 ## Use it
 

@@ -121,8 +121,8 @@ Principal? ArriveAt(WorkItem item, OrganizationTier? tier) {
   var spoken = LanguageSkill(item.Language);
   if (spoken != null) { Need(item, spoken, false); }
 
-  var arrived = new Assignment { Item = item, Step = NextStep(item), ToQueue = item.Queue,
-                                 Reason = routedBy != null ? AssignReason.Rule : AssignReason.Arrived, Rule = routedBy,
+  var arrived = new Handover { Item = item, Step = NextStep(item), ToQueue = item.Queue,
+                                 Reason = routedBy != null ? HandoverReason.Rule : HandoverReason.Arrived, Rule = routedBy,
                                  At = DurableClock.UtcNow };
   Raise(new ItemQueued { Item = item, Step = StepOf(arrived) });
   if (routedBy != null) { Raise(new ItemRouted { Item = item, Step = StepOf(arrived) }); }
@@ -134,8 +134,8 @@ Principal? ArriveAt(WorkItem item, OrganizationTier? tier) {
   if (assignTo != null) {
     if (MayHold(assignTo!, item)) {
       item.Assignee = assignTo;
-      var given = new Assignment { Item = item, Step = NextStep(item), To = assignTo, FromQueue = item.Queue, ToQueue = item.Queue,
-                                   Reason = AssignReason.Rule, Rule = assignedBy, At = DurableClock.UtcNow };
+      var given = new Handover { Item = item, Step = NextStep(item), To = assignTo, FromQueue = item.Queue, ToQueue = item.Queue,
+                                   Reason = HandoverReason.Rule, Rule = assignedBy, At = DurableClock.UtcNow };
       Raise(new HolderChanged { Item = item, Step = StepOf(given) });
     } else {
       Raise(new RoutingSkipped { Item = item, Step = new InboxStep { Rule = assignedBy!.Name, About = NameAt(assignTo), At = DurableClock.UtcNow } });
@@ -173,7 +173,7 @@ bool Pooled(WorkItem item) {
 /// Give `item` to the member its queue's distribution picks (`Choose`). Nobody free: it stays in the pool, and is
 /// pulled when somebody is. `why` is the reason the trail records when it is a pull (`Refill`); an arrival records the
 /// distribution's own (`RoundRobin`, `LeastLoaded`). `except`: never them — they have just let it go.
-void Distribute(WorkItem item, AssignReason? why, Guid? except = null) {
+void Distribute(WorkItem item, HandoverReason? why, Guid? except = null) {
   if (item.Queue == null || item.Assignee != null || item.OfferedTo != null) { return; }
   var queue = item.Queue;
   if (queue.Distribution == Distribution.Manual || !queue.Active) { return; }
@@ -184,7 +184,7 @@ void Distribute(WorkItem item, AssignReason? why, Guid? except = null) {
     return;
   }
   var reason = why != null ? why.Value
-    : (queue.Distribution == Distribution.RoundRobin ? AssignReason.RoundRobin : AssignReason.LeastLoaded);
+    : (queue.Distribution == Distribution.RoundRobin ? HandoverReason.RoundRobin : HandoverReason.LeastLoaded);
   Give(item, best, reason);
 }
 
@@ -263,7 +263,7 @@ QueueMember? Choose(WorkItem item, Queue queue, Distribution order, Guid? except
 /// Put `item` on `member` — a queue's choice — and take their turn: stamp `LastGivenAt` strictly after every turn
 /// already given in that queue, so two hand-outs in one instant still rotate. Whoever held it before has room again.
 [SuppressWarning("cost-unbounded-read")]   // one queue's members
-void Give(WorkItem item, QueueMember member, AssignReason reason) {
+void Give(WorkItem item, QueueMember member, HandoverReason reason) {
   var to = member.Member;
   // SECURITY-INVARIANT(inbox-work-goes-only-to-who-may-hold-it) — the choice reads membership and skills in bulk; the
   // write asks the one question every path asks, so routing can never give an item to somebody who may not hold it,
@@ -277,7 +277,7 @@ void Give(WorkItem item, QueueMember member, AssignReason reason) {
   member.LastGivenAt = stamp;
   var from = item.Assignee;
   item.Assignee = to;
-  var given = new Assignment { Item = item, Step = NextStep(item), From = from, To = to, FromQueue = item.Queue, ToQueue = item.Queue,
+  var given = new Handover { Item = item, Step = NextStep(item), From = from, To = to, FromQueue = item.Queue, ToQueue = item.Queue,
                                Reason = reason, At = now };
   Raise(new HolderChanged { Item = item, Step = StepOf(given) });
   if (from != null) { Refill(from, item); }

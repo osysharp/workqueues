@@ -1,5 +1,5 @@
 // WHO HOLDS AN ITEM — taking it, the collision sentence, releasing, handing on, moving, and the bulk verbs. Every
-// change of holder is an `Assignment` with its reason. The desk is in desk.test.osy: agents work their own items, and
+// change of holder is a `Handover` with its reason. The desk is in desk.test.osy: agents work their own items, and
 // moving work a colleague holds is a lead's (`AgentsHandOn = false`).
 using Osysharp.Identity;
 using Osysharp.WorkQueues;
@@ -14,7 +14,7 @@ void taking_an_item_puts_your_name_on_it_and_records_why() {
   Workflow.Settle(r);
   Assert.Equal("Ines", r.Assignee!.DisplayName);
   var last = TrailOf(r)[1];
-  Assert.Equal(AssignReason.Claimed, last.Reason);
+  Assert.Equal(HandoverReason.Claimed, last.Reason);
   Assert.Equal("Ines", last.To!.DisplayName);
   Assert.Equal("Ines", last.By!.DisplayName);
   Assert.Equal("Ines took it.", Said(last));
@@ -65,7 +65,7 @@ void handing_on_is_refused_for_a_target_who_may_not_hold_it() {
     HandWorkTo(r, PersonNamed("Rahul"));
     Workflow.Settle(r);
     Assert.Equal("Rahul", r.Assignee!.DisplayName);
-    Assert.Equal(AssignReason.HandedOn, TrailOf(r)[1].Reason);
+    Assert.Equal(HandoverReason.HandedOn, TrailOf(r)[1].Reason);
     Assert.Equal("Lena", TrailOf(r)[1].By!.DisplayName);
   }
 }
@@ -86,7 +86,7 @@ void a_move_keeps_the_holder_only_when_they_may_hold_it_in_the_new_queue() {
     Workflow.Settle(goes);
     Assert.Null(goes.Assignee);
     var moved = TrailOf(goes)[2];
-    Assert.Equal(AssignReason.Moved, moved.Reason);
+    Assert.Equal(HandoverReason.Moved, moved.Reason);
     Assert.Equal("Support", moved.FromQueue!.Name);
     Assert.Equal("Moved to Billing by Lena. Ines is not in Billing, so it is unheld.", Said(moved));
   }
@@ -134,7 +134,7 @@ void round_robin_offers_each_member_in_turn_and_skips_the_away() {
   }
   Assert.Equal("Ines, Mateo, Rahul, Ines", string.Join(", ", holders));    // each in turn, and round again
   var given = TrailOf(Request.Single(x => x.Title == "Turn two"))[1];
-  Assert.Equal(AssignReason.RoundRobin, given.Reason);
+  Assert.Equal(HandoverReason.RoundRobin, given.Reason);
   Assert.Equal("Given to Mateo — their turn in Rota.", Said(given));
   Assert.Null(given.By);                                             // the inbox did it
 
@@ -166,7 +166,7 @@ void least_loaded_counts_only_work_that_needs_attention() {
   runas (Lena) {
     var first = Ask("Floor one", queue: "Floor");
     Assert.Equal("Rahul", HolderOf(first));                          // 0 that need him, against Mateo 1 and Ines 2
-    Assert.Equal(AssignReason.LeastLoaded, TrailOf(first)[1].Reason);
+    Assert.Equal(HandoverReason.LeastLoaded, TrailOf(first)[1].Reason);
     Assert.Equal("Mateo", HolderOf(Ask("Floor two", queue: "Floor")));   // 1 and 1: the one given least recently
     Assert.Equal("Rahul", HolderOf(Ask("Floor three", queue: "Floor")));
     Assert.Equal(2, LoadOf(PersonNamed("Rahul")));
@@ -227,7 +227,7 @@ void capacity_freed_pulls_the_oldest_due_pooled_item() {
   runas (Lena) {
     var oldest = Request.Single(x => x.Id == ids[2]);
     Assert.Equal("Ines", HolderOf(oldest));
-    Assert.Equal(AssignReason.Refill, TrailOf(oldest)[1].Reason);
+    Assert.Equal(HandoverReason.Refill, TrailOf(oldest)[1].Reason);
     Assert.Equal("Nobody", HolderOf(Request.Single(x => x.Id == ids[3])));
   }
   runas (Rahul) {                                                   // waiting on the requester frees him too
@@ -264,4 +264,43 @@ void an_unclaimed_item_past_pickup_tells_the_leads() {
     Workflow.Settle(left);
     Assert.Equal(1, Told.Count(t => t.Item == left.Id && t.Kind == "notify:leads"));   // once
   }
+}
+
+// ── an item put to one person by name ───────────────────────────────────────────────────────────────────────────────
+
+/// An item made for one named person (`Addressee`) is theirs as it arrives — it is not routed, and the trail says
+/// it was put to them. In a queue that hands its work out in turn, the turn is not spent on it.
+[Test(Desk)]
+[runas(Lena)]
+void an_item_put_to_one_person_by_name_is_theirs_as_it_arrives() {
+  var r = new Request { Title = "Sign off the Larkspur renewal", Requester = PersonNamed("Olivia"), Addressee = PersonNamed("Rahul") };
+  r.Queue = QueueOf("Rota");                                         // the rota would have given it to Ines — her turn
+  Workflow.Settle(r);
+  Assert.Equal("Rahul", HolderOf(r));
+  Assert.Equal("Arrived → Addressed", Trail(r));
+  Assert.Equal("Put to Rahul.", Said(TrailOf(r)[1]));
+  // The rota's turn was not used: the next item it hands out still goes to Ines.
+  Assert.Equal("Ines", HolderOf(Ask("Printer jammed", queue: "Rota")));
+}
+
+/// Somebody who may not hold the item — not a member of the queue it waits in — is not given it: it is routed as
+/// any item is. Naming them changed nothing a hand-on could not have done.
+[Test(Desk)]
+[runas(Lena)]
+void an_item_put_to_somebody_who_may_not_hold_it_is_routed_like_any_other() {
+  var r = new Request { Title = "Review the access log", Requester = PersonNamed("Olivia"), Addressee = PersonNamed("Mateo") };
+  r.Queue = QueueOf("Security");                                     // restricted: Lena alone is in it
+  Workflow.Settle(r);
+  Assert.Null(r.Assignee);
+  Assert.Equal("Arrived", Trail(r));
+}
+
+/// `AddressWork` is the run's to say: from a page or a plain function it is refused, whoever asks.
+[Test(Desk)]
+[runas(Lena)]
+void addressing_work_is_refused_outside_a_run() {
+  var r = Ask("Mailbox full");
+  var refused = Assert.Throws<ValidationException>(() => AddressWork(r, PersonNamed("Rahul")));
+  Assert.Contains("is said by a workflow's body", refused.Message);
+  Assert.Null(r.Assignee);
 }

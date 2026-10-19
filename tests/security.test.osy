@@ -84,7 +84,7 @@ void the_assignee_queue_and_priority_cannot_be_written_except_through_the_kit() 
   Assert.Denied(() => { var x = Request.Single(y => y.Id == r.Id); x.Priority = WorkPriority.Urgent; UnitOfWork.Commit(); });
   Assert.Denied(() => { var x = Request.Single(y => y.Id == r.Id); x.ResolutionWithin = TimeSpan.FromDays(30); UnitOfWork.Commit(); });
   Assert.Denied(() => { var x = Request.Single(y => y.Id == r.Id); x.EscalationLevel = 3; UnitOfWork.Commit(); });
-  // (An `Escalation`, like an `Assignment`, has no create grant at all — app code writing one does not even compile.)
+  // (An `Escalation`, like a `Handover`, has no create grant at all — app code writing one does not even compile.)
   Assert.Denied(() => { new Request { Title = "Pre-held", Assignee = lena }; UnitOfWork.Commit(); });
   // …while the app's own fields stay the app's.
   var mine = Request.Single(y => y.Id == r.Id);
@@ -161,7 +161,7 @@ void a_requester_reads_none_of_the_service_internals() {
     Assert.Null(mine.Policy);
     Assert.Null(mine.FirstResponseWithin);
     Assert.Null(mine.ResolutionWithin);
-    Assert.False(Assignment.Any(a => a.Item.Id == id));               // no history of who held it
+    Assert.False(Handover.Any(a => a.Item.Id == id));               // no history of who held it
     Assert.False(SlaClock.Any(c => c.Item.Id == id));                 // no clock records
     Assert.False(SlaPolicy.Any());                                    // no policies
     Assert.False(Queue.Any());                                        // no queues
@@ -329,7 +329,7 @@ void an_anonymous_caller_reads_none_of_the_inbox() {
   Assert.False(WorkItem.Any());
   Assert.False(Request.Any());
   Assert.False(Queue.Any());
-  Assert.False(Assignment.Any());
+  Assert.False(Handover.Any());
   Assert.False(SlaClock.Any());
   Assert.False(InboxView.Any());
   Assert.False(RoutingRule.Any());

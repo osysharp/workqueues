@@ -193,12 +193,12 @@ void HandOver(Absence absence) {
     // restricted item, or one needing a skill the cover lacks, goes back to its queue instead; cover is never a way
     // into work somebody may not hold. Guarded by tests/security.test.osy `cover_hands_work_only_to_someone_who_may_hold_it`.
     if (item.Queue.OnAway == AwayRule.ToCover && cover != null && MayHold(cover!, item)) {
-      Hand(item, cover!, AssignReason.Cover, absence.Until);
+      Hand(item, cover!, HandoverReason.Cover, absence.Until);
     } else {
       item.Assignee = null;
       // Released by nobody, with the date they are back: "Ines is away until … — back to Billing."
-      var back = new Assignment { Item = item, Step = NextStep(item), From = person, FromQueue = item.Queue, ToQueue = item.Queue,
-                                  Reason = AssignReason.Released, Until = absence.Until, At = DurableClock.UtcNow };
+      var back = new Handover { Item = item, Step = NextStep(item), From = person, FromQueue = item.Queue, ToQueue = item.Queue,
+                                  Reason = HandoverReason.Released, Until = absence.Until, At = DurableClock.UtcNow };
       Raise(new HolderChanged { Item = item, Step = StepOf(back) });
       Distribute(item, null, person.Id);
     }
@@ -219,12 +219,12 @@ Principal? CoverOfAvailability(Principal person) {
 
 /// Put `item` on `to` — the inbox's own move (cover), recorded with `reason` and, for an absence, until when its holder
 /// is away. Refused for anybody who may not hold it. The cover is told, in the words the trail says it in.
-void Hand(WorkItem item, Principal to, AssignReason reason, DateTime? until) {
+void Hand(WorkItem item, Principal to, HandoverReason reason, DateTime? until) {
   // SECURITY-INVARIANT(inbox-work-goes-only-to-who-may-hold-it) — the inbox's own moves ask too.
   if (!MayHold(to, item)) { return; }
   var from = item.Assignee;
   item.Assignee = to;
-  var step = new Assignment { Item = item, Step = NextStep(item), From = from, To = to, FromQueue = item.Queue, ToQueue = item.Queue,
+  var step = new Handover { Item = item, Step = NextStep(item), From = from, To = to, FromQueue = item.Queue, ToQueue = item.Queue,
                               Reason = reason, Until = until, At = DurableClock.UtcNow };
   Raise(new HolderChanged { Item = item, Step = StepOf(step), Told = to });
 }
@@ -246,7 +246,7 @@ void CoverIfOffHours(WorkItem item) {
   if (OnDuty(holder, DurableClock.UtcNow)) { return; }
   var cover = Choose(item, item.Queue, Distribution.LeastLoaded, holder.Id);
   if (cover == null) { return; }
-  Give(item, cover, AssignReason.OffHoursCover);
+  Give(item, cover, HandoverReason.OffHoursCover);
 }
 
 /// When, from now, half of what is left of the first-response promise has passed — the follow-the-sun check. Null: no

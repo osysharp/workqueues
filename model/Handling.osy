@@ -130,14 +130,14 @@ public workflow WorkHandling {
   // offered, done, or in a queue that hands nothing out.
   event Route();
 
-  on Take(Guid? expected) { HoldFor(this.Item, actor, actor, AssignReason.Claimed, expected, false); }
-  on TakeOver(Guid? expected) { HoldFor(this.Item, actor, actor, AssignReason.Claimed, expected, true); }
-  on HandTo(Principal to, Guid? expected) { HoldFor(this.Item, to, actor, AssignReason.HandedOn, expected, false); }
-  on HandOver(Principal to, Guid? expected) { HoldFor(this.Item, to, actor, AssignReason.HandedOn, expected, true); }
+  on Take(Guid? expected) { HoldFor(this.Item, actor, actor, HandoverReason.Claimed, expected, false); }
+  on TakeOver(Guid? expected) { HoldFor(this.Item, actor, actor, HandoverReason.Claimed, expected, true); }
+  on HandTo(Principal to, Guid? expected) { HoldFor(this.Item, to, actor, HandoverReason.HandedOn, expected, false); }
+  on HandOver(Principal to, Guid? expected) { HoldFor(this.Item, to, actor, HandoverReason.HandedOn, expected, true); }
   on Release { LetGo(this.Item, actor); }
   on Move(Queue to) { MoveTo(this.Item, to, actor, false); TakePolicy(this.Item); Workflow.Retarget(); }
   on MoveOver(Queue to) { MoveTo(this.Item, to, actor, true); TakePolicy(this.Item); Workflow.Retarget(); }
-  on Route { if (Pooled(this.Item)) { Distribute(this.Item, AssignReason.Refill); } }
+  on Route { if (Pooled(this.Item)) { Distribute(this.Item, HandoverReason.Refill); } }
   on Decline { Withdraw(this.Item, Unavailability.Declined); }
 
   Start {
@@ -145,7 +145,9 @@ public workflow WorkHandling {
     var tier = TierOf(this.Item);
     ArriveAt(this.Item, tier);
     TakePolicyAt(this.Item, tier, started: false);
-    if (RoutesByAccount(this.Item)) { RouteOn(this.Item, 0); } else { Distribute(this.Item, null); }
+    // Put to one person by name: it is theirs as it arrives, when they may hold it; otherwise it is routed.
+    if (GivenToAddressee(this.Item)) { }
+    else if (RoutesByAccount(this.Item)) { RouteOn(this.Item, 0); } else { Distribute(this.Item, null); }
     Raise(new ItemArrived { Item = this.Item, Policy = this.Item.Policy != null ? this.Item.Policy.Name : "", Due = this.Item.DueAt });
   }
 

@@ -73,8 +73,8 @@ public component InboxShell(AppChrome chrome, string prefix = "/inbox") {
     .Select(g => new Tally { Queue = g.Key.Queue, Handling = g.Key.Handling, Mine = g.Key.Mine, Held = g.Key.Held,
                              Offered = g.Key.Offered, Sla = g.Key.Sla, Count = g.Count() })
     .ToList();
-  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Position).ThenBy(q => q.Name).ToList();
-  live var views = InboxView.Where(v => v.Active).OrderBy(v => v.Position).ThenBy(v => v.Name).ToList();
+  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Position).ThenBy(q => q.Name).Take(200).ToList();
+  live var views = InboxView.Where(v => v.Active).OrderBy(v => v.Position).ThenBy(v => v.Name).Take(200).ToList();
   live var accounts = AccountTeamMember.Count(m => m.Member.Id == meId);
   live var lead = LeadsInbox;
   live var counts = Summed(tallies, queues);

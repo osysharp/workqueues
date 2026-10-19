@@ -34,7 +34,7 @@ public entity RoutingOffer {
   [Required] WorkItem Item;
   [Required] Principal To;
   /// Which step of the account chain: `AccountOwner`, `AccountBackup`, `AccountPod`.
-  AssignReason Step;
+  HandoverReason Step;
   /// How long it waits, in `Hours`.
   TimeSpan For;
   /// The hours its timer runs in — the queue's when it was offered. None: around the clock.
@@ -96,15 +96,15 @@ public RoutingOffer? OfferOn(WorkItem item) {
 // ── the chain (called from the item's run, and from an offer's) ───────────────────────────────────────────────────────
 
 /// The steps of the chain, in order.
-AssignReason StepAt(int i) {
-  if (i == 0) { return AssignReason.AccountOwner; }
-  if (i == 1) { return AssignReason.AccountBackup; }
-  return AssignReason.AccountPod;
+HandoverReason StepAt(int i) {
+  if (i == 0) { return HandoverReason.AccountOwner; }
+  if (i == 1) { return HandoverReason.AccountBackup; }
+  return HandoverReason.AccountPod;
 }
 
-int IndexOf(AssignReason step) {
-  if (step == AssignReason.AccountOwner) { return 0; }
-  if (step == AssignReason.AccountBackup) { return 1; }
+int IndexOf(HandoverReason step) {
+  if (step == HandoverReason.AccountOwner) { return 0; }
+  if (step == HandoverReason.AccountBackup) { return 1; }
   return 2;
 }
 
@@ -184,8 +184,8 @@ void RouteOn(WorkItem item, int from) {
       if (cannot == null && Offer(item, person, StepAt(i))) { return; }
       var because = cannot ?? Unavailability.MayNotHold;
       // Each one skipped is a fact of the trail — who, why, until when — not a clause in the next step's words.
-      var skipped = new Assignment { Item = item, Step = NextStep(item), FromQueue = item.Queue, ToQueue = item.Queue,
-                                     Reason = i == 0 ? AssignReason.OwnerAway : AssignReason.Skipped, About = person,
+      var skipped = new Handover { Item = item, Step = NextStep(item), FromQueue = item.Queue, ToQueue = item.Queue,
+                                     Reason = i == 0 ? HandoverReason.OwnerAway : HandoverReason.Skipped, About = person,
                                      Because = because, Until = because == Unavailability.Away ? AwayUntil(person) : null,
                                      At = DurableClock.UtcNow };
       Raise(new RoutingSkipped { Item = item, Step = StepOf(skipped) });
@@ -208,8 +208,8 @@ void FallToTheQueue(WorkItem item) {
   if (pod != null) {
     var fromQueue = item.Queue;
     item.Queue = pod;
-    var fell = new Assignment { Item = item, Step = NextStep(item), FromQueue = fromQueue, ToQueue = pod,
-                                Reason = AssignReason.FellThrough, At = DurableClock.UtcNow };
+    var fell = new Handover { Item = item, Step = NextStep(item), FromQueue = fromQueue, ToQueue = pod,
+                                Reason = HandoverReason.FellThrough, At = DurableClock.UtcNow };
     Raise(new ItemMoved { Item = item, Step = StepOf(fell) });
     TakePolicy(item);
   }
@@ -218,7 +218,7 @@ void FallToTheQueue(WorkItem item) {
 
 /// Offer `item` to `person` at `step`: they see it in "Offered to me", and it falls through after the queue's
 /// `OfferFor` in the queue's hours. False: not offered — they may not hold it.
-bool Offer(WorkItem item, Principal person, AssignReason step) {
+bool Offer(WorkItem item, Principal person, HandoverReason step) {
   // SECURITY-INVARIANT(inbox-work-goes-only-to-who-may-hold-it) — an offer is a promise to hold; it asks too.
   if (!MayHold(person, item)) { return false; }
   var queue = item.Queue;
@@ -226,7 +226,7 @@ bool Offer(WorkItem item, Principal person, AssignReason step) {
   var now = DurableClock.UtcNow;
   new RoutingOffer { Item = item, To = person, Step = step, For = queue.OfferFor, Hours = queue.Hours, At = now,
                      EndsAt = ServiceHours.After(queue.Hours, now, queue.OfferFor) };
-  var offered = new Assignment { Item = item, Step = NextStep(item), FromQueue = queue, ToQueue = queue, Reason = step,
+  var offered = new Handover { Item = item, Step = NextStep(item), FromQueue = queue, ToQueue = queue, Reason = step,
                                  About = person, Minutes = (int)queue.OfferFor.TotalMinutes, At = DurableClock.UtcNow };
   Raise(new ItemOffered { Item = item, Step = StepOf(offered), To = person });
   return true;
@@ -237,8 +237,8 @@ void OfferLapsed(RoutingOffer offer) {
   var item = offer.Item;
   if (item.OfferedTo == null || item.OfferedTo.Id != offer.To.Id || item.Assignee != null) { return; }
   item.OfferedTo = null;
-  var lapsed = new Assignment { Item = item, Step = NextStep(item), FromQueue = item.Queue, ToQueue = item.Queue,
-                                Reason = AssignReason.FellThrough, About = offer.To, Because = Unavailability.DidNotTake,
+  var lapsed = new Handover { Item = item, Step = NextStep(item), FromQueue = item.Queue, ToQueue = item.Queue,
+                                Reason = HandoverReason.FellThrough, About = offer.To, Because = Unavailability.DidNotTake,
                                 Minutes = (int)offer.For.TotalMinutes, At = DurableClock.UtcNow };
   Raise(new OfferFellThrough { Item = item, Step = StepOf(lapsed) });
   RouteOn(item, IndexOf(offer.Step) + 1);
@@ -250,8 +250,8 @@ void Withdraw(WorkItem item, Unavailability because, DateTime? until = null) {
   if (offer == null || item.OfferedTo == null) { return; }
   var who = item.OfferedTo;
   item.OfferedTo = null;
-  var fell = new Assignment { Item = item, Step = NextStep(item), FromQueue = item.Queue, ToQueue = item.Queue,
-                              Reason = AssignReason.FellThrough, About = who, Because = because, Until = until,
+  var fell = new Handover { Item = item, Step = NextStep(item), FromQueue = item.Queue, ToQueue = item.Queue,
+                              Reason = HandoverReason.FellThrough, About = who, Because = because, Until = until,
                               At = DurableClock.UtcNow };
   Raise(new OfferFellThrough { Item = item, Step = StepOf(fell) });
   OfferFlow.RaiseSettle(offer);

@@ -71,7 +71,7 @@ void an_item_lands_in_the_queue_its_first_matching_rule_names() {
     var refund = Ask("Refund for INVOICE 42");
     Assert.Equal("Billing", refund.Queue!.Name);                     // the FIRST match names the queue — the next one never runs
     var routed = TrailOf(refund)[0];
-    Assert.Equal(AssignReason.Rule, routed.Reason);
+    Assert.Equal(HandoverReason.Rule, routed.Reason);
     Assert.Equal("Money words", routed.Rule!.Name);
     Assert.Equal("Arrived in Billing — rule “Money words”.", Said(routed));
 
@@ -82,7 +82,7 @@ void an_item_lands_in_the_queue_its_first_matching_rule_names() {
 
     var other = Ask("Printer offline");                               // no rule: the default queue
     Assert.Equal("Support", other.Queue!.Name);
-    Assert.Equal(AssignReason.Arrived, TrailOf(other)[0].Reason);
+    Assert.Equal(HandoverReason.Arrived, TrailOf(other)[0].Reason);
 
     var chat = new Request { Title = "Hi there", Channel = "chat", Organization = CompanyNamed("Larkspur") };
     Workflow.Settle(chat);

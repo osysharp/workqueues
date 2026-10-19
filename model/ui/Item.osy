@@ -79,7 +79,7 @@ public component AssignControl(WorkItem item, ItemOpening? opened = null) {
   render {
     if (finished) { HeadFact("Assignee", holderName); }
     if (!finished) {
-    Stack(gap: 2, label: "Assignment") {
+    Stack(gap: 2, label: "Handover") {
       Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
         Box(position: Position.Relative) {
           Pressable(onClick: Toggle, label: "Assignee: " + holderName, expanded: open, shortcut: "A",
@@ -304,7 +304,7 @@ public string ClockWords(SlaClock c, TimeSpan left) {
 [Composable]
 public component WhyHere(WorkItem item, ItemOpening? opened = null) {
   live var itemId = item.Id;
-  live var trail = Assignment.Where(a => a.Item.Id == itemId).OrderBy(a => a.Step).ToList();
+  live var trail = Handover.Where(a => a.Item.Id == itemId).OrderBy(a => a.Step).ToList();
   List<TrailLine> asked = [];
   bool askedLoaded = false;
   DateTime now = DateTime.UtcNow;
@@ -331,7 +331,7 @@ public component WhyHere(WorkItem item, ItemOpening? opened = null) {
 /// One step of an item's trail — its sentence for the reader (`TrailLines`), or, for a step recorded after the trail
 /// opened, fetched as it appears. `latest`: the step that says where the item is now.
 [Composable]
-public component TrailStep(Assignment step, string sentence = "", bool latest = false, DateTime? now = null) {
+public component TrailStep(Handover step, string sentence = "", bool latest = false, DateTime? now = null) {
   string fetched = "";
   on mount {
     if (sentence == "") {

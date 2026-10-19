@@ -20,7 +20,7 @@ void an_organisations_item_is_offered_to_its_account_owner_first() {
     Assert.Equal("Nobody", HolderOf(r));
     Assert.Equal("Mateo", OfferedOf(r));
     var offered = TrailOf(r)[1];
-    Assert.Equal(AssignReason.AccountOwner, offered.Reason);
+    Assert.Equal(HandoverReason.AccountOwner, offered.Reason);
     Assert.Equal("Offered to Mateo (account owner); it falls through after 15 minutes.", Said(offered));
     Assert.Equal(OfferState.Offered, OfferOf(r).State);
   }
@@ -32,7 +32,7 @@ void an_organisations_item_is_offered_to_its_account_owner_first() {
     Workflow.Settle(r);
     Assert.Equal("Mateo", HolderOf(r));
     Assert.Equal("Nobody", OfferedOf(r));
-    Assert.Equal(AssignReason.AccountOwner, TrailOf(r)[2].Reason);    // why he has it: he owns the account
+    Assert.Equal(HandoverReason.AccountOwner, TrailOf(r)[2].Reason);    // why he has it: he owns the account
     Assert.Equal(OfferState.Accepted, OfferOf(r).State);
     Assert.Equal(0, Counts().Offered);
   }
@@ -81,7 +81,7 @@ void an_away_owner_is_skipped_at_once_and_the_note_says_why() {
     var r = Ask("Acme invoices missing", org: "Acme");
     Assert.Equal("Lena", OfferedOf(r));                               // at once — not after Mateo's fifteen minutes
     var skipped = TrailOf(r)[1];
-    Assert.Equal(AssignReason.OwnerAway, skipped.Reason);
+    Assert.Equal(HandoverReason.OwnerAway, skipped.Reason);
     Assert.Equal("Mateo is away until Mon 8 Jun 06:00 UTC — skipped.", Said(skipped));
     // The skip is its own step, with who, why and until when; the offer that follows says only the offer.
     Assert.Equal("Offered to Lena (backup); it falls through after 15 minutes.", Said(TrailOf(r)[2]));
@@ -120,7 +120,7 @@ void responding_to_an_offered_item_accepts_it() {
     Workflow.Settle(r);
     Assert.Equal("Mateo", HolderOf(r));
     Assert.Equal("Nobody", OfferedOf(r));
-    Assert.Equal(AssignReason.AccountOwner, TrailOf(r)[2].Reason);
+    Assert.Equal(HandoverReason.AccountOwner, TrailOf(r)[2].Reason);
     Assert.Equal("Mateo took the offer (account owner).", Said(TrailOf(r)[2]));
     Assert.Equal(OfferState.Accepted, OfferOf(r).State);
     Assert.Equal(ClockOutcome.Met, ClockOf(r, SlaMetric.FirstResponse).Outcome);

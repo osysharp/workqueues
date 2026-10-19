@@ -416,7 +416,7 @@ public component WorkListView(string view, Func<WorkRow, string> hrefOf, Guid op
   live var orgId = IdAfter(view, "o-");
   live var builtIn = BuiltInNamed(view);
   live var accounts = AccountTeamMember.Where(m => m.Member.Id == meId).Select(m => m.Organization.Id).ToList();
-  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Position).ThenBy(q => q.Name).ToList();
+  live var queues = Queue.Where(q => q.Active).OrderBy(q => q.Level).ThenBy(q => q.Position).ThenBy(q => q.Name).Take(200).ToList();
   live var saved = InboxView.Where(v => v.Id == savedId).Include(v => v.Queue).Include(v => v.Tier)
     .Include(v => v.Organization).ToList();
   live var orgNamed = Organization.Where(o => o.Id == orgId).Select(o => o.Name).ToList();
@@ -488,7 +488,7 @@ public component WorkListView(string view, Func<WorkRow, string> hrefOf, Guid op
     : orgId != Guid.Empty ? orgNamed.FirstOrDefault() ?? "Account"
     : builtIn.Label;
   // Who the selected can be handed to: everybody who works a queue (each hand-on still asks whether they may hold it).
-  live var people = Principal.Where(p => QueueMember.Any(m => m.Member == p && m.Active)).OrderBy(p => p.DisplayName).ToList();
+  live var people = Principal.Where(p => QueueMember.Any(m => m.Member == p && m.Active)).OrderBy(p => p.DisplayName).Take(500).ToList();
   live var hrefs = shown.Select(r => hrefOf(r)).ToList();
 
   // ── the clock — one per list, coarse, so a row's countdown costs nothing per row ────────────────────────────────
@@ -588,6 +588,13 @@ public component WorkListView(string view, Func<WorkRow, string> hrefOf, Guid op
     picked = [];
   }
   action OpenMore() { Toggle("more"); }
+  /// The kind key the picked items share — "" when they differ, or have none. What a contributed bulk action is told.
+  string PickedKind() {
+    var kinds = shown.Where(r => picked.Contains(r.Id)).Select(r => r.Kind).Distinct().ToList();
+    return kinds.Count == 1 ? kinds[0] : "";
+  }
+  /// A contributed bulk action (`WorkBulkAction`) is finished: say how it went; the pick is spent.
+  action BulkDone(string sentence) { said = sentence; picked = []; menu = ""; }
   action EscalateThem() {
     said = ""; menu = "";
     try { said = BulkSentence(EscalateAll(Targets(), "Escalated from the list"), "Escalated"); picked = []; }
@@ -691,6 +698,8 @@ public component WorkListView(string view, Func<WorkRow, string> hrefOf, Guid op
               }
             }
           }
+          // What other kits, and the app, do to many items of their kind — each draws its own button, or nothing.
+          WorkBulkAction(PickedKind(), picked, BulkDone);
           Button("Escalate", onPress: EscalateThem, size: Size.Sm, tone: Tone.Ghost, shortcut: "E");
           IconButton("Clear selection", ClearPicked, size: Size.Sm, tone: Tone.Ghost) { Icon(Icons.Close); }
         }
@@ -702,7 +711,7 @@ public component WorkListView(string view, Func<WorkRow, string> hrefOf, Guid op
       }
 
       // ── the rows ─────────────────────────────────────────────────────────────────────────────────────────────
-      Box(grow: 1, minH: "0", overflowY: Overflow.Auto, role: UiRole.List, label: heading + " list") {
+      Box(grow: 1, minH: "0", overflowY: Overflow.Auto, role: (shown.Count == 0) ? UiRole.Group : UiRole.List, label: heading + " list") {
         if (shown.Count == 0) {
           Box(p: 6) { EmptyState(search != "" ? "Nothing matches" : "Nothing here", body: EmptyLine(view)); }
         }

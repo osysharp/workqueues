@@ -32,7 +32,7 @@ void going_away_hands_held_work_to_cover_and_withdraws_offers() {
       var r = Request.Single(x => x.Id == id);
       Assert.Equal("Ines", HolderOf(r));
       var covered = TrailOf(r).Last();
-      Assert.Equal(AssignReason.Cover, covered.Reason);
+      Assert.Equal(HandoverReason.Cover, covered.Reason);
       Assert.Equal("Rahul is away until Thu 4 Jun 07:00 UTC — covered by Ines.", Said(covered));
     }
     var o = Request.Single(x => x.Id == offered);
@@ -93,7 +93,7 @@ void cover_that_may_not_hold_an_item_sends_it_back_to_the_queue() {
     var b = Request.Single(x => x.Id == billing);
     Assert.Equal("Nobody", HolderOf(b));
     Assert.Equal("Billing", b.Queue!.Name);
-    Assert.Equal(AssignReason.Released, TrailOf(b).Last().Reason);
+    Assert.Equal(HandoverReason.Released, TrailOf(b).Last().Reason);
     Assert.Contains("— back to Billing.", Said(TrailOf(b).Last()));
   }
   runas (Rahul) {                                                     // back: what cover took stays with the cover
@@ -130,7 +130,7 @@ void off_hours_cover_at_half_the_first_response_target() {
     Workflow.Settle(r);
     Assert.Equal("Rahul", HolderOf(r));                              // on until 20:00
     var covered = TrailOf(r).Last();
-    Assert.Equal(AssignReason.OffHoursCover, covered.Reason);
+    Assert.Equal(HandoverReason.OffHoursCover, covered.Reason);
     Assert.Equal("Ines is off shift — Rahul is on, and has it now.", Said(covered));
   }
 }

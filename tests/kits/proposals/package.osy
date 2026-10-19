@@ -1,0 +1,10 @@
+// Acme.Proposals — ANOTHER KIT'S KIND OF ITEM IN THE INBOX. The WorkQueues test desk's own package: it brings a kind of
+// work item the inbox has never heard of (`Proposal`), shows it on the item's screen (`WorkItemDetail`), and adds one
+// change to many of them at once to the list's bulk bar (`WorkBulkAction`). Nothing in Osysharp.WorkQueues names it.
+package Acme.Proposals {
+  version "0.1.0";
+  summary "a proposal waiting for a yes — the WorkQueues test desk's example of a kit that adds its own kind of item.";
+  model "model/**/*.osy";
+  use Osysharp.WorkQueues@0;
+  use Osysharp.Ui;
+}

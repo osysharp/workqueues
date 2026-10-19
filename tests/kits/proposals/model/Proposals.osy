@@ -26,7 +26,15 @@ public Proposal Propose(string title, string change) {
 /// Approve every one of `ids` the caller may — the ones they hold — and answer how many that was. It runs as the
 /// caller: a proposal a colleague holds is not theirs to change, and stays as it was.
 public int ApproveAll(List<Guid> ids) {
-  return Proposal.Where(p => ids.Contains(p.Id) && !p.Approved).Update(p => p.Approved = true);
+  // One row at a time, the caller's own: a bulk `.Update` called from a page's action faults in the 0.14 client
+  // ("n is not iterable"), and this fixture must run on the platform line the kit is published for.
+  var me = Session.CurrentUser;
+  var n = 0;
+  foreach (var p in Proposal.Where(p => ids.Contains(p.Id) && !p.Approved && p.Assignee == me).Take(500).ToList()) {
+    p.Approved = true;
+    n = n + 1;
+  }
+  return n;
 }
 
 // ── on the inbox's screens ──────────────────────────────────────────────────────────────────────────────────────────

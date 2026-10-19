@@ -10,7 +10,7 @@ you — Ines is away until Mon 8 Jun 06:00 UTC." The first reply on one of them 
 the holder; his bell says "First reply is at risk." Nobody wrote a line of code for any of it.
 
 ```osy
-use Osysharp.WorkQueues@0;
+use Osysharp.WorkQueues@1;
 use Osysharp.Notifications@1;
 // Osysharp.WorkQueues.Notifications is not written: it arrives by itself, because the app uses what it completes (`osy lock` says so)
 ```

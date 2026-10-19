@@ -12,7 +12,7 @@ app InboxNotificationsKitTests {
   use Osysharp.Workflow;
   use Osysharp.ServiceHours;
   use Osysharp.Ui;
-  use Osysharp.WorkQueues@0;
+  use Osysharp.WorkQueues@1;
   use Osysharp.Mail@0;
   use Osysharp.EmailTemplates@0;
   use Osysharp.Notifications@1;

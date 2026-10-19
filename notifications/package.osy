@@ -17,13 +17,13 @@
 // ⚑ NEVER ABOUT AN ITEM THEY MAY NOT READ. Each notification is about the item, and Notifications asks, as it delivers, reads
 //   and mails it, whether the recipient may read that item under their own rules.
 package Osysharp.WorkQueues.Notifications {
-  version     "0.3.1";
-  minPlatform "0.9.0";
+  version     "0.4.0";
+  minPlatform "0.14.0";
   summary     "the inbox's people told in their bell — an item offered to them, work handed to them while its holder is away, a promise at risk or missed on what they hold, and a queue's leads when nobody picks an item up — in their own words and language, and never about an item they may not read; the leads are whoever the app's LeadsInbox policy says.";
-  completes   Osysharp.WorkQueues@0, Osysharp.Notifications@1;
+  completes   Osysharp.WorkQueues@1, Osysharp.Notifications@1;
   model "model/*.osy";
   use Osysharp.Identity@0;
-  use Osysharp.WorkQueues@0;
+  use Osysharp.WorkQueues@1;
   use Osysharp.Notifications@1;
   tests "tests";
 }

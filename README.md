@@ -143,7 +143,7 @@ use Osysharp.Organizations@0;
 use Osysharp.Organizations.ServicePlans@0;   // customers' tiers, account teams, VIPs — read, never written
 use Osysharp.Presence@0;   // the "moved first" sentence; seats on an item
 use Osysharp.Observability;
-use Osysharp.WorkQueues@0;
+use Osysharp.WorkQueues@1;
 use Osysharp.Workflow;
 use Osysharp.ServiceHours;
 ```

@@ -9,7 +9,7 @@ app InboxKitTests {
   use Osysharp.Organizations.ServicePlans@0;
   use Osysharp.Presence@0;
   use Osysharp.Observability;
-  use Osysharp.WorkQueues@0;
+  use Osysharp.WorkQueues@1;
   // This project's own `kits/proposals`: ANOTHER KIT's kind of item, with its detail view and its bulk action — what
   // the inbox's two slots are for (tests/slots.test.osy).
   use Acme.Proposals@0;

@@ -27,7 +27,7 @@
 //
 // Docs: osy docs workflow-inbox-kit · osy docs security-inbox-kit.
 package Osysharp.WorkQueues {
-  version "0.24.0";
+  version "1.0.0";
   minPlatform "0.14.0";
   summary     "work queues, who holds what, and the service levels promised on it, over any item an app derives from WorkItem — and typed links between items, of kinds the app declares — with the screens a team works it from.";
   model "model/**/*.osy";

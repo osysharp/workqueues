@@ -5,6 +5,6 @@ package Acme.Proposals {
   version "0.1.0";
   summary "a proposal waiting for a yes — the WorkQueues test desk's example of a kit that adds its own kind of item.";
   model "model/**/*.osy";
-  use Osysharp.WorkQueues@0;
+  use Osysharp.WorkQueues@1;
   use Osysharp.Ui;
 }

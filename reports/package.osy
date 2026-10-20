@@ -22,16 +22,16 @@
 //   · a promise is counted by when it STARTED, once it has ended — met in time, or met late; a promise still running is
 //     neither kept nor missed yet, and a cancelled one measured nothing.
 package Osysharp.WorkQueues.Reports {
-  version "0.2.2";
-  minPlatform "0.9.0";
+  version "0.3.0";
+  minPlatform "0.14.0";
   summary     "Osysharp.Reports sources for Osysharp.WorkQueues — arrived, done, first reply and time to done (median and slowest tenth), open now, and promises kept, by agent, queue, channel, organization, tier and priority.";
-  completes   Osysharp.WorkQueues@0, Osysharp.Reports@0;
+  completes   Osysharp.WorkQueues@1, Osysharp.Reports@1;
   model "model/*.osy";
   use Osysharp.Identity@0;
   use Osysharp.Organizations@0;
   use Osysharp.Organizations.ServicePlans@0;
-  use Osysharp.WorkQueues@0;
-  use Osysharp.Reports@0;
+  use Osysharp.WorkQueues@1;
+  use Osysharp.Reports@1;
   use Osysharp.Explore;
   tests "tests";
 }

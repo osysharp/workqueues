@@ -9,10 +9,10 @@ app InboxReportsKitTests {
   use Osysharp.Organizations.ServicePlans@0;
   use Osysharp.Presence@0;
   use Osysharp.Observability;
-  use Osysharp.WorkQueues@0;
+  use Osysharp.WorkQueues@1;
   // Osysharp.WorkQueues.Reports, the package under test, is not written: it arrives by itself because this app uses
   // Inbox and Reports, which it completes (`osy lock` includes it and says so).
-  use Osysharp.Reports@0;
+  use Osysharp.Reports@1;
   use Osysharp.Explore;
   use Osysharp.Charts@1;
   use Osysharp.Csv@0;

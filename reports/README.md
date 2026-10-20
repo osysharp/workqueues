@@ -8,8 +8,8 @@ It is the bridge between two kits, so neither depends on the other: an app that 
 reports, and `Osysharp.Reports` knows nothing about inboxes. Add both and say, in your own words, what you report on:
 
 ```osy
-use Osysharp.WorkQueues@0;
-use Osysharp.Reports@0;
+use Osysharp.WorkQueues@1;
+use Osysharp.Reports@1;
 // Osysharp.WorkQueues.Reports is not written: it arrives by itself, because the app uses what it completes (`osy lock` says so)
 use Osysharp.Explore;
 

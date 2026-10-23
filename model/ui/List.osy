@@ -133,45 +133,48 @@ public component WorkLine(WorkRow row, string href, LineMark mark, bool picked, 
     }
   }
   render {
-    // The edge mark: the accent for the item open beside the list, ink for the keyboard's cursor.
-    Box(position: Position.Absolute, left: "0", top: "0", bottom: "0", w: "2px", decorative: true,
-        bg: mark == LineMark.Open ? Colors.Primary : (mark == LineMark.Cursor ? Colors.TextMuted : Colors.Transparent)) { }
-    Row(gap: 3, align: Align.Start, grow: 1, minW: "0", pl: 3, pr: 4, pt: compact ? "4px" : "8px", pb: compact ? "4px" : "8px",
-        role: UiRole.ListItem, selected: mark == LineMark.Open,
+    // ONE root: the variants above style it, and only it. It is the list item; the edge mark is positioned against it, and
+    // the row beside it is its flex child. Drawn as two roots, both wore the border, the fill and `Position.Relative`.
+    Box(role: UiRole.ListItem, selected: mark == LineMark.Open,
         label: (row.Reference != "" ? row.Reference + " " : "") + row.Title) {
-      Box(pt: "2px", shrink: 0) {
-        PickMark(picked, () => onPick(row.Id), "Select " + (row.Reference != "" ? row.Reference : row.Title));
-      }
-      Link(href: href, grow: 1, minW: "0", color: Colors.OnSurface) {
-        Stack(gap: compact ? "0" : "2px", minW: "0") {
-          // The lamp leads the line it describes: state before text.
-          Row(gap: 2, align: Align.Center, minW: "0") {
-            WorkLamp(row.Handling, row.Sla);
-            Text(row.Title, fontSize: FontSize.Label,
-                 fontWeight: row.Handling == Handling.New ? FontWeight.Semibold : FontWeight.Medium,
-                 whiteSpace: WhiteSpace.Nowrap, overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis, minW: "0",
-                 grow: 1);
-            SlaChip(row, now);
-          }
-          Row(gap: 2, align: Align.Center, minW: "0", pl: "16px") {
-            if (row.Reference != "") {
-              Text(row.Reference, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted,
-                   whiteSpace: WhiteSpace.Nowrap);
+      // The edge mark: the accent for the item open beside the list, ink for the keyboard's cursor.
+      Box(position: Position.Absolute, left: "0", top: "0", bottom: "0", w: "2px", decorative: true,
+          bg: mark == LineMark.Open ? Colors.Primary : (mark == LineMark.Cursor ? Colors.TextMuted : Colors.Transparent)) { }
+      Row(gap: 3, align: Align.Start, grow: 1, minW: "0", pl: 3, pr: 4, pt: compact ? "4px" : "8px", pb: compact ? "4px" : "8px") {
+        Box(pt: "2px", shrink: 0) {
+          PickMark(picked, () => onPick(row.Id), "Select " + (row.Reference != "" ? row.Reference : row.Title));
+        }
+        Link(href: href, grow: 1, minW: "0", color: Colors.OnSurface) {
+          Stack(gap: compact ? "0" : "2px", minW: "0") {
+            // The lamp leads the line it describes: state before text.
+            Row(gap: 2, align: Align.Center, minW: "0") {
+              WorkLamp(row.Handling, row.Sla);
+              Text(row.Title, fontSize: FontSize.Label,
+                   fontWeight: row.Handling == Handling.New ? FontWeight.Semibold : FontWeight.Medium,
+                   whiteSpace: WhiteSpace.Nowrap, overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis, minW: "0",
+                   grow: 1);
+              SlaChip(row, now);
             }
-            Text(WhoFor(row), color: Colors.TextSecondary, fontSize: FontSize.Caption, whiteSpace: WhiteSpace.Nowrap,
-                 overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis, minW: "0", grow: 1);
-            if (row.Tier != "") {
-              Text(row.Tier, fontSize: FontSize.Caption, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap, px: "6px",
-                   rounded: Radius.Pill, borderW: 1, border: Colors.Border);
+            Row(gap: 2, align: Align.Center, minW: "0", pl: "16px") {
+              if (row.Reference != "") {
+                Text(row.Reference, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted,
+                     whiteSpace: WhiteSpace.Nowrap);
+              }
+              Text(WhoFor(row), color: Colors.TextSecondary, fontSize: FontSize.Caption, whiteSpace: WhiteSpace.Nowrap,
+                   overflow: Overflow.Hidden, textOverflow: TextOverflow.Ellipsis, minW: "0", grow: 1);
+              if (row.Tier != "") {
+                Text(row.Tier, fontSize: FontSize.Caption, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap, px: "6px",
+                     rounded: Radius.Pill, borderW: 1, border: Colors.Border);
+              }
+              if (row.EscalationLevel > 1) {
+                Text("L" + row.EscalationLevel, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.Warning,
+                     label: "escalated to level " + row.EscalationLevel);
+              }
+              if (row.Priority == WorkPriority.Urgent || row.Priority == WorkPriority.High) {
+                Badge(row.Priority.Label, tone: PriorityTone(row.Priority));
+              }
+              HolderMark(row, now);
             }
-            if (row.EscalationLevel > 1) {
-              Text("L" + row.EscalationLevel, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.Warning,
-                   label: "escalated to level " + row.EscalationLevel);
-            }
-            if (row.Priority == WorkPriority.Urgent || row.Priority == WorkPriority.High) {
-              Badge(row.Priority.Label, tone: PriorityTone(row.Priority));
-            }
-            HolderMark(row, now);
           }
         }
       }

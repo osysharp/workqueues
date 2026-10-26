@@ -107,8 +107,8 @@ void cover_that_may_not_hold_an_item_sends_it_back_to_the_queue() {
 void off_hours_cover_at_half_the_first_response_target() {
   TestClock.Set(new DateTime(2026, 6, 2, 14, 0, 0));                 // Tue 16:00 Stockholm
   runas (Ada) {
-    var early = new ServiceHours { Name = "Early shift", Zone = Zone.Of("Europe/Stockholm") };
-    var late = new ServiceHours { Name = "Late shift", Zone = Zone.Of("Europe/Stockholm") };
+    var early = new ServiceHours { Name = "Early shift", Zone = TimeZoneInfo.FindSystemTimeZoneById("Europe/Stockholm") };
+    var late = new ServiceHours { Name = "Late shift", Zone = TimeZoneInfo.FindSystemTimeZoneById("Europe/Stockholm") };
     foreach (var d in new List<DayOfWeek> { DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday, DayOfWeek.Friday }) {
       new ServiceWindow { ServiceHours = early, Day = d, Start = TimeSpan.FromHours(8), End = TimeSpan.FromHours(16.5) };
       new ServiceWindow { ServiceHours = late, Day = d, Start = TimeSpan.FromHours(12), End = TimeSpan.FromHours(20) };
@@ -138,7 +138,7 @@ void off_hours_cover_at_half_the_first_response_target() {
 [Test(Desk)]
 void on_shift_is_read_from_working_hours_in_their_zone() {
   runas (Ada) {
-    var chicago = new ServiceHours { Name = "Chicago office", Zone = Zone.Of("America/Chicago") };
+    var chicago = new ServiceHours { Name = "Chicago office", Zone = TimeZoneInfo.FindSystemTimeZoneById("America/Chicago") };
     foreach (var d in new List<DayOfWeek> { DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday, DayOfWeek.Friday }) {
       new ServiceWindow { ServiceHours = chicago, Day = d, Start = TimeSpan.FromHours(9), End = TimeSpan.FromHours(17) };
     }

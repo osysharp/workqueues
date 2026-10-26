@@ -454,11 +454,11 @@ public component BusinessHoursSettings() {
   render {
     SettingsPage("Business hours", description: "The calendars promises count in. A calendar with no hours runs around the clock; a holiday stops its clocks for the days it covers.") {
       foreach (var h in calendars) {
-        SettingsSection(h.Name, description: "Hours in " + h.Zone + ".", locked: !admin,
+        SettingsSection(h.Name, description: "Hours in " + h.Zone.Id + ".", locked: !admin,
                         lockedBecause: "Only inbox admins change business hours.") {
           Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
             Stack(grow: 1, minW: "180px") { Field("Name", value: h.Name); }
-            Text("Time zone " + h.Zone, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted);
+            Text("Time zone " + h.Zone.Id, fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted);
           }
           Stack(gap: 0, role: UiRole.List, label: h.Name + " hours") {
             if (windows.Count(w => w.ServiceHours.Id == h.Id) == 0) {

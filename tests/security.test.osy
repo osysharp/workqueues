@@ -309,7 +309,7 @@ void only_an_inbox_admin_changes_queues_policies_hours_and_rules() {
     Assert.Denied(() => { var p = SlaPolicy.Single(x => x.Name == "Standard"); p.AtRiskAt = 0.99; UnitOfWork.Commit(); });
     Assert.Denied(() => { var t = SlaTarget.First(x => x.Policy.Name == "Standard"); t.Within = TimeSpan.FromDays(9); UnitOfWork.Commit(); });
     Assert.Denied(() => { var q = QueueOf("Support"); q.Restricted = true; UnitOfWork.Commit(); });
-    Assert.Denied(() => { new ServiceHours { Name = "Lena's hours", Zone = Zone.Of("UTC") }; UnitOfWork.Commit(); });
+    Assert.Denied(() => { new ServiceHours { Name = "Lena's hours", Zone = TimeZoneInfo.FindSystemTimeZoneById("UTC") }; UnitOfWork.Commit(); });
     Assert.Denied(() => { new RoutingRule { Name = "Lena's rule", ToQueue = QueueOf("Billing") }; UnitOfWork.Commit(); });
     Assert.Denied(() => { new RoutingSkill { Name = "Lena's skill" }; UnitOfWork.Commit(); });
     Assert.Denied(() => { var q = QueueOf("Rota"); q.Distribution = Distribution.Manual; UnitOfWork.Commit(); });

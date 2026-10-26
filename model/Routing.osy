@@ -272,7 +272,10 @@ void Give(WorkItem item, QueueMember member, HandoverReason reason) {
   var now = DurableClock.UtcNow;
   var stamp = now;
   foreach (var m in QueueMember.Where(m => m.Queue == member.Queue).ToList()) {
-    if (m.LastGivenAt != null && m.LastGivenAt.Value >= stamp) { stamp = m.LastGivenAt.Value.AddTicks(1); }
+    // One MICROSECOND later, not one tick: a stored DateTime keeps microseconds, so a tick past the latest turn read back
+    // as that same turn — a tie, broken by name — and a start redelivered with its journaled (earlier) clock gave the
+    // first member a second turn (InboxUnderConcurrencyTests: Ada=6, Di=4).
+    if (m.LastGivenAt != null && m.LastGivenAt.Value >= stamp) { stamp = m.LastGivenAt.Value.AddMicroseconds(1); }
   }
   member.LastGivenAt = stamp;
   var from = item.Assignee;

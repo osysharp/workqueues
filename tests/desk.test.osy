@@ -48,7 +48,7 @@ void Desk() {
   new Membership { Organization = larkspur, Member = olivia };
   new Membership { Organization = orbit, Member = dev };
 
-  var business = new ServiceHours { Name = "Business hours", Zone = Zone.Of("Europe/Stockholm") };
+  var business = new ServiceHours { Name = "Business hours", Zone = TimeZoneInfo.FindSystemTimeZoneById("Europe/Stockholm") };
   foreach (var d in new List<DayOfWeek> { DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday, DayOfWeek.Friday }) {
     new ServiceWindow { ServiceHours = business, Day = d, Start = TimeSpan.FromHours(9), End = TimeSpan.FromHours(17) };
   }

@@ -181,3 +181,95 @@ Ten security rules, each with its own test in
 
 The kit's test app carries two kinds of work, `Request` (a requester who waits on us) and `Spend` (an approval with its
 own lifecycle), so the kit is proven general on its own, not only by the helpdesk.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+using InboxKitTests;
+
+[Test(Desk)]
+void an_organisations_item_is_offered_to_its_account_owner_first() {
+  runas (Ada) { Team("Acme", "Mateo", "Lena", new List<string> { "Ines" }); }   // Mateo is not in Support — the account is his
+  var id = Guid.Empty;
+  runas (Lena) {
+    var r = Ask("Acme cannot export", org: "Acme");
+    id = r.Id;
+    Assert.Equal("Nobody", HolderOf(r));
+    Assert.Equal("Mateo", OfferedOf(r));
+    var offered = TrailOf(r)[1];
+    Assert.Equal(HandoverReason.AccountOwner, offered.Reason);
+    Assert.Equal("Offered to Mateo (account owner); it falls through after 15 minutes.", Said(offered));
+    Assert.Equal(OfferState.Offered, OfferOf(r).State);
+  }
+  runas (Mateo) {
+    var r = Request.Single(x => x.Id == id);
+    Assert.Equal("Acme cannot export", Titles(Rows(BuiltInView.Offered)));
+    Assert.Equal(1, Counts().Offered);
+    AcceptOffer(r);
+    Workflow.Settle(r);
+    Assert.Equal("Mateo", HolderOf(r));
+    Assert.Equal("Nobody", OfferedOf(r));
+    Assert.Equal(HandoverReason.AccountOwner, TrailOf(r)[2].Reason);    // why he has it: he owns the account
+    Assert.Equal(OfferState.Accepted, OfferOf(r).State);
+    Assert.Equal(0, Counts().Offered);
+  }
+}
+```
+
+From [`tests/accounts.test.osy`](tests/accounts.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.Workflow;
+using InboxKitTests;
+
+[Test(Desk)]
+[runas(Ines)]
+void taking_an_item_puts_your_name_on_it_and_records_why() {
+  var r = Ask("Printer offline");
+  TakeWork(r);
+  Workflow.Settle(r);
+  Assert.Equal("Ines", r.Assignee!.DisplayName);
+  var last = TrailOf(r)[1];
+  Assert.Equal(HandoverReason.Claimed, last.Reason);
+  Assert.Equal("Ines", last.To!.DisplayName);
+  Assert.Equal("Ines", last.By!.DisplayName);
+  Assert.Equal("Ines took it.", Said(last));
+  Assert.True(WasTold(r, "work-queues.holder-changed"));
+}
+```
+
+From [`tests/assignment.test.osy`](tests/assignment.test.osy).
+
+```osy
+using InboxKitTests;
+
+[Test(Desk)]
+void the_sign_in_admits_a_right_code_and_refuses_everything_else() {
+  Assert.NotEqual("", SignInWithCode("ines@desk.test", "1111"));
+  Assert.Equal("", SignInWithCode("ines@desk.test", "9999"));
+  Assert.Equal("", SignInWithCode("nobody@desk.test", "1111"));
+}
+```
+
+From [`tests/auth.test.osy`](tests/auth.test.osy).
+
+## Learn more
+
+- [The Osysharp.WorkQueues reference](https://osysharp.com/reference/agent/kit-work-queues/)
+- [Osysharp.WorkQueues in the package catalogue](https://osysharp.com/packages/#osysharp-workqueues)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).

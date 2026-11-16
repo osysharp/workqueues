@@ -119,8 +119,10 @@ public void MoveWork(WorkItem item, Queue queue) {
 public BulkResult TakeMany(List<WorkItem> items) {
   var result = new BulkResult();
   foreach (var item in items) {
-    try { TakeWork(item, item.Assignee == null ? null : item.Assignee.Id); result.Moved = result.Moved + 1; }
-    catch (Exception e) { result.NotMoved.Add(item.Title + ": " + e.Message); }
+    var moved = true;
+    try { TakeWork(item, item.Assignee == null ? null : item.Assignee.Id); }
+    catch (Exception e) { moved = false; result.NotMoved.Add(item.Title + ": " + e.Message); }
+    if (moved) { result.Moved = result.Moved + 1; }
   }
   return result;
 }
@@ -129,8 +131,10 @@ public BulkResult TakeMany(List<WorkItem> items) {
 public BulkResult MoveMany(List<WorkItem> items, Queue queue) {
   var result = new BulkResult();
   foreach (var item in items) {
-    try { MoveWork(item, queue); result.Moved = result.Moved + 1; }
-    catch (Exception e) { result.NotMoved.Add(item.Title + ": " + e.Message); }
+    var moved = true;
+    try { MoveWork(item, queue); }
+    catch (Exception e) { moved = false; result.NotMoved.Add(item.Title + ": " + e.Message); }
+    if (moved) { result.Moved = result.Moved + 1; }
   }
   return result;
 }

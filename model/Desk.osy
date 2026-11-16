@@ -270,8 +270,10 @@ public BulkResult HandAllTo(List<Guid> ids, Guid person) {
   var to = Principal.Single(p => p.Id == person);
   var result = new BulkResult();
   foreach (var item in WorkItem.Where(w => ids.Contains(w.Id)).ToList()) {
-    try { HandWorkTo(item, to, item.Assignee == null ? null : item.Assignee.Id); result.Moved = result.Moved + 1; }
-    catch (Exception e) { result.NotMoved.Add(item.Title + ": " + e.Message); }
+    var moved = true;
+    try { HandWorkTo(item, to, item.Assignee == null ? null : item.Assignee.Id); }
+    catch (Exception e) { moved = false; result.NotMoved.Add(item.Title + ": " + e.Message); }
+    if (moved) { result.Moved = result.Moved + 1; }
   }
   return result;
 }
@@ -281,8 +283,10 @@ public BulkResult HandAllTo(List<Guid> ids, Guid person) {
 public BulkResult PrioritiseAll(List<Guid> ids, WorkPriority priority) {
   var result = new BulkResult();
   foreach (var item in WorkItem.Where(w => ids.Contains(w.Id)).ToList()) {
-    try { Prioritise(item, priority); result.Moved = result.Moved + 1; }
-    catch (Exception e) { result.NotMoved.Add(item.Title + ": " + e.Message); }
+    var moved = true;
+    try { Prioritise(item, priority); }
+    catch (Exception e) { moved = false; result.NotMoved.Add(item.Title + ": " + e.Message); }
+    if (moved) { result.Moved = result.Moved + 1; }
   }
   return result;
 }
@@ -292,8 +296,10 @@ public BulkResult PrioritiseAll(List<Guid> ids, WorkPriority priority) {
 public BulkResult EscalateAll(List<Guid> ids, string why) {
   var result = new BulkResult();
   foreach (var item in WorkItem.Where(w => ids.Contains(w.Id)).ToList()) {
-    try { EscalateWork(item, why); result.Moved = result.Moved + 1; }
-    catch (Exception e) { result.NotMoved.Add(item.Title + ": " + e.Message); }
+    var moved = true;
+    try { EscalateWork(item, why); }
+    catch (Exception e) { moved = false; result.NotMoved.Add(item.Title + ": " + e.Message); }
+    if (moved) { result.Moved = result.Moved + 1; }
   }
   return result;
 }

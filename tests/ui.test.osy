@@ -452,9 +452,9 @@ void the_inbox_settings_pages_draw_for_an_admin() {
 }
 
 /// ⭐ A SAVED VIEW WITH THE APP'S OWN FILTER LISTS WHAT THE FILTER KEEPS — reached from another view, as a person
-/// reaches it. The list asks the app's filter when a view's list mounts, so a list moved from one view to another must
-/// mount afresh for the new view (its rows are keyed by view, not by place); otherwise the filter would never be asked for
-/// the saved view and it would list nothing while the server's `AppFilteredBy` named its items.
+/// reaches it. The list asks the app's filter whenever its view changes, so a list moved from one view to another asks it
+/// for the new view — otherwise it would list nothing while the server's `AppFilteredBy` named its items — and does so in
+/// place: the click is judged by the redraw check too, so the list's toolbar and bulk bar are not drawn twice.
 [Test(Desk)]
 void a_saved_view_with_the_apps_own_filter_lists_what_the_filter_keeps() {
   Guid view = Guid.Empty;

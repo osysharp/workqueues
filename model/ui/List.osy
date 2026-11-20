@@ -267,15 +267,9 @@ public string MetricWord(SlaMetric? m) { return m == null ? "" : m.Value.Label.T
 /// Did this item arrive in the last minute — is it new on the screen?
 public bool JustArrived(WorkRow r, DateTime now) { return (now - r.ArrivedAt).TotalSeconds < 60.0; }
 
-/// The one row a view's list is mounted under. It carries the view as its IDENTITY (`Id`), and a `foreach` keys a row
-/// by its item's identity — so a new view REPLACES the row, and its body mounts afresh.
-///
-/// ⛔ A PLAIN STRING ROW IS KEYED BY ITS PLACE, NOT ITS VALUE (a list of text is edited in place — `items[i]` bound to a
-///   box — so the walker must not remount a row whose text changes). Keyed by a plain `[view]`, ONE body would serve
-///   every view a list was ever shown: it would keep the first view's cursor, picks and filter, and its `on mount` —
-///   which asks the app's own filter of a saved view (`AppFilteredBy`) — would have run for whatever view the page
-///   opened on, so a saved view with an app filter would list NOTHING. Hence a `ViewKey` per view. Guarded by
-///   tests/views.test.osy `a_saved_view_with_the_apps_own_filter_lists_what_the_filter_keeps`.
+/// A one-item row carrying a key as its IDENTITY (`Id`): a `foreach` over `OneOf(key)` is replaced, whole, when the key
+/// changes. The list no longer draws itself this way — a change of view is patched in place (`WorkListView`'s
+/// `on change`) — but the helper stays part of the kit's surface.
 public class ViewKey { public string Id = ""; }
 
 /// A one-item list holding `key` — the row of a `foreach` that is replaced, whole, when `key` changes.
@@ -383,16 +377,14 @@ public component WorkList(string view, Func<WorkRow, string> hrefOf, Guid open, 
                           Func<Guid, string>? whoFor = null, BulkMenu? more = null,
                           Action<Guid, List<Guid>>? onMore = null, bool titled = true,
                           Action<List<Guid>, string>? onShown = null, List<Guid>? whoMatches = null) {
-  // ⚑ A CHANGE OF VIEW IS A FRESH LIST: its cursor, its picks and its filter belong to the view they were made in, so
-  //   the body is the row of a one-item `foreach` keyed by the view, and a new view mounts a new one.
+  // ⚑ A CHANGE OF VIEW IS THE SAME LIST, STARTED OVER: `WorkListView` resets its cursor, picks and filter for the new
+  //   view and asks the app's filter again, so nothing around the rows is drawn twice.
   render {
-    foreach (var v in OneOf(view)) {
-      WorkListView(v.Id, hrefOf, open, title, whoFor, more, onMore, titled, onShown, whoMatches);
-    }
+    WorkListView(view, hrefOf, open, title, whoFor, more, onMore, titled, onShown, whoMatches);
   }
 }
 
-/// One view's list — `WorkList`'s body, mounted afresh for each view.
+/// One view's list — `WorkList`'s body; a change of `view` starts it over in place (its `on change`).
 [Composable]
 public component WorkListView(string view, Func<WorkRow, string> hrefOf, Guid open, string title = "",
                               Func<Guid, string>? whoFor = null, BulkMenu? more = null,
@@ -497,9 +489,14 @@ public component WorkListView(string view, Func<WorkRow, string> hrefOf, Guid op
   // ── the clock — one per list, coarse, so a row's countdown costs nothing per row ────────────────────────────────
   DateTime now = DateTime.UtcNow;
   on every (TimeSpan.FromSeconds(15)) { now = DateTime.UtcNow; }
-  // The app's own filter of a saved view is the app's code — asked on the server when the view opens (a change of
-  // view mounts a fresh list: see `WorkList`).
-  on mount { if (savedId != Guid.Empty) { kept = AppFilteredBy(savedId); } }
+  // ⚑ A CHANGE OF VIEW STARTS THE LIST OVER, IN PLACE: its cursor, its picks, its search and its window belong to the
+  //   view they were made in, and the app's own filter of a saved view (the app's code, asked on the server) is asked
+  //   again for the new one. The list itself — its head, its toolbar, its bulk bar — stays on the screen and is patched:
+  //   only the rows change (D-REDRAW, a move between views redraws nothing that shows the same thing).
+  on change {
+    search = ""; cursor = Guid.Empty; picked = []; menu = ""; said = ""; limit = WorkWindow();
+    kept = savedId != Guid.Empty ? AppFilteredBy(savedId) : new List<Guid>();
+  }
   // The app hears which rows are shown and what the list is filtered by — it names those rows (`whoFor`) and finds
   // items by who they are for (`whoMatches`).
   on change { if (onShown != null) { onShown(ids, q); } }
@@ -718,22 +715,19 @@ public component WorkListView(string view, Func<WorkRow, string> hrefOf, Guid op
         if (shown.Count == 0) {
           Box(p: 6) { EmptyState(search != "" ? "Nothing matches" : "Nothing here", body: EmptyLine(view)); }
         }
-        // ⚑ ONE CONTAINER PER VIEW: switching views REPLACES the rows' container (it is the row of a one-item
-        //   `foreach` keyed by the view), so the old rows go at once instead of each playing its exit — an exit means
-        //   "this item left the view", which a switch of view is not.
-        foreach (var v in OneOf(view)) {
-          Stack(gap: 0) {
-            foreach (var r in shown) {
-              // What just arrived drops into place; everything already there on load stays still. What leaves the
-              // view (taken by a colleague, moved, done) slides out and the rows below close the gap.
-              if (JustArrived(r, now)) {
-                Box(animation: KitArrive, exitAnimation: KitLeave) {
-                  WorkLine(r, hrefOf(r), MarkOf(r.Id, open, cursor, picked), picked.Contains(r.Id), now, Pick, compact);
-                }
-              } else {
-                Box(exitAnimation: KitLeave) {
-                  WorkLine(r, hrefOf(r), MarkOf(r.Id, open, cursor, picked), picked.Contains(r.Id), now, Pick, compact);
-                }
+        // ⚑ ONE CONTAINER FOR EVERY VIEW, ROWS KEYED BY THEIR ITEM: switching views keeps a row the new view shows too
+        //   (patched, never drawn twice) and takes out the rows it does not.
+        Stack(gap: 0) {
+          foreach (var r in shown) {
+            // What just arrived drops into place; everything already there on load stays still. What leaves the
+            // view (taken by a colleague, moved, done) slides out and the rows below close the gap.
+            if (JustArrived(r, now)) {
+              Box(animation: KitArrive, exitAnimation: KitLeave) {
+                WorkLine(r, hrefOf(r), MarkOf(r.Id, open, cursor, picked), picked.Contains(r.Id), now, Pick, compact);
+              }
+            } else {
+              Box(exitAnimation: KitLeave) {
+                WorkLine(r, hrefOf(r), MarkOf(r.Id, open, cursor, picked), picked.Contains(r.Id), now, Pick, compact);
               }
             }
           }

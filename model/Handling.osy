@@ -44,8 +44,10 @@ public void ReopenWork(WorkItem item, DateTime? at = null) {
   if (at == null) { WorkHandling.RaiseReopen(item); } else { WorkHandling.RaiseReopen(item, at: at.Value); }
 }
 
-/// Closed for good. An item closed before it was done is done first.
+/// Closed for good. An item closed before it was done is done first. An item already cancelled (a duplicate, a privacy
+/// erasure) has nothing left to close: its run has ended, and a raise on it would be refused as a raise on a cancelled run.
 public void CloseWork(WorkItem item, DateTime? at = null) {
+  if (item.Handling == Handling.Cancelled) { return; }
   if (at == null) { WorkHandling.RaiseClose(item); } else { WorkHandling.RaiseClose(item, at: at.Value); }
 }
 
